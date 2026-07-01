@@ -552,6 +552,24 @@ static void fill_network_info(cJSON *inv)
 			cJSON_AddNumberToObject(io, "prefix",  (double)prefix);
 			cJSON_AddStringToObject(io, "family",  family ? family : "");
 			cJSON_AddStringToObject(io, "kind",    win_net_kind(p->IfType));
+
+			/* req4: gateway = 어댑터 default gateway 중 이 주소와 같은 family.
+			 * FirstGatewayAddress는 Vista+(NT6.0+)에서만 OS가 채운다 -> legacy32(NT5.2)는 null. */
+			cJSON *gw_item = NULL;
+#if AGENT_NT6
+			int ufam = u->Address.lpSockaddr->sa_family;
+			for (IP_ADAPTER_GATEWAY_ADDRESS_LH *g = p->FirstGatewayAddress; g; g = g->Next) {
+				if (!g->Address.lpSockaddr || g->Address.lpSockaddr->sa_family != ufam)
+					continue;
+				char gbuf[INET6_ADDRSTRLEN] = {0};
+				if (ufam == AF_INET)
+					inet_ntop(AF_INET, &((struct sockaddr_in *)g->Address.lpSockaddr)->sin_addr, gbuf, sizeof gbuf);
+				else if (ufam == AF_INET6)
+					inet_ntop(AF_INET6, &((struct sockaddr_in6 *)g->Address.lpSockaddr)->sin6_addr, gbuf, sizeof gbuf);
+				if (gbuf[0]) { gw_item = cJSON_CreateString(gbuf); break; }
+			}
+#endif
+			cJSON_AddItemToObject(io, "gateway", gw_item ? gw_item : cJSON_CreateNull());
 			cJSON_AddItemToArray(ifaces, io);
 		}
 
@@ -1093,16 +1111,17 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 }
 
 /* item 5 (saturation, raw-first): Linux loadavg/iowait 등가 신호.
- * disk_queue는 이미 쓰는 IOCTL_DISK_PERFORMANCE의 QueueDepth(순간 큐 깊이) 합이라
- * 추가 DLL/PDH 없이 신뢰성 있게 취득한다. cpu_run_queue(Processor Queue Length)와
+ * disk_queue는 물리 디스크별 IOCTL_DISK_PERFORMANCE의 QueueDepth(순간 큐 깊이)를
+ * [{device, queue}] 배열로 발행한다(추가 DLL/PDH 없음). device 키는 disks[].name과
+ * 동일(PhysicalDriveN)이라 엔진이 물리 디스크에 귀속·per-device max로 병목 판정한다.
+ * 빈 배열 [] = 신호 없음(unmeasured). cpu_run_queue(Processor Queue Length)와
  * mem_paging_rate(Pages/sec)는 perflib(HKEY_PERFORMANCE_DATA) 파싱이 필요해 실기
  * 검증 전까지 null(미측정)로 둔다 — 값 정합성 우선. */
 static void fill_saturation(cJSON *m)
 {
 	cJSON *s = cJSON_CreateObject();
 
-	long total_qd = 0;
-	int have_disk = 0;
+	cJSON *dq = cJSON_CreateArray();
 	for (int i = 0; i < 32; i++) {
 		wchar_t path[64];
 		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
@@ -1113,13 +1132,16 @@ static void fill_saturation(cJSON *m)
 		DWORD ret = 0;
 		if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, NULL, 0,
 		                    &dp, sizeof dp, &ret, NULL)) {
-			total_qd += (long)dp.QueueDepth;
-			have_disk = 1;
+			char name[32];
+			snprintf(name, sizeof name, "PhysicalDrive%d", i);
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddStringToObject(o, "device", name);
+			cJSON_AddNumberToObject(o, "queue",  (double)dp.QueueDepth);
+			cJSON_AddItemToArray(dq, o);
 		}
 		CloseHandle(h);
 	}
-	if (have_disk) cJSON_AddNumberToObject(s, "disk_queue", (double)total_qd);
-	else           cJSON_AddNullToObject  (s, "disk_queue");
+	cJSON_AddItemToObject(s, "disk_queue", dq);
 
 	cJSON_AddNullToObject(s, "cpu_run_queue");
 	cJSON_AddNullToObject(s, "mem_paging_rate");
@@ -1127,11 +1149,25 @@ static void fill_saturation(cJSON *m)
 	cJSON_AddItemToObject(m, "saturation", s);
 }
 
+/* req3: 설정된 수집 주기(초). main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60). */
+static int agent_interval_sec(void)
+{
+	const char *v = getenv("AGENT_INTERVAL_SEC");
+	if (v && *v) {
+		char *end;
+		long n = strtol(v, &end, 10);
+		if (end != v && n > 0 && n < 86400)
+			return (int)n;
+	}
+	return 60;
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *m = cJSON_CreateObject();
 	if (!m) return NULL;
 	add_common_metadata(m, "metrics", machine_id, agent_version);
+	cJSON_AddNumberToObject(m, "collection_interval_sec", agent_interval_sec());
 
 	fill_cpu_stat(m);
 	fill_memory_metrics(m);

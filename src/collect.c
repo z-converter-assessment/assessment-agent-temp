@@ -896,7 +896,41 @@ static int ipv6_netmask_prefix(const struct sockaddr_in6 *mask)
 	return prefix;
 }
 
-/* item 3: 구조화 인터페이스 배열(name/address/prefix/family/kind, IPv6 포함).
+/* req4: /proc/net/route의 default route(dest=0, mask=0) gateway를 iface->IP 문자열 맵으로.
+ * 엔진 토폴로지 서브넷 disambiguation용. IPv4만 취득(엔진 용도는 사설 대역 중복 판별). */
+static cJSON *build_default_gw_v4(void)
+{
+	cJSON *map = cJSON_CreateObject();
+	FILE *f = fopen("/proc/net/route", "r");
+	if (!f)
+		return map;
+
+	char line[512];
+	if (fgets(line, sizeof line, f)) {   /* 헤더 한 줄 스킵 */
+		while (fgets(line, sizeof line, f)) {
+			char iface[64];
+			unsigned long dest, gw, flags, mask;
+			int refcnt, use, metric, mtu, win, irtt;
+			if (sscanf(line, "%63s %lx %lx %lx %d %d %d %lx %d %d %d",
+			           iface, &dest, &gw, &flags, &refcnt, &use,
+			           &metric, &mask, &mtu, &win, &irtt) < 8)
+				continue;
+			if (dest != 0 || mask != 0 || gw == 0)
+				continue;   /* default route + 실 gateway만 */
+			if (cJSON_GetObjectItem(map, iface))
+				continue;   /* iface당 첫 default route */
+			struct in_addr a;
+			a.s_addr = (in_addr_t)gw;   /* hex는 network-order LE 정수 (amd64) */
+			char buf[INET_ADDRSTRLEN];
+			if (inet_ntop(AF_INET, &a, buf, sizeof buf))
+				cJSON_AddStringToObject(map, iface, buf);
+		}
+	}
+	fclose(f);
+	return map;
+}
+
+/* item 3: 구조화 인터페이스 배열(name/address/prefix/family/kind/gateway, IPv6 포함).
  * cutover로 구형 ip_internal(CIDR 문자열, IPv4-only) 대체(단독 발행). */
 static cJSON *collect_interfaces(void)
 {
@@ -904,6 +938,8 @@ static cJSON *collect_interfaces(void)
 	struct ifaddrs *ifap = NULL;
 	if (getifaddrs(&ifap) != 0)
 		return arr;
+
+	cJSON *gw4 = build_default_gw_v4();
 
 	for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
 		if (!ifa->ifa_addr)
@@ -941,9 +977,18 @@ static cJSON *collect_interfaces(void)
 		cJSON_AddNumberToObject(o, "prefix",  (double)prefix);
 		cJSON_AddStringToObject(o, "family",  family);
 		cJSON_AddStringToObject(o, "kind",    net_kind(name));
+		/* req4: gateway = 이 iface의 IPv4 default route(있으면). v6·미보유는 null. */
+		cJSON *g = NULL;
+		if (fam == AF_INET) {
+			cJSON *hit = cJSON_GetObjectItem(gw4, name);
+			if (hit && cJSON_IsString(hit))
+				g = cJSON_CreateString(hit->valuestring);
+		}
+		cJSON_AddItemToObject(o, "gateway", g ? g : cJSON_CreateNull());
 		cJSON_AddItemToArray(arr, o);
 	}
 	freeifaddrs(ifap);
+	cJSON_Delete(gw4);
 	return arr;
 }
 
@@ -1787,12 +1832,27 @@ static cJSON *collect_net_io(void)
 	return arr;
 }
 
+/* req3: 설정된 수집 주기(초). 엔진 sample_sufficiency 하드코딩(1440/day) 대체 기준값.
+ * main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60)를 읽는다. */
+static int agent_interval_sec(void)
+{
+	const char *v = getenv("AGENT_INTERVAL_SEC");
+	if (v && *v) {
+		char *end;
+		long n = strtol(v, &end, 10);
+		if (end != v && n > 0 && n < 86400)
+			return (int)n;
+	}
+	return 60;
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *root = cJSON_CreateObject();
 	if (!root)
 		return NULL;
 	add_common_metadata(root, "metrics", machine_id, agent_version);
+	cJSON_AddNumberToObject(root, "collection_interval_sec", agent_interval_sec());
 
 	int ok = 1;
 	if (!add_cpu_stat(root))     ok = 0;

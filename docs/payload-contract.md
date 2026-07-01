@@ -46,11 +46,12 @@ CI가 git 태그에서 주입한다(`v1.0.0` -> `1.0.0`, release.yml). 로컬/de
 | mounts[] | 마운트. mount/kind/fstype/total_bytes 등 |
 | services[] | 서비스. unit/sub/pid/exe |
 | listen_ports[] | 리슨 소켓. proto/addr/port/pid/comm |
-| interfaces[] | 인터페이스. name/address/prefix/family/kind (IPv4+IPv6) |
+| interfaces[] | 인터페이스. name/address/prefix/family/kind/gateway (IPv4+IPv6) |
 | mac_addresses[] | MAC 목록(감사용) |
 | ip_external[] | 외부 IP |
 
 services.pid와 listen_ports.pid로 unit-포트 조인이 가능하다.
+interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 IP(없으면 null). Linux는 IPv4 default route(/proc/net/route), Windows modern/win7은 FirstGatewayAddress. IPv6 항목과 win2003(NT5.2)은 null.
 
 ## metrics 필드
 
@@ -58,6 +59,7 @@ services.pid와 listen_ports.pid로 unit-포트 조인이 가능하다.
 
 | 필드 | 내용 |
 |---|---|
+| collection_interval_sec | 설정된 수집 주기(초). 엔진 표본 충분성 계산 기준 |
 | loadavg | 1/5/15분 (Linux) |
 | cpu_stat | user/nice/system/idle/iowait/irq/softirq/steal |
 | mem_* / swap_* | mem_total_kb, mem_free_kb, mem_available_kb, mem_buffers_kb, mem_cached_kb, swap_total_kb, swap_free_kb. 불변식 mem_available<=mem_total, swap_free<=swap_total 보장 |
@@ -88,7 +90,7 @@ task_id로 매칭하므로 식별 큐와 무관하다.
 - Windows kind는 coarse(IfType/드라이브 종류 기반). Linux는 세분.
 - Windows os_version은 DisplayVersion을 쓴다.
 - Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}`.
-  현재 disk_queue만 값을 발행(IOCTL_DISK_PERFORMANCE.QueueDepth 합)하고,
+  disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN, IOCTL_DISK_PERFORMANCE.QueueDepth). 빈 배열=미측정.
   cpu_run_queue/mem_paging_rate는 null(미측정). perflib(HKEY_PERFORMANCE_DATA) 실기 검증 후 raw 값으로 채운다.
 - listen_ports.uid는 Windows에서 null(POSIX uid 없음).
 
