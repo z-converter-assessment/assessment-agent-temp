@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 #ifndef AGENT_VERSION
-#define AGENT_VERSION "1.1.0"
+#define AGENT_VERSION "0.0.0-dev"
 #endif
 
 static volatile sig_atomic_t g_stop = 0;
@@ -275,9 +275,11 @@ int main(int argc, char **argv)
 
 		const char *queue_prefix = getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks");
 
-		const char *cid = cached_composite_id(machine_id);
+		/* 식별·라우팅은 안정 agent_id 기준(cutover). composite_id/machine_id는
+		 * 감사용으로 payload에만 실린다. 엔진은 agent.tasks.{agent_id}를 declare/route. */
+		const char *aid = cached_agent_id();
 		char queue_name[256];
-		snprintf(queue_name, sizeof queue_name, "%s.%s", queue_prefix, cid);
+		snprintf(queue_name, sizeof queue_name, "%s.%s", queue_prefix, aid);
 
 		worker_config_t wc = {
 			.amqp                = wcfg,

@@ -39,7 +39,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: build (${{ matrix.name }})
-        run: BUILD_IMAGE=${{ matrix.image }} BUILD_TARGET=${{ matrix.target }} sh scripts/build-linux.sh
+        # payload agent_version = 릴리즈 태그(v1.0.0 -> 1.0.0). 별도 스키마 버전 안 매김.
+        run: AGENT_VERSION="${GITHUB_REF_NAME#v}" BUILD_IMAGE=${{ matrix.image }} BUILD_TARGET=${{ matrix.target }} sh scripts/build-linux.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.name }}
@@ -74,7 +75,7 @@ jobs:
         working-directory: windows-agent
         run: |
           make PROFILE=${{ matrix.profile }} ${{ matrix.cross }} vendor-build
-          make PROFILE=${{ matrix.profile }} ${{ matrix.cross }} release
+          make PROFILE=${{ matrix.profile }} ${{ matrix.cross }} AGENT_VERSION="${GITHUB_REF_NAME#v}" release
       - uses: actions/upload-artifact@v4
         with:
           name: win-${{ matrix.profile }}
@@ -94,14 +95,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: build in debian:bookworm (CRT v10)
         run: |
-          docker run --rm --network host -v "$PWD/windows-agent":/w -w /w debian:bookworm bash -c '
+          docker run --rm --network host -e AGENT_VERSION="${GITHUB_REF_NAME#v}" -v "$PWD/windows-agent":/w -w /w debian:bookworm bash -c '
             set -e
             apt-get update -qq
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
               gcc-mingw-w64-i686 binutils-mingw-w64-i686 cmake make git perl ca-certificates
             echo "[toolchain] $(i686-w64-mingw32-gcc --version | head -1)"
             make PROFILE=legacy32 JOBS=2 vendor-build
-            make PROFILE=legacy32 release
+            make PROFILE=legacy32 AGENT_VERSION="$AGENT_VERSION" release
           '
       - uses: actions/upload-artifact@v4
         with:

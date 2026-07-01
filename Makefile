@@ -1,7 +1,9 @@
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11
 LDFLAGS ?=
-AGENT_VERSION ?= 1.1.0
+# payload의 agent_version 필드값. 릴리즈는 CI가 git 태그(release.yml)에서 주입한다.
+# 로컬/dev 빌드는 이 fallback. 스키마 계약 버전이 아니라 "어느 에이전트 빌드가 발행했나"의 빌드 정체성.
+AGENT_VERSION ?= 0.0.0-dev
 
 # USE_VENDORED=1 -> static link against vendor/ (release). default: pkg-config (dev).
 PKGS               := librabbitmq libcjson libcurl libarchive

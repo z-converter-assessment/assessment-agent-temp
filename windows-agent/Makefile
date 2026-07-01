@@ -9,7 +9,7 @@
 #   win7               : NT 6.1  x64 — Server 2008R2/2012/2012R2, Win7/8/8.1. OpenSSL 3.x.
 #   legacy32           : NT 5.2  i686 — Server 2003 / XP (32-bit). OpenSSL 1.0.2u, no bcrypt.
 #                        Needs an OLDER MinGW-w64 (i686) that still emits NT 5.2 startup code
-#                        + the win32/threads NT5.2 patch (see assessment-fleet/win-legacy-patch).
+#                        + the win32/threads NT5.2 patch (see assessment-fleet-temp/win-legacy-patch).
 # The C code is identical across profiles: GetTickCount64 / BCryptGenRandom are resolved
 # at runtime (monotonic_ms / compat_rand_bytes), so a lower WINNT_VER leaves no unresolved import.
 
@@ -73,7 +73,9 @@ CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
            -DCURL_STATICLIB -DAMQP_STATIC
 LDFLAGS ?= -static -static-libgcc -Wl,--no-insert-timestamp
 
-AGENT_VERSION ?= 1.1.0
+# payload의 agent_version 필드값. 릴리즈는 CI가 git 태그(release.yml)에서 주입한다.
+# 로컬/dev 빌드는 이 fallback. 스키마 계약 버전이 아니라 "어느 에이전트 빌드가 발행했나"의 빌드 정체성.
+AGENT_VERSION ?= 0.0.0-dev
 
 # Vendor static libraries (gitignored — built locally before agent build).
 VENDOR_DIR         := vendor

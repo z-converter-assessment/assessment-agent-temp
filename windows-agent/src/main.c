@@ -15,7 +15,7 @@
 #include <windows.h>
 
 #ifndef AGENT_VERSION
-#define AGENT_VERSION "1.1.0"
+#define AGENT_VERSION "0.0.0-dev"
 #endif
 
 static const char *user_worker_state_default(void)
@@ -77,10 +77,12 @@ static worker_config_t make_worker_config(const publish_config_t *pcfg,
 	wcfg.amqp.password  = wpass;
 	wcfg.amqp.exchange  = getenv_default("WORKER_TASK_EXCHANGE", "assessment.tasks");
 
-	const char *cid = cached_composite_id(machine_id);
+	/* 식별·라우팅은 안정 agent_id 기준(cutover). composite_id/machine_id는
+	 * 감사용으로 payload에만 실린다. 엔진은 agent.tasks.{agent_id}를 declare/route. */
+	const char *aid = cached_agent_id();
 	snprintf(queue_name_buf, qbuf_sz, "%s.%s",
 	         getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks"),
-	         cid);
+	         aid);
 	wcfg.queue_name         = queue_name_buf;
 	wcfg.result_routing_key = getenv_default("WORKER_TASK_RESULT_KEY", "task.result");
 	wcfg.machine_id         = machine_id;

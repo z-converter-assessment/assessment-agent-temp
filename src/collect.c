@@ -884,38 +884,6 @@ static int ipv4_netmask_prefix(uint32_t mask_n)
 	return n;
 }
 
-static cJSON *collect_internal_ips(void)
-{
-	cJSON *arr = cJSON_CreateArray();
-	struct ifaddrs *ifap = NULL;
-	if (getifaddrs(&ifap) != 0)
-		return arr;
-
-	for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
-		if (!ifa->ifa_addr)
-			continue;
-		if (ifa->ifa_flags & IFF_LOOPBACK)
-			continue;
-		if (ifa->ifa_addr->sa_family != AF_INET)
-			continue;
-		char ip[INET_ADDRSTRLEN];
-		struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-		if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip))
-			continue;
-
-		int prefix = 0;
-		if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET) {
-			struct sockaddr_in *mask = (struct sockaddr_in *)ifa->ifa_netmask;
-			prefix = ipv4_netmask_prefix(mask->sin_addr.s_addr);
-		}
-		char cidr[INET_ADDRSTRLEN + 4];
-		snprintf(cidr, sizeof cidr, "%s/%d", ip, prefix);
-		cJSON_AddItemToArray(arr, cJSON_CreateString(cidr));
-	}
-	freeifaddrs(ifap);
-	return arr;
-}
-
 static int ipv6_netmask_prefix(const struct sockaddr_in6 *mask)
 {
 	int prefix = 0;
@@ -929,7 +897,7 @@ static int ipv6_netmask_prefix(const struct sockaddr_in6 *mask)
 }
 
 /* item 3: 구조화 인터페이스 배열(name/address/prefix/family/kind, IPv6 포함).
- * ip_internal(CIDR 문자열, IPv4-only)과 additive 병행 발행한다. */
+ * cutover로 구형 ip_internal(CIDR 문자열, IPv4-only) 대체(단독 발행). */
 static cJSON *collect_interfaces(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1569,7 +1537,6 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	cJSON_AddItemToObject(root, "services",     collect_services());
 	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
-	cJSON_AddItemToObject(root, "ip_internal",   or_empty_array(collect_internal_ips()));
 	cJSON_AddItemToObject(root, "interfaces",    or_empty_array(collect_interfaces()));
 	cJSON_AddItemToObject(root, "mac_addresses", or_empty_array(collect_mac_addresses()));
 

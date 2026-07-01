@@ -494,7 +494,6 @@ static int mac_cmp(const void *a, const void *b)
 
 static void fill_network_info(cJSON *inv)
 {
-	cJSON *ips    = cJSON_AddArrayToObject(inv, "ip_internal");
 	cJSON *ifaces = cJSON_AddArrayToObject(inv, "interfaces");
 	cJSON *macs   = cJSON_AddArrayToObject(inv, "mac_addresses");
 
@@ -537,18 +536,13 @@ static void fill_network_info(cJSON *inv)
 				family = "ipv6";
 			}
 			if (!ip[0]) continue;
-			char cidr[INET6_ADDRSTRLEN + 5];
 			unsigned prefix = 0;
 #if AGENT_NT6
 			prefix = (unsigned)u->OnLinkPrefixLength;
-			snprintf(cidr, sizeof cidr, "%s/%u", ip, prefix);
-#else
-
-			snprintf(cidr, sizeof cidr, "%s", ip);
 #endif
-			cJSON_AddItemToArray(ips, cJSON_CreateString(cidr));
 
-			/* item 3: 구조화 interfaces[] (name/address/prefix/family/kind) */
+			/* item 3: 구조화 interfaces[] (name/address/prefix/family/kind).
+			 * cutover로 구형 ip_internal 대체(단독 발행). */
 			char ifname[256];
 			WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1,
 			                    ifname, sizeof ifname, NULL, NULL);

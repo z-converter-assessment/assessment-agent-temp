@@ -45,8 +45,10 @@ GID_HOST=$(id -g)
 # The legacy CentOS 6 build overrides both: manylinux2010 image + release-legacy.
 BUILD_IMAGE="${BUILD_IMAGE:-quay.io/pypa/manylinux2014_x86_64}"
 BUILD_TARGET="${BUILD_TARGET:-release}"
+# payload agent_version — CI가 git 태그에서 주입(release.yml). 로컬은 dev fallback.
+AGENT_VERSION="${AGENT_VERSION:-0.0.0-dev}"
 
-echo "[build-linux] image=$BUILD_IMAGE target=$BUILD_TARGET"
+echo "[build-linux] image=$BUILD_IMAGE target=$BUILD_TARGET agent_version=$AGENT_VERSION"
 
 docker run --rm \
     --network host \
@@ -62,7 +64,7 @@ docker run --rm \
         export CC=gcc CXX=g++
         make vendor-fetch
         make vendor-build
-        make USE_VENDORED=1 ${BUILD_TARGET}
+        make USE_VENDORED=1 AGENT_VERSION='${AGENT_VERSION}' ${BUILD_TARGET}
         chown -R ${UID_HOST}:${GID_HOST} vendor dist 2>/dev/null || true
     "
 
