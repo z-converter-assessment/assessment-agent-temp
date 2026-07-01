@@ -32,6 +32,10 @@ ifeq ($(PROFILE),legacy32)
   RABBITMQ_C_VERSION  ?= v0.10.0
   BIN                 := assessment-agent-win2003-x86.exe
   BCRYPT_LIB          :=
+  # OpenSSL 1.0.2u엔 build_libs는 있으나 install_dev 타깃이 없다 -> 전체 빌드 + install_sw.
+  # (1.0.2 apps는 .rc가 없어 windres를 쓰지 않으므로 전체 빌드해도 이중 prefix 문제 없음)
+  OPENSSL_MAKE_TGT    :=
+  OPENSSL_INSTALL_TGT := install_sw
   OPENSSL_CONFIG_OPTS := no-shared no-dso \
       -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration \
       -Wno-error=int-conversion -Wno-error=implicit-int -fcommon
@@ -58,6 +62,11 @@ endif
 
 EXTRA_SYS_LIBS ?=
 VENDOR_CFLAGS  ?=
+
+# OpenSSL 3.x(modern/win7): 라이브러리만 뽑는 build_libs + install_dev로 apps/windres 회피.
+# legacy32(1.0.2u)는 위 블록에서 install_sw로 override.
+OPENSSL_MAKE_TGT    ?= build_libs
+OPENSSL_INSTALL_TGT ?= install_dev
 
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
            -D_WIN32_WINNT=$(WINNT_VER) -DWINVER=$(WINNT_VER) -DUNICODE -D_UNICODE \
@@ -106,7 +115,7 @@ CFLAGS += -I$(CJSON_DIR) \
 # bcrypt: modern/win7 only (resolved at runtime via compat_rand_bytes, so legacy32 drops it).
 LDLIBS := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
           -lws2_32 -liphlpapi -ladvapi32 -lkernel32 -luser32 \
-          -lcrypt32 -lsecur32 $(BCRYPT_LIB) -lole32 -loleaut32 -lshell32 $(EXTRA_SYS_LIBS)
+          -lcrypt32 -lsecur32 $(BCRYPT_LIB) -lole32 -loleaut32 -lshell32 -lpthread $(EXTRA_SYS_LIBS)
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
@@ -142,8 +151,13 @@ vendor-build-openssl:
 	    --libdir=lib --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
 	# 1.0.2 install_sw mkdir is not idempotent — wipe prefix first.
 	rm -rf $(OPENSSL_DIR)/install
-	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS)
-	$(MAKE) -C $(OPENSSL_DIR) install_sw
+	# 라이브러리(libssl/libcrypto)만 필요 — apps(openssl.exe)는 빌드하지 않는다.
+	# 기본 타깃 build_sw는 apps/openssl.rc를 RC(=$(CROSS_COMPILE)windres)로 컴파일하는데,
+	# --cross-compile-prefix가 windres 이름에도 적용되어 이중 prefix
+	# (x86_64-w64-mingw32-x86_64-w64-mingw32-windres)가 되어 실패한다.
+	# 3.0.15엔 no-apps 옵션이 없으므로 build_libs + install_dev 로 apps 를 건너뛴다.
+	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS) $(OPENSSL_MAKE_TGT)
+	$(MAKE) -C $(OPENSSL_DIR) $(OPENSSL_INSTALL_TGT)
 
 vendor-build-zlib:
 	# zlib win32/Makefile.gcc defines ARFLAGS=rcs itself — pass AR command only.

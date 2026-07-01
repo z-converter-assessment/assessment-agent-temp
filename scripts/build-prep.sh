@@ -57,9 +57,19 @@ elif command -v yum >/dev/null 2>&1; then
 	for pkg in $RPM_PKGS; do
 		try_install_one yum "$pkg"
 	done
-	# manylinux2014(CentOS7) base cmake=2.8.12 -> libarchive(cmake 3.x 필요) 실패.
-	# cmake3(EPEL, 3.17)을 설치해 /usr/local/bin/cmake 로 우선 노출.
-	if yum install -y -q cmake3 >/dev/null 2>&1 && command -v cmake3 >/dev/null 2>&1; then
+	# cmake 최소 요구: rabbitmq-c v0.15.0 은 CMake 3.22+ 를 요구한다.
+	# 최신 manylinux 이미지엔 이미 pipx cmake(4.x)가 /usr/local/bin/cmake 로 있으므로,
+	# EPEL cmake3(3.17)로 덮어쓰면 오히려 강등되어 rabbitmq-c 빌드가 깨진다.
+	# 기존 cmake 가 3.22+ 이면 손대지 않고, 그보다 낮을 때만 cmake3 로 보강한다.
+	cmake_ok=0
+	have=$(cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
+	if [ -n "$have" ]; then
+		set -- $have
+		if [ "$1" -gt 3 ] || { [ "$1" -eq 3 ] && [ "$2" -ge 22 ]; }; then cmake_ok=1; fi
+	fi
+	if [ "$cmake_ok" -eq 1 ]; then
+		echo "  = cmake $(cmake --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') 이미 충분 (>=3.22) — 유지"
+	elif yum install -y -q cmake3 >/dev/null 2>&1 && command -v cmake3 >/dev/null 2>&1; then
 		ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
 		echo "  + cmake3 -> /usr/local/bin/cmake ($(cmake3 --version | head -1))"
 	fi

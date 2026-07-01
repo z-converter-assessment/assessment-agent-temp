@@ -49,6 +49,7 @@ BUILD_TARGET="${BUILD_TARGET:-release}"
 echo "[build-linux] image=$BUILD_IMAGE target=$BUILD_TARGET"
 
 docker run --rm \
+    --network host \
     --platform linux/amd64 \
     -v "$(pwd)":/src -w /src \
     "$BUILD_IMAGE" \
