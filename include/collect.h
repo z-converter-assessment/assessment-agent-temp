@@ -7,6 +7,9 @@ char *resolve_machine_id(void);
 
 const char *cached_composite_id(const char *machine_id);
 
+/* task.result 등 inventory 외 메시지에서 os_family/os_id/os_version을 재사용. */
+void collect_add_os_result_fields(cJSON *root);
+
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version);
 
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version);

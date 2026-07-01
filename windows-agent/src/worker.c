@@ -197,7 +197,9 @@ static char *iso8601_now(void)
 	return buf;
 }
 
-static void os_build_number(char *out, size_t out_sz)
+/* task.result os_version은 inventory와 동일 소스(DisplayVersion, fallback ReleaseId)를
+ * 쓴다 — 과거 bare CurrentBuildNumber와 의미가 달랐던 것을 통일. */
+static void os_display_version(char *out, size_t out_sz)
 {
 	if (out_sz) out[0] = '\0';
 	HKEY hKey;
@@ -205,7 +207,10 @@ static void os_build_number(char *out, size_t out_sz)
 	    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
 	    0, KEY_READ, &hKey) != ERROR_SUCCESS) return;
 	DWORD sz = (DWORD)out_sz;
-	RegQueryValueExA(hKey, "CurrentBuildNumber", NULL, NULL, (LPBYTE)out, &sz);
+	if (RegQueryValueExA(hKey, "DisplayVersion", NULL, NULL, (LPBYTE)out, &sz) != ERROR_SUCCESS) {
+		sz = (DWORD)out_sz;
+		RegQueryValueExA(hKey, "ReleaseId", NULL, NULL, (LPBYTE)out, &sz);
+	}
 	RegCloseKey(hKey);
 }
 
@@ -223,8 +228,9 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	cJSON_AddStringToObject(root, "machine_id",       ctx->cfg.machine_id ? ctx->cfg.machine_id : "");
 	cJSON_AddStringToObject(root, "os_family",        "windows");
+	cJSON_AddStringToObject(root, "os_id",            "windows");
 	char os_build_b[32];
-	os_build_number(os_build_b, sizeof os_build_b);
+	os_display_version(os_build_b, sizeof os_build_b);
 	if (os_build_b[0])
 		cJSON_AddStringToObject(root, "os_version", os_build_b);
 	else
@@ -510,8 +516,9 @@ static unsigned __stdcall install_thread_main(void *arg)
 		cJSON_AddStringToObject(root, "message_type",     "task.result");
 		cJSON_AddStringToObject(root, "machine_id",       a->machine_id ? a->machine_id : "");
 		cJSON_AddStringToObject(root, "os_family",        "windows");
+		cJSON_AddStringToObject(root, "os_id",            "windows");
 		char os_build_b[32];
-		os_build_number(os_build_b, sizeof os_build_b);
+		os_display_version(os_build_b, sizeof os_build_b);
 		if (os_build_b[0])
 			cJSON_AddStringToObject(root, "os_version", os_build_b);
 		else

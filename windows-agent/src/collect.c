@@ -231,6 +231,10 @@ static void fill_memory_metrics(cJSON *out)
 	long long swap_avail = (ms.ullAvailPageFile > ms.ullAvailPhys)
 	    ? (long long)((ms.ullAvailPageFile - ms.ullAvailPhys) / 1024ULL)
 	    : 0;
+	/* canonical 불변식: swap_free <= swap_total. TotalPageFile-TotalPhys와
+	 * AvailPageFile-AvailPhys는 서로 다른 뺄셈이라 상한 관계가 없어, 소스에서
+	 * clamp해 엔진 defensive clamp가 정상 에이전트에선 발동하지 않게 한다. */
+	if (swap_avail > swap_total) swap_avail = swap_total;
 
 	cJSON_AddNumberToObject(out, "mem_total_kb",     (double)mem_total);
 	cJSON_AddNumberToObject(out, "mem_free_kb",      (double)mem_avail);
@@ -297,6 +301,7 @@ static cJSON *enumerate_physical_disks(void)
 			cJSON_AddNumberToObject(o, "minor", i);
 			cJSON_AddNumberToObject(o, "size_bytes", (double)gli.Length.QuadPart);
 			cJSON_AddStringToObject(o, "type", "disk");
+			cJSON_AddStringToObject(o, "kind", "physical");
 			cJSON_AddItemToArray(arr, o);
 		}
 		CloseHandle(h);
@@ -345,6 +350,7 @@ static cJSON *enumerate_mounts(int include_fstype)
 				cJSON_AddNumberToObject(o, "total_bytes", (double)total.QuadPart);
 				cJSON_AddNumberToObject(o, "free_bytes",  (double)total_free.QuadPart);
 				cJSON_AddNumberToObject(o, "avail_bytes", (double)avail_to_caller.QuadPart);
+				cJSON_AddStringToObject(o, "kind", "data");
 
 				if (include_fstype) {
 					wchar_t fs[16] = {0};
@@ -393,11 +399,23 @@ static cJSON *enumerate_disk_io(void)
 			                        (double)(dp.BytesRead.QuadPart / 512));
 			cJSON_AddNumberToObject(o, "sectors_written",
 			                        (double)(dp.BytesWritten.QuadPart / 512));
+			cJSON_AddStringToObject(o, "kind", "physical");
 			cJSON_AddItemToArray(arr, o);
 		}
 		CloseHandle(h);
 	}
 	return arr;
+}
+
+/* IfType -> kind (item 1). Windows는 세분 분류(bridge/veth/bond)가 안 나와
+ * coarse(physical/loopback/tunnel/virtual)로만 태그한다 — 엔진이 수용. */
+static const char *win_net_kind(ULONG if_type)
+{
+	if (if_type == IF_TYPE_SOFTWARE_LOOPBACK) return "loopback";
+	if (if_type == IF_TYPE_TUNNEL)            return "tunnel";
+	if (if_type == IF_TYPE_ETHERNET_CSMACD || if_type == 71 /* IEEE80211 */)
+		return "physical";
+	return "virtual";
 }
 
 #if AGENT_NT6
@@ -422,6 +440,7 @@ static cJSON *enumerate_net_io(void)
 		cJSON_AddNumberToObject(o, "tx_packets", (double)(r->OutUcastPkts + r->OutNUcastPkts));
 		cJSON_AddNumberToObject(o, "rx_errors",  (double)r->InErrors);
 		cJSON_AddNumberToObject(o, "tx_errors",  (double)r->OutErrors);
+		cJSON_AddStringToObject(o, "kind", win_net_kind(r->Type));
 		cJSON_AddItemToArray(arr, o);
 	}
 	FreeMibTable(table);
@@ -459,6 +478,7 @@ static cJSON *enumerate_net_io(void)
 		cJSON_AddNumberToObject(o, "tx_packets", (double)((double)r->dwOutUcastPkts + r->dwOutNUcastPkts));
 		cJSON_AddNumberToObject(o, "rx_errors",  (double)r->dwInErrors);
 		cJSON_AddNumberToObject(o, "tx_errors",  (double)r->dwOutErrors);
+		cJSON_AddStringToObject(o, "kind", win_net_kind(r->dwType));
 		cJSON_AddItemToArray(arr, o);
 	}
 	free(t);
@@ -473,8 +493,9 @@ static int mac_cmp(const void *a, const void *b)
 
 static void fill_network_info(cJSON *inv)
 {
-	cJSON *ips  = cJSON_AddArrayToObject(inv, "ip_internal");
-	cJSON *macs = cJSON_AddArrayToObject(inv, "mac_addresses");
+	cJSON *ips    = cJSON_AddArrayToObject(inv, "ip_internal");
+	cJSON *ifaces = cJSON_AddArrayToObject(inv, "interfaces");
+	cJSON *macs   = cJSON_AddArrayToObject(inv, "mac_addresses");
 
 	ULONG buf_len = 16 * 1024;
 	IP_ADAPTER_ADDRESSES *aa = malloc(buf_len);
@@ -504,24 +525,39 @@ static void fill_network_info(cJSON *inv)
 
 		for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress; u; u = u->Next) {
 			char ip[INET6_ADDRSTRLEN] = {0};
+			const char *family = NULL;
 			if (u->Address.lpSockaddr->sa_family == AF_INET) {
 				struct sockaddr_in *sa = (struct sockaddr_in *)u->Address.lpSockaddr;
 				inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof ip);
+				family = "ipv4";
 			} else if (u->Address.lpSockaddr->sa_family == AF_INET6) {
 				struct sockaddr_in6 *sa = (struct sockaddr_in6 *)u->Address.lpSockaddr;
 				inet_ntop(AF_INET6, &sa->sin6_addr, ip, sizeof ip);
+				family = "ipv6";
 			}
 			if (!ip[0]) continue;
 			char cidr[INET6_ADDRSTRLEN + 5];
+			unsigned prefix = 0;
 #if AGENT_NT6
-
-			snprintf(cidr, sizeof cidr, "%s/%u", ip,
-				(unsigned)u->OnLinkPrefixLength);
+			prefix = (unsigned)u->OnLinkPrefixLength;
+			snprintf(cidr, sizeof cidr, "%s/%u", ip, prefix);
 #else
 
 			snprintf(cidr, sizeof cidr, "%s", ip);
 #endif
 			cJSON_AddItemToArray(ips, cJSON_CreateString(cidr));
+
+			/* item 3: 구조화 interfaces[] (name/address/prefix/family/kind) */
+			char ifname[256];
+			WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1,
+			                    ifname, sizeof ifname, NULL, NULL);
+			cJSON *io = cJSON_CreateObject();
+			cJSON_AddStringToObject(io, "name",    ifname);
+			cJSON_AddStringToObject(io, "address", ip);
+			cJSON_AddNumberToObject(io, "prefix",  (double)prefix);
+			cJSON_AddStringToObject(io, "family",  family ? family : "");
+			cJSON_AddStringToObject(io, "kind",    win_net_kind(p->IfType));
+			cJSON_AddItemToArray(ifaces, io);
 		}
 
 		if (p->PhysicalAddressLength == 6 && mac_count < MAC_CAP) {
@@ -793,6 +829,8 @@ static char *try_cloud_instance_id(void)
 	return id;
 }
 
+static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz);
+
 static cJSON *enumerate_running_services(void)
 {
 	SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ENUMERATE_SERVICE);
@@ -820,6 +858,13 @@ static cJSON *enumerate_running_services(void)
 			cJSON *o = cJSON_CreateObject();
 			cJSON_AddStringToObject(o, "unit", name);
 			cJSON_AddStringToObject(o, "sub",  "running");
+			DWORD spid = es[i].ServiceStatusProcess.dwProcessId;
+			if (spid) cJSON_AddNumberToObject(o, "pid", (double)spid);
+			else      cJSON_AddNullToObject  (o, "pid");
+			char exe[256];
+			fill_comm_for_pid(spid, exe, sizeof exe);
+			if (exe[0]) cJSON_AddStringToObject(o, "exe", exe);
+			else        cJSON_AddNullToObject  (o, "exe");
 			cJSON_AddItemToArray(arr, o);
 		}
 	}

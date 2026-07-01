@@ -73,7 +73,7 @@ CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
            -DCURL_STATICLIB -DAMQP_STATIC
 LDFLAGS ?= -static -static-libgcc -Wl,--no-insert-timestamp
 
-AGENT_VERSION ?= 1.0.0
+AGENT_VERSION ?= 1.1.0
 
 # Vendor static libraries (gitignored — built locally before agent build).
 VENDOR_DIR         := vendor

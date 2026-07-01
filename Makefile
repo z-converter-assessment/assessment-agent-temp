@@ -1,7 +1,7 @@
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11
 LDFLAGS ?=
-AGENT_VERSION ?= 1.0.0
+AGENT_VERSION ?= 1.1.0
 
 # USE_VENDORED=1 -> static link against vendor/ (release). default: pkg-config (dev).
 PKGS               := librabbitmq libcjson libcurl libarchive

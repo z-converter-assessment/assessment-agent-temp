@@ -15,7 +15,7 @@
 #include <windows.h>
 
 #ifndef AGENT_VERSION
-#define AGENT_VERSION "1.0.0"
+#define AGENT_VERSION "1.1.0"
 #endif
 
 static const char *user_worker_state_default(void)

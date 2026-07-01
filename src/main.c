@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 #ifndef AGENT_VERSION
-#define AGENT_VERSION "1.0.0"
+#define AGENT_VERSION "1.1.0"
 #endif
 
 static volatile sig_atomic_t g_stop = 0;

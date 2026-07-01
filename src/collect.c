@@ -400,6 +400,12 @@ static int add_kernel_version(cJSON *root)
 	return 1;
 }
 
+void collect_add_os_result_fields(cJSON *root)
+{
+	cJSON_AddStringToObject(root, "os_family", "linux");
+	add_os_release(root);   /* os_id, os_version, os_codename */
+}
+
 static int add_cpu_cores(cJSON *root)
 {
 	long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -484,6 +490,64 @@ static int add_mem_total_swap_total(cJSON *root)
 	return 1;
 }
 
+/* ---- device kind 분류기 (item 1) — disk_io/net_io/mounts/interfaces 공용 ----
+ * "가상이냐" 판정을 한 곳으로 모아 엔진의 정규식/major 추론을 대체한다. */
+
+static const char *disk_kind(const char *dev)
+{
+	char p[288];
+	snprintf(p, sizeof p, "/sys/class/block/%s/partition", dev);
+	if (access(p, F_OK) == 0) return "partition";
+	snprintf(p, sizeof p, "/sys/block/%s/dm", dev);
+	if (access(p, F_OK) == 0) return "lvm";
+	snprintf(p, sizeof p, "/sys/block/%s/md", dev);
+	if (access(p, F_OK) == 0) return "raid";
+	snprintf(p, sizeof p, "/sys/block/%s/device", dev);
+	if (access(p, F_OK) == 0) return "physical";
+	return "virtual";
+}
+
+static const char *net_kind(const char *ifname)
+{
+	if (!ifname || !*ifname) return "virtual";
+	if (strcmp(ifname, "lo") == 0) return "loopback";
+	char p[320];
+	snprintf(p, sizeof p, "/sys/class/net/%s/bridge", ifname);
+	if (access(p, F_OK) == 0) return "bridge";
+	snprintf(p, sizeof p, "/sys/class/net/%s/bonding", ifname);
+	if (access(p, F_OK) == 0) return "bond_master";
+	snprintf(p, sizeof p, "/sys/class/net/%s/bonding_slave", ifname);
+	if (access(p, F_OK) == 0) return "bond_member";
+	snprintf(p, sizeof p, "/sys/class/net/%s/tun_flags", ifname);
+	if (access(p, F_OK) == 0) return "tunnel";
+	snprintf(p, sizeof p, "/sys/class/net/%s/uevent", ifname);
+	char *ue = read_file_all(p);
+	if (ue) {
+		int is_vlan = strstr(ue, "DEVTYPE=vlan") != NULL;
+		free(ue);
+		if (is_vlan) return "vlan";
+	}
+	if (strncmp(ifname, "veth", 4) == 0)   return "veth";
+	if (strncmp(ifname, "docker", 6) == 0) return "bridge";
+	if (strncmp(ifname, "virbr", 5) == 0)  return "bridge";
+	if (strncmp(ifname, "br-", 3) == 0)    return "bridge";
+	snprintf(p, sizeof p, "/sys/class/net/%s/device", ifname);
+	if (access(p, F_OK) == 0) return "physical";
+	return "virtual";
+}
+
+static const char *mount_kind(const char *mountpoint, const char *fstype)
+{
+	if (mountpoint && (strcmp(mountpoint, "/boot") == 0 ||
+	                   strncmp(mountpoint, "/boot/", 6) == 0))
+		return "boot";
+	if (fstype && (strcmp(fstype, "squashfs") == 0 ||
+	               strcmp(fstype, "iso9660") == 0 ||
+	               strcmp(fstype, "udf") == 0))
+		return "image";
+	return "data";
+}
+
 static cJSON *collect_disks_via_lsblk(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -531,6 +595,7 @@ static cJSON *collect_disks_via_lsblk(void)
 
 		cJSON_AddStringToObject(item, "type",
 		                        cJSON_IsString(type) ? type->valuestring : "disk");
+		cJSON_AddStringToObject(item, "kind", disk_kind(name->valuestring));
 		cJSON_AddItemToArray(arr, item);
 	}
 	cJSON_Delete(parsed);
@@ -582,6 +647,7 @@ static cJSON *collect_disks_via_sysfs(void)
 		add_major_minor(item, major, minor);
 		cJSON_AddNumberToObject(item, "size_bytes", (double)sectors * 512.0);
 		cJSON_AddStringToObject(item, "type", "disk");
+		cJSON_AddStringToObject(item, "kind", disk_kind(e->d_name));
 		cJSON_AddItemToArray(arr, item);
 	}
 	closedir(d);
@@ -769,6 +835,8 @@ static cJSON *collect_mounts_inventory(void)
 		cJSON_AddNumberToObject(item, "free_bytes", freeb);
 		cJSON_AddNumberToObject(item, "avail_bytes", avail);
 		cJSON_AddStringToObject(item, "fstype", mounts[i].fstype);
+		cJSON_AddStringToObject(item, "kind",
+		                        mount_kind(mounts[i].mount, mounts[i].fstype));
 		cJSON_AddItemToArray(arr, item);
 	}
 	free_mount_entries(mounts, n);
@@ -797,6 +865,9 @@ static cJSON *collect_mounts_metrics(void)
 		cJSON_AddNumberToObject(item, "total_bytes", total);
 		cJSON_AddNumberToObject(item, "free_bytes", freeb);
 		cJSON_AddNumberToObject(item, "avail_bytes", avail);
+		cJSON_AddStringToObject(item, "fstype", mounts[i].fstype);
+		cJSON_AddStringToObject(item, "kind",
+		                        mount_kind(mounts[i].mount, mounts[i].fstype));
 		cJSON_AddItemToArray(arr, item);
 	}
 	free_mount_entries(mounts, n);
@@ -838,6 +909,69 @@ static cJSON *collect_internal_ips(void)
 		char cidr[INET_ADDRSTRLEN + 4];
 		snprintf(cidr, sizeof cidr, "%s/%d", ip, prefix);
 		cJSON_AddItemToArray(arr, cJSON_CreateString(cidr));
+	}
+	freeifaddrs(ifap);
+	return arr;
+}
+
+static int ipv6_netmask_prefix(const struct sockaddr_in6 *mask)
+{
+	int prefix = 0;
+	for (int i = 0; i < 16; i++) {
+		unsigned char b = mask->sin6_addr.s6_addr[i];
+		if (b == 0xff) { prefix += 8; continue; }
+		while (b & 0x80) { prefix++; b <<= 1; }
+		break;
+	}
+	return prefix;
+}
+
+/* item 3: 구조화 인터페이스 배열(name/address/prefix/family/kind, IPv6 포함).
+ * ip_internal(CIDR 문자열, IPv4-only)과 additive 병행 발행한다. */
+static cJSON *collect_interfaces(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	struct ifaddrs *ifap = NULL;
+	if (getifaddrs(&ifap) != 0)
+		return arr;
+
+	for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr)
+			continue;
+		if (ifa->ifa_flags & IFF_LOOPBACK)
+			continue;
+		int fam = ifa->ifa_addr->sa_family;
+		char ip[INET6_ADDRSTRLEN];
+		int prefix = 0;
+		const char *family;
+		if (fam == AF_INET) {
+			struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+			if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip))
+				continue;
+			if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET)
+				prefix = ipv4_netmask_prefix(
+				    ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr);
+			family = "ipv4";
+		} else if (fam == AF_INET6) {
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+			if (!inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof ip))
+				continue;
+			if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET6)
+				prefix = ipv6_netmask_prefix(
+				    (struct sockaddr_in6 *)ifa->ifa_netmask);
+			family = "ipv6";
+		} else {
+			continue;
+		}
+
+		const char *name = ifa->ifa_name ? ifa->ifa_name : "";
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "name",    name);
+		cJSON_AddStringToObject(o, "address", ip);
+		cJSON_AddNumberToObject(o, "prefix",  (double)prefix);
+		cJSON_AddStringToObject(o, "family",  family);
+		cJSON_AddStringToObject(o, "kind",    net_kind(name));
+		cJSON_AddItemToArray(arr, o);
 	}
 	freeifaddrs(ifap);
 	return arr;
@@ -1041,6 +1175,11 @@ static cJSON *collect_external_ip(void)
 	return arr;
 }
 
+static int read_pid_comm(int pid, char *out, size_t out_len);
+
+/* services[]에 pid(MainPID)/exe(comm)를 붙여 listen_ports[].pid와 조인 가능하게 한다.
+ * per-unit `systemctl show` 반복은 fork 비용이 커서, 실행 중 unit 전체를 한 번의
+ * `systemctl show -p Id,MainPID <units...>`로 배치 조회해 unit명으로 매칭한다. */
 static cJSON *collect_services(void)
 {
 	char *out = run_cmd(
@@ -1052,6 +1191,10 @@ static cJSON *collect_services(void)
 
 	cJSON *arr = cJSON_CreateArray();
 	if (!arr) { free(out); return NULL; }
+
+	char units_buf[8192];
+	size_t units_len = 0;
+	units_buf[0] = '\0';
 
 	char *save = NULL;
 	for (char *line = strtok_r(out, "\n", &save); line;
@@ -1069,8 +1212,66 @@ static cJSON *collect_services(void)
 		cJSON_AddStringToObject(item, "unit", unit);
 		cJSON_AddStringToObject(item, "sub",  sub);
 		cJSON_AddItemToArray(arr, item);
+
+		/* unit명은 systemctl 규칙상 공백/쉘 메타문자가 없어 bare로 이어붙인다. */
+		size_t ul = strlen(unit);
+		if (units_len + ul + 2 < sizeof units_buf) {
+			if (units_len) units_buf[units_len++] = ' ';
+			memcpy(units_buf + units_len, unit, ul);
+			units_len += ul;
+			units_buf[units_len] = '\0';
+		}
 	}
 	free(out);
+
+	if (units_buf[0]) {
+		char cmd[8320];
+		snprintf(cmd, sizeof cmd,
+		         "systemctl show --property=Id,MainPID %s 2>/dev/null", units_buf);
+		char *show = run_cmd(cmd);
+		if (show) {
+			char cur_id[256] = "";
+			char *s2 = NULL;
+			for (char *l = strtok_r(show, "\n", &s2); l; l = strtok_r(NULL, "\n", &s2)) {
+				if (strncmp(l, "Id=", 3) == 0) {
+					snprintf(cur_id, sizeof cur_id, "%s", l + 3);
+				} else if (strncmp(l, "MainPID=", 8) == 0 && cur_id[0]) {
+					int pid = atoi(l + 8);
+					cJSON *it;
+					cJSON_ArrayForEach(it, arr) {
+						cJSON *u = cJSON_GetObjectItemCaseSensitive(it, "unit");
+						if (!cJSON_IsString(u) || strcmp(u->valuestring, cur_id) != 0)
+							continue;
+						if (cJSON_GetObjectItemCaseSensitive(it, "pid"))
+							break;   /* 이미 설정됨 */
+						if (pid > 0) {
+							cJSON_AddNumberToObject(it, "pid", (double)pid);
+							char comm[64];
+							if (read_pid_comm(pid, comm, sizeof comm))
+								cJSON_AddStringToObject(it, "exe", comm);
+							else
+								cJSON_AddNullToObject(it, "exe");
+						} else {
+							cJSON_AddNullToObject(it, "pid");
+							cJSON_AddNullToObject(it, "exe");
+						}
+						break;
+					}
+					cur_id[0] = '\0';
+				}
+			}
+			free(show);
+		}
+	}
+
+	/* show에서 못 잡힌 항목은 pid/exe를 null로 채워 스키마 일관 유지. */
+	cJSON *it;
+	cJSON_ArrayForEach(it, arr) {
+		if (!cJSON_GetObjectItemCaseSensitive(it, "pid")) {
+			cJSON_AddNullToObject(it, "pid");
+			cJSON_AddNullToObject(it, "exe");
+		}
+	}
 	return arr;
 }
 
@@ -1299,6 +1500,7 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	cJSON_AddItemToObject(root, "services",     collect_services());
 	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
 	cJSON_AddItemToObject(root, "ip_internal",   or_empty_array(collect_internal_ips()));
+	cJSON_AddItemToObject(root, "interfaces",    or_empty_array(collect_interfaces()));
 	cJSON_AddItemToObject(root, "mac_addresses", or_empty_array(collect_mac_addresses()));
 
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
@@ -1488,6 +1690,7 @@ static cJSON *collect_disk_io(void)
 		cJSON_AddNumberToObject(item, "writes_completed", (double)writes_completed);
 		cJSON_AddNumberToObject(item, "sectors_read",     (double)sectors_read);
 		cJSON_AddNumberToObject(item, "sectors_written",  (double)sectors_written);
+		cJSON_AddStringToObject(item, "kind", disk_kind(dev));
 		cJSON_AddItemToArray(arr, item);
 	}
 	free(content);
@@ -1540,6 +1743,7 @@ static cJSON *collect_net_io(void)
 		cJSON_AddNumberToObject(item, "tx_packets", (double)tx_packets);
 		cJSON_AddNumberToObject(item, "rx_errors",  (double)rx_errors);
 		cJSON_AddNumberToObject(item, "tx_errors",  (double)tx_errors);
+		cJSON_AddStringToObject(item, "kind", net_kind(iface));
 		cJSON_AddItemToArray(arr, item);
 	}
 	free(content);
