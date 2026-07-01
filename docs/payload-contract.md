@@ -88,7 +88,7 @@ task_id로 매칭하므로 식별 큐와 무관하다.
 ## OS별 차이
 
 - Windows kind는 coarse(IfType/드라이브 종류 기반). Linux는 세분.
-- Windows os_version은 DisplayVersion을 쓴다.
+- Windows os_version은 DisplayVersion(없으면 ReleaseId, 예: Server 2016 -> "1607"). 둘 다 없는 구버전(2012R2/2003 등)은 빈 문자열.
 - Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}`.
   disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN, IOCTL_DISK_PERFORMANCE.QueueDepth). 빈 배열=미측정.
   cpu_run_queue/mem_paging_rate는 null(미측정). perflib(HKEY_PERFORMANCE_DATA) 실기 검증 후 raw 값으로 채운다.
