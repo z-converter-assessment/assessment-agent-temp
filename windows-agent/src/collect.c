@@ -497,20 +497,23 @@ static void fill_network_info(cJSON *inv)
 	cJSON *ifaces = cJSON_AddArrayToObject(inv, "interfaces");
 	cJSON *macs   = cJSON_AddArrayToObject(inv, "mac_addresses");
 
+	/* req4: FirstGatewayAddress는 GAA_FLAG_INCLUDE_GATEWAYS를 줘야만 OS가 채운다.
+	 * 이 플래그는 Vista+(NT6.0+) 전용이라 legacy32(NT5.2)에는 넣지 않는다(gateway는 null). */
+	ULONG gaa_flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+#if AGENT_NT6
+	gaa_flags |= GAA_FLAG_INCLUDE_GATEWAYS;
+#endif
+
 	ULONG buf_len = 16 * 1024;
 	IP_ADAPTER_ADDRESSES *aa = malloc(buf_len);
 	if (!aa) return;
 
-	ULONG ret = GetAdaptersAddresses(AF_UNSPEC,
-		GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-		NULL, aa, &buf_len);
+	ULONG ret = GetAdaptersAddresses(AF_UNSPEC, gaa_flags, NULL, aa, &buf_len);
 	if (ret == ERROR_BUFFER_OVERFLOW) {
 		free(aa);
 		aa = malloc(buf_len);
 		if (!aa) return;
-		ret = GetAdaptersAddresses(AF_UNSPEC,
-			GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-			NULL, aa, &buf_len);
+		ret = GetAdaptersAddresses(AF_UNSPEC, gaa_flags, NULL, aa, &buf_len);
 	}
 	if (ret != NO_ERROR) { free(aa); return; }
 
