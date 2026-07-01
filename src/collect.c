@@ -1291,35 +1291,44 @@ static cJSON *collect_services(void)
 		         "systemctl show --property=Id,MainPID %s 2>/dev/null", units_buf);
 		char *show = run_cmd(cmd);
 		if (show) {
+			/* systemctl show는 --property 요청 순서를 지키지 않아(예: MainPID가
+			 * Id보다 먼저) 나오고, strtok_r는 블록 구분 빈 줄을 건너뛴다. 그래서
+			 * 순서에 의존하지 않고 Id/MainPID를 쌍으로 모아 둘 다 채워지면 매칭한다.
+			 * 한 unit 블록은 Id 1개 + MainPID 1개를 정확히 낸다. */
 			char cur_id[256] = "";
+			int  cur_pid = -1, have_pid = 0;
 			char *s2 = NULL;
 			for (char *l = strtok_r(show, "\n", &s2); l; l = strtok_r(NULL, "\n", &s2)) {
-				if (strncmp(l, "Id=", 3) == 0) {
+				if (strncmp(l, "Id=", 3) == 0)
 					snprintf(cur_id, sizeof cur_id, "%s", l + 3);
-				} else if (strncmp(l, "MainPID=", 8) == 0 && cur_id[0]) {
-					int pid = atoi(l + 8);
-					cJSON *it;
-					cJSON_ArrayForEach(it, arr) {
-						cJSON *u = cJSON_GetObjectItemCaseSensitive(it, "unit");
-						if (!cJSON_IsString(u) || strcmp(u->valuestring, cur_id) != 0)
-							continue;
-						if (cJSON_GetObjectItemCaseSensitive(it, "pid"))
-							break;   /* 이미 설정됨 */
-						if (pid > 0) {
-							cJSON_AddNumberToObject(it, "pid", (double)pid);
-							char comm[64];
-							if (read_pid_comm(pid, comm, sizeof comm))
-								cJSON_AddStringToObject(it, "exe", comm);
-							else
-								cJSON_AddNullToObject(it, "exe");
-						} else {
-							cJSON_AddNullToObject(it, "pid");
-							cJSON_AddNullToObject(it, "exe");
-						}
-						break;
-					}
-					cur_id[0] = '\0';
+				else if (strncmp(l, "MainPID=", 8) == 0) {
+					cur_pid = atoi(l + 8);
+					have_pid = 1;
 				}
+				if (!cur_id[0] || !have_pid)
+					continue;
+				cJSON *it;
+				cJSON_ArrayForEach(it, arr) {
+					cJSON *u = cJSON_GetObjectItemCaseSensitive(it, "unit");
+					if (!cJSON_IsString(u) || strcmp(u->valuestring, cur_id) != 0)
+						continue;
+					if (cJSON_GetObjectItemCaseSensitive(it, "pid"))
+						break;   /* 이미 설정됨 */
+					if (cur_pid > 0) {
+						cJSON_AddNumberToObject(it, "pid", (double)cur_pid);
+						char comm[64];
+						if (read_pid_comm(cur_pid, comm, sizeof comm))
+							cJSON_AddStringToObject(it, "exe", comm);
+						else
+							cJSON_AddNullToObject(it, "exe");
+					} else {
+						cJSON_AddNullToObject(it, "pid");
+						cJSON_AddNullToObject(it, "exe");
+					}
+					break;
+				}
+				cur_id[0] = '\0';
+				have_pid = 0;
 			}
 			free(show);
 		}

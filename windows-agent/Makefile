@@ -9,7 +9,7 @@
 #   win7               : NT 6.1  x64 — Server 2008R2/2012/2012R2, Win7/8/8.1. OpenSSL 3.x.
 #   legacy32           : NT 5.2  i686 — Server 2003 / XP (32-bit). OpenSSL 1.0.2u, no bcrypt.
 #                        Needs an OLDER MinGW-w64 (i686) that still emits NT 5.2 startup code
-#                        + the win32/threads NT5.2 patch (see agent-fleet/win-legacy-patch).
+#                        + the win32/threads NT5.2 patch (see assessment-fleet/win-legacy-patch).
 # The C code is identical across profiles: GetTickCount64 / BCryptGenRandom are resolved
 # at runtime (monotonic_ms / compat_rand_bytes), so a lower WINNT_VER leaves no unresolved import.
 
