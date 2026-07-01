@@ -7,6 +7,9 @@ char *resolve_machine_id(void);
 
 const char *cached_composite_id(const char *machine_id);
 
+/* 첫 실행 시 생성·영구 저장하는 안정 식별자(UUID). MAC/machine_id와 무관. */
+const char *cached_agent_id(void);
+
 /* task.result 등 inventory 외 메시지에서 os_family/os_id/os_version을 재사용. */
 void collect_add_os_result_fields(cJSON *root);
 

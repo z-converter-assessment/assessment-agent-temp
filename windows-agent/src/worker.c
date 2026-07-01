@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "worker.h"
+#include "collect.h"
 #include "download.h"
 #include "exec.h"
 #include "service.h"
@@ -227,6 +228,7 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	if (!root) return NULL;
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	cJSON_AddStringToObject(root, "machine_id",       ctx->cfg.machine_id ? ctx->cfg.machine_id : "");
+	cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
 	cJSON_AddStringToObject(root, "os_family",        "windows");
 	cJSON_AddStringToObject(root, "os_id",            "windows");
 	char os_build_b[32];
@@ -515,6 +517,7 @@ static unsigned __stdcall install_thread_main(void *arg)
 	if (root) {
 		cJSON_AddStringToObject(root, "message_type",     "task.result");
 		cJSON_AddStringToObject(root, "machine_id",       a->machine_id ? a->machine_id : "");
+		cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
 		cJSON_AddStringToObject(root, "os_family",        "windows");
 		cJSON_AddStringToObject(root, "os_id",            "windows");
 		char os_build_b[32];

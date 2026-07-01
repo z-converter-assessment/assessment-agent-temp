@@ -741,6 +741,13 @@ int installer_run_prep_image(int run_sysprep)
         return 1;
     }
 
+    /* 영구 agent_id 삭제 — 클론마다 다음 기동 때 새로 생성되게 한다(agent_id 짝). */
+    {
+        wchar_t idp[MAX_PATH];
+        if (agent_data_path_w(L"agent-id", idp, MAX_PATH) == 0 && DeleteFileW(idp))
+            fprintf(stdout, "[prep-image] removed persistent agent-id\n");
+    }
+
     if (run_sysprep) {
         const wchar_t sys[] = L"C:\\Windows\\System32\\Sysprep\\Sysprep.exe";
         fprintf(stdout, "[prep-image] launching sysprep /generalize /oobe /shutdown...\n");

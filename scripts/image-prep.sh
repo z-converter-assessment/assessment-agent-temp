@@ -75,6 +75,23 @@ fi
 #        before this script if you want per-machine credentials.
 echo "[image-prep] keeping agent.env{,.local} (per-tenant secrets)"
 
+# --- 6. Remove the persistent agent_id so each clone generates its own on
+#        first start. Without this, clones would share one agent_id — a worse
+#        duplicate source than MAC-derived ids. Paired with the agent_id feature.
+: "${WORKER_STATE_DIR:=}"
+: "${XDG_STATE_HOME:=}"
+: "${HOME:=}"
+for d in "$WORKER_STATE_DIR" \
+         "$XDG_STATE_HOME/assessment-agent" \
+         "$HOME/.local/state/assessment-agent" \
+         /var/lib/agent-worker /var/lib/assessment-agent; do
+	case "$d" in ""|"/assessment-agent"|"/.local/state/assessment-agent") continue ;; esac
+	if [ -e "$d/agent-id" ]; then
+		rm -f "$d/agent-id" && echo "[image-prep] removed $d/agent-id"
+	fi
+done
+echo "[image-prep] persistent agent-id cleared (regenerated on next start)"
+
 printf '\n[image-prep] done — VM is ready to snapshot.\n'
 if [ "$am_root" -eq 0 ]; then
 	printf '[image-prep] NOTE: ran unprivileged — system-wide hygiene steps were\n'

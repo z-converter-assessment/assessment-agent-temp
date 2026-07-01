@@ -168,6 +168,7 @@ static char *build_result_json(const worker_ctx_t *ctx,
 
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	cJSON_AddStringToObject(root, "machine_id",       ctx->cfg.machine_id ? ctx->cfg.machine_id : "");
+	cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
 	collect_add_os_result_fields(root);   /* os_family/os_id/os_version */
 	cJSON_AddStringToObject(root, "agent_version",    ctx->cfg.agent_version ? ctx->cfg.agent_version : AGENT_VERSION);
 	cJSON_AddStringToObject(root, "collected_at",     now_buf);

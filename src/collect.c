@@ -22,6 +22,7 @@
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -83,6 +84,7 @@ static void add_common_metadata(cJSON *obj,
 	cJSON_AddStringToObject(obj, "machine_id",
 	                        machine_id && *machine_id ? machine_id : "");
 	cJSON_AddStringToObject(obj, "composite_id", cached_composite_id(machine_id));
+	cJSON_AddStringToObject(obj, "agent_id", cached_agent_id());
 	cJSON_AddStringToObject(obj, "os_family", "linux");
 	cJSON_AddStringToObject(obj, "agent_version",
 	                        agent_version && *agent_version ? agent_version
@@ -1109,6 +1111,65 @@ const char *cached_composite_id(const char *machine_id)
 	}
 	hex_buf[64] = '\0';
 	return hex_buf;
+}
+
+/* item 4: 첫 실행 시 UUIDv4 생성 -> state dir에 영구 저장 -> 재사용.
+ * 저장 경로는 install이 잡아주는 WORKER_STATE_DIR(없으면 XDG_STATE_HOME/HOME
+ * 폴백)을 재사용해 user-level/SysV 어느 설치 모델에서도 쓰기 가능하게 한다.
+ * prep-image(image-prep.sh)가 이 파일을 지워 클론마다 새로 생성되게 한다. */
+const char *cached_agent_id(void)
+{
+	static char id_buf[64];
+	static int  cached = 0;
+	if (cached)
+		return id_buf;
+	cached = 1;
+	id_buf[0] = '\0';
+
+	char dir[512];
+	const char *sd = getenv("WORKER_STATE_DIR");
+	if (sd && *sd) {
+		snprintf(dir, sizeof dir, "%s", sd);
+	} else {
+		const char *xdg  = getenv("XDG_STATE_HOME");
+		const char *home = getenv("HOME");
+		if (xdg && *xdg)
+			snprintf(dir, sizeof dir, "%s/assessment-agent", xdg);
+		else if (home && *home)
+			snprintf(dir, sizeof dir, "%s/.local/state/assessment-agent", home);
+		else
+			snprintf(dir, sizeof dir, "/var/lib/assessment-agent");
+	}
+	char path[600];
+	snprintf(path, sizeof path, "%s/agent-id", dir);
+
+	char *content = read_file_all(path);
+	if (content) {
+		trim_inplace(content);
+		if (strlen(content) >= 32 && strlen(content) < sizeof id_buf) {
+			snprintf(id_buf, sizeof id_buf, "%s", content);
+			free(content);
+			return id_buf;
+		}
+		free(content);
+	}
+
+	char uuid[64];
+	uuid_v4(uuid, sizeof uuid);
+	snprintf(id_buf, sizeof id_buf, "%s", uuid);
+
+	/* best-effort 영구화: dir은 보통 install이 생성. 없으면 재귀 생성 시도. */
+	for (char *p = dir + 1; *p; p++) {
+		if (*p == '/') { *p = '\0'; mkdir(dir, 0700); *p = '/'; }
+	}
+	mkdir(dir, 0700);
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "%s\n", id_buf);
+		fclose(f);
+		chmod(path, 0600);
+	}
+	return id_buf;
 }
 
 static cJSON *collect_external_ip(void)

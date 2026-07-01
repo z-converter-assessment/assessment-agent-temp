@@ -73,6 +73,7 @@ static void add_common_metadata(cJSON *root, const char *msg_type,
 	cJSON_AddStringToObject(root, "message_type", msg_type);
 	cJSON_AddStringToObject(root, "machine_id",   machine_id ? machine_id : "");
 	cJSON_AddStringToObject(root, "composite_id", cached_composite_id(machine_id));
+	cJSON_AddStringToObject(root, "agent_id",     cached_agent_id());
 	cJSON_AddStringToObject(root, "os_family",    "windows");
 	cJSON_AddStringToObject(root, "agent_version", agent_version ? agent_version : "0.0.0");
 
@@ -680,6 +681,45 @@ const char *cached_composite_id(const char *machine_id)
 	return hex_buf;
 }
 
+/* item 4: 첫 실행 시 UUIDv4 생성 -> %ProgramData%\assessment-agent\agent-id에
+ * 영구 저장 -> 재사용. LocalSystem 서비스가 항상 읽고 쓸 수 있는 고정 경로다.
+ * prep-image가 이 파일을 지워 클론마다 새로 생성되게 한다. */
+const char *cached_agent_id(void)
+{
+	static char id_buf[64];
+	static int  cached = 0;
+	if (cached)
+		return id_buf;
+	cached = 1;
+	id_buf[0] = '\0';
+
+	char path[MAX_PATH];
+	if (agent_data_path_a("agent-id", path, sizeof path) != 0) {
+		uuid_v4(id_buf, sizeof id_buf);   /* 경로 못 잡으면 휘발성 */
+		return id_buf;
+	}
+
+	FILE *f = fopen(path, "r");
+	if (f) {
+		if (fgets(id_buf, sizeof id_buf, f)) {
+			size_t l = strlen(id_buf);
+			while (l && (id_buf[l - 1] == '\n' || id_buf[l - 1] == '\r' ||
+			             id_buf[l - 1] == ' '))
+				id_buf[--l] = '\0';
+			if (l >= 32) { fclose(f); return id_buf; }
+		}
+		fclose(f);
+	}
+
+	uuid_v4(id_buf, sizeof id_buf);
+	char dir[MAX_PATH];
+	if (agent_data_path_a(NULL, dir, sizeof dir) == 0)
+		CreateDirectoryA(dir, NULL);   /* base는 보통 install이 생성 */
+	f = fopen(path, "w");
+	if (f) { fprintf(f, "%s\n", id_buf); fclose(f); }
+	return id_buf;
+}
+
 struct http_sink {
 	char  *buf;
 	size_t len;
@@ -1058,6 +1098,41 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	return m;
 }
 
+/* item 5 (saturation, raw-first): Linux loadavg/iowait 등가 신호.
+ * disk_queue는 이미 쓰는 IOCTL_DISK_PERFORMANCE의 QueueDepth(순간 큐 깊이) 합이라
+ * 추가 DLL/PDH 없이 신뢰성 있게 취득한다. cpu_run_queue(Processor Queue Length)와
+ * mem_paging_rate(Pages/sec)는 perflib(HKEY_PERFORMANCE_DATA) 파싱이 필요해 실기
+ * 검증 전까지 null(미측정)로 둔다 — 값 정합성 우선. */
+static void fill_saturation(cJSON *m)
+{
+	cJSON *s = cJSON_CreateObject();
+
+	long total_qd = 0;
+	int have_disk = 0;
+	for (int i = 0; i < 32; i++) {
+		wchar_t path[64];
+		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
+		HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+		                       NULL, OPEN_EXISTING, 0, NULL);
+		if (h == INVALID_HANDLE_VALUE) break;
+		DISK_PERFORMANCE dp;
+		DWORD ret = 0;
+		if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, NULL, 0,
+		                    &dp, sizeof dp, &ret, NULL)) {
+			total_qd += (long)dp.QueueDepth;
+			have_disk = 1;
+		}
+		CloseHandle(h);
+	}
+	if (have_disk) cJSON_AddNumberToObject(s, "disk_queue", (double)total_qd);
+	else           cJSON_AddNullToObject  (s, "disk_queue");
+
+	cJSON_AddNullToObject(s, "cpu_run_queue");
+	cJSON_AddNullToObject(s, "mem_paging_rate");
+
+	cJSON_AddItemToObject(m, "saturation", s);
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *m = cJSON_CreateObject();
@@ -1074,6 +1149,7 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	cJSON_AddItemToObject(m, "disk_io", enumerate_disk_io());
 	cJSON_AddItemToObject(m, "mounts",  enumerate_mounts(0));
 	cJSON_AddItemToObject(m, "net_io",  enumerate_net_io());
+	fill_saturation(m);
 
 	return m;
 }
