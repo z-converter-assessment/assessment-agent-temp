@@ -3,7 +3,7 @@
 #
 # Usage: env-setup.sh <example_file> <target_env_file> <local_secret_file>
 #
-# Rules (matches deploy/install.ps1 on Windows):
+# Rules (mirrored by env_setup_run in windows-agent/src/installer.c):
 #   - canonical key list + suggested defaults come from <example_file>
 #   - <target_env_file> preserves any KEY=value with non-empty value
 #     (NEVER overwrite — operator's value wins).
