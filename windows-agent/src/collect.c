@@ -1,38 +1,10 @@
-/**
- * @file collect.c
- * @brief Win32 collectors. Builds v2 payloads identical to the Linux agent
- *        (assessment-agent/docs/payload-schema.md).
- *
- * Sources mapped from /proc to Win32 API:
- *   /etc/machine-id        → HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
- *   /etc/os-release        → HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion
- *   /proc/cpuinfo          → CPUID brand (0x80000002..04)
- *   /proc/meminfo          → GlobalMemoryStatusEx
- *   /proc/stat             → GetSystemTimes
- *   /proc/diskstats        → DeviceIoControl(IOCTL_DISK_PERFORMANCE)
- *   /proc/net/dev          → GetIfTable2
- *   /proc/net/{tcp,udp}    → GetExtendedTcpTable / GetExtendedUdpTable
- *   /proc/self/mountinfo   → GetLogicalDriveStringsW + GetVolumeInformationW
- *   getifaddrs             → GetAdaptersAddresses (also yields PhysicalAddress for MAC)
- *   systemctl list-units   → EnumServicesStatusExW (SCM)
- *
- * Windows-only payload differences (schema-compatible nulls / zeros):
- *   - metrics.load_*m                          : null
- *   - cpu_stat.{nice,iowait,irq,softirq,steal} : 0 (no Windows analog)
- *   - listen_ports[].uid                       : null (no POSIX uid)
- *
- * Unit conversion:
- *   - cpu_stat       : FILETIME 100ns ÷ 100000 → 10ms tick (Linux HZ=100 호환)
- *   - sectors_*      : BytesRead/Written ÷ 512 (Linux diskstats 호환)
- */
-
 #define WIN32_LEAN_AND_MEAN
 
 #include "collect.h"
 #include "util.h"
 #include "cJSON.h"
 #include <openssl/evp.h>
-#include "openssl_compat.h"   /* EVP_MD_CTX_new/_free on OpenSSL 1.0.2 (legacy) */
+#include "openssl_compat.h"
 #include <curl/curl.h>
 
 #include <ctype.h>
@@ -42,31 +14,16 @@
 #include <string.h>
 #include <time.h>
 #include <wchar.h>
-#include <intrin.h>      /* __cpuid */
+#include <intrin.h>
 
-#include <winsock2.h>    /* MUST precede windows.h */
-#include <ws2tcpip.h>    /* inet_ntop, struct sockaddr_in6 */
-#include <iphlpapi.h>    /* GetAdaptersAddresses, GetIfTable2, GetExtendedTcpTable */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
-#include <winioctl.h>    /* IOCTL_DISK_PERFORMANCE, DISK_PERFORMANCE, GET_LENGTH_INFORMATION */
-#include <ntddstor.h>    /* IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER */
-#include "nt52_compat.h" /* strtok_s/strncpy_s — NT5.2 msvcrt 부재 대비(legacy 빌드) */
-/* QueryFullProcessImageNameW lives in <processthreadsapi.h> (auto-pulled by
- * <windows.h>) since Vista — <psapi.h> not needed. */
+#include <winioctl.h>
+#include <ntddstor.h>
+#include "nt52_compat.h"
 
-/* ============================================================
- *  NT 5.2 (Server 2003 / XP x64) legacy-API compat
- *
- *  The legacy build (PROFILE=legacy, _WIN32_WINNT=0x0502, OpenSSL 1.0.2u)
- *  predates several APIs this collector uses on Vista+/OpenSSL 1.1+:
- *    - GetIfTable2 / MIB_IF_ROW2 / FreeMibTable  → GetIfTable / MIB_IFROW
- *    - inet_ntop                                 → small polyfill below
- *    - IP_ADAPTER_UNICAST_ADDRESS.OnLinkPrefixLength (no member on XP struct)
- *    - EVP_MD_CTX_new / _free                    → EVP_MD_CTX_create / _destroy
- *    - QueryFullProcessImageNameW (+ PROCESS_QUERY_LIMITED_INFORMATION)
- *  Per the collector contract, fields that cannot be obtained on the legacy
- *  OS degrade to empty/absent (never an error).
- * ============================================================ */
 #if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
 #define AGENT_NT6 1
 #else
@@ -74,8 +31,7 @@
 #endif
 
 #if !AGENT_NT6
-/* inet_ntop is Vista+. Minimal polyfill (uncompressed IPv6 — acceptable for
- * the display-only ip_internal field; the engine keys on composite_id). */
+
 static const char *compat_inet_ntop(int af, const void *src, char *dst, size_t size)
 {
 	const unsigned char *b = (const unsigned char *)src;
@@ -96,9 +52,6 @@ static const char *compat_inet_ntop(int af, const void *src, char *dst, size_t s
 #define inet_ntop compat_inet_ntop
 #endif
 
-/* ============================================================
- *  Process-lifetime cached timestamps (boot_time, agent_started_at)
- * ============================================================ */
 static char g_boot_time_iso[32]      = {0};
 static char g_agent_started_iso[32]  = {0};
 static int  g_times_cached           = 0;
@@ -112,12 +65,6 @@ static void cache_process_times(void)
 	g_times_cached = 1;
 }
 
-/* cached_composite_id 는 collect.h 에 public 으로 노출 — main.c 가 worker 큐 이름
- * 빌드에 사용. 실제 정의는 fill_network_info() 이후. */
-
-/* ============================================================
- *  Common metadata (every message)
- * ============================================================ */
 static void add_common_metadata(cJSON *root, const char *msg_type,
                                 const char *machine_id, const char *agent_version)
 {
@@ -149,15 +96,9 @@ static void add_common_metadata(cJSON *root, const char *msg_type,
 	else                        cJSON_AddNullToObject(root, "agent_started_at");
 }
 
-/* Forward decls — 정의는 cloud metadata 영역 (cached_composite_id 다음). */
 static char *http_get_short(const char *url, const char *header, int put_request);
 static char *try_cloud_instance_id(void);
 
-/* ============================================================
- *  machine_id — Registry HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
- *               + cloud IMDS instance-id fallback (Sysprep 안 한 image /
- *                 비표준 환경 안전망 — Linux /etc/machine-id 결손 케이스와 대칭).
- * ============================================================ */
 char *resolve_machine_id(void)
 {
 	HKEY hKey;
@@ -177,9 +118,6 @@ char *resolve_machine_id(void)
 		return try_cloud_instance_id();
 	}
 
-	/* Trim any stray trailing NUL / CR / LF and lowercase to match
-	 * the /etc/machine-id (32-char hex) shape the engine expects to
-	 * normalize across platforms. */
 	size_t l = strlen(buf);
 	while (l > 0 && (buf[l-1] == '\0' || buf[l-1] == '\r' || buf[l-1] == '\n' || buf[l-1] == ' '))
 		buf[--l] = '\0';
@@ -197,9 +135,6 @@ char *resolve_machine_id(void)
 	return out;
 }
 
-/* ============================================================
- *  OS version (Registry CurrentVersion)
- * ============================================================ */
 static void os_version_info(char *display_out, size_t dsz, char *build_out, size_t bsz)
 {
 	display_out[0] = '\0';
@@ -240,9 +175,6 @@ static void os_version_info(char *display_out, size_t dsz, char *build_out, size
 	RegCloseKey(hKey);
 }
 
-/* ============================================================
- *  CPU model (CPUID extended brand string)
- * ============================================================ */
 static void cpu_model_string(char *out, size_t len)
 {
 	int regs[4] = {0};
@@ -261,9 +193,6 @@ static void cpu_model_string(char *out, size_t len)
 	snprintf(out, len, "%s", p);
 }
 
-/* ============================================================
- *  Memory (GlobalMemoryStatusEx)
- * ============================================================ */
 static void fill_memory_inventory(cJSON *out)
 {
 	MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
@@ -273,7 +202,7 @@ static void fill_memory_inventory(cJSON *out)
 		return;
 	}
 	long long mem_total_kb = (long long)(ms.ullTotalPhys / 1024ULL);
-	/* swap_total = page file size = total commit limit - physical */
+
 	long long swap_total_kb = (ms.ullTotalPageFile > ms.ullTotalPhys)
 	    ? (long long)((ms.ullTotalPageFile - ms.ullTotalPhys) / 1024ULL)
 	    : 0;
@@ -306,16 +235,13 @@ static void fill_memory_metrics(cJSON *out)
 	cJSON_AddNumberToObject(out, "mem_total_kb",     (double)mem_total);
 	cJSON_AddNumberToObject(out, "mem_free_kb",      (double)mem_avail);
 	cJSON_AddNumberToObject(out, "mem_available_kb", (double)mem_avail);
-	/* Windows에는 Linux buffers/cached 와 1:1 대응이 없으므로 null. */
+
 	cJSON_AddNullToObject(out, "mem_buffers_kb");
 	cJSON_AddNullToObject(out, "mem_cached_kb");
 	cJSON_AddNumberToObject(out, "swap_total_kb",    (double)swap_total);
 	cJSON_AddNumberToObject(out, "swap_free_kb",     (double)swap_avail);
 }
 
-/* ============================================================
- *  CPU stat (GetSystemTimes — 100ns ticks → 10ms ticks)
- * ============================================================ */
 static void fill_cpu_stat(cJSON *m)
 {
 	cJSON *cs = cJSON_AddObjectToObject(m, "cpu_stat");
@@ -337,7 +263,6 @@ static void fill_cpu_stat(cJSON *m)
 	kern.LowPart = kernelTime.dwLowDateTime; kern.HighPart = kernelTime.dwHighDateTime;
 	usr.LowPart  = userTime.dwLowDateTime;   usr.HighPart  = userTime.dwHighDateTime;
 
-	/* KernelTime includes IdleTime; subtract to get system-only. */
 	ULONGLONG sys_only = (kern.QuadPart > idle.QuadPart) ? (kern.QuadPart - idle.QuadPart) : 0;
 
 	cJSON_AddNumberToObject(cs, "user",    (double)(usr.QuadPart  / 100000ULL));
@@ -350,9 +275,6 @@ static void fill_cpu_stat(cJSON *m)
 	cJSON_AddNumberToObject(cs, "steal",   0);
 }
 
-/* ============================================================
- *  Physical disks
- * ============================================================ */
 static cJSON *enumerate_physical_disks(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -382,7 +304,6 @@ static cJSON *enumerate_physical_disks(void)
 	return arr;
 }
 
-/* Map a drive root (e.g. "C:\") to its physical drive number. */
 static int drive_letter_to_phys_num(wchar_t letter)
 {
 	wchar_t path[8];
@@ -401,11 +322,6 @@ static int drive_letter_to_phys_num(wchar_t letter)
 	return n;
 }
 
-/* ============================================================
- *  Mounts (logical drives with type=FIXED)
- *
- *  include_fstype: 1 for inventory (with fstype), 0 for metrics.
- * ============================================================ */
 static cJSON *enumerate_mounts(int include_fstype)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -450,12 +366,6 @@ static cJSON *enumerate_mounts(int include_fstype)
 	return arr;
 }
 
-/* ============================================================
- *  Disk IO (IOCTL_DISK_PERFORMANCE per physical drive)
- *
- *  diskperf 카운터는 Windows Server 2008+ 자동 활성화. 비활성화된 환경에서는
- *  값이 0으로 보이며 그 케이스는 빈 카운터로 emit (engine은 동일하게 delta 0).
- * ============================================================ */
 static cJSON *enumerate_disk_io(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -478,7 +388,7 @@ static cJSON *enumerate_disk_io(void)
 			cJSON_AddNumberToObject(o, "minor", i);
 			cJSON_AddNumberToObject(o, "reads_completed",  (double)dp.ReadCount);
 			cJSON_AddNumberToObject(o, "writes_completed", (double)dp.WriteCount);
-			/* 512-byte sectors for diskstats wire-compat. */
+
 			cJSON_AddNumberToObject(o, "sectors_read",
 			                        (double)(dp.BytesRead.QuadPart / 512));
 			cJSON_AddNumberToObject(o, "sectors_written",
@@ -490,9 +400,6 @@ static cJSON *enumerate_disk_io(void)
 	return arr;
 }
 
-/* ============================================================
- *  Network IO (GetIfTable2)
- * ============================================================ */
 #if AGENT_NT6
 static cJSON *enumerate_net_io(void)
 {
@@ -521,9 +428,7 @@ static cJSON *enumerate_net_io(void)
 	return arr;
 }
 #else
-/* NT 5.2 fallback: GetIfTable2 / MIB_IF_ROW2 / FreeMibTable are Vista+. The
- * classic GetIfTable / MIB_IFROW (NT4+) exposes 32-bit counters — sufficient
- * for the wire format (engine handles counter wrap). */
+
 static cJSON *enumerate_net_io(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -538,9 +443,7 @@ static cJSON *enumerate_net_io(void)
 
 		char name[256];
 		WideCharToMultiByte(CP_UTF8, 0, r->wszName, -1, name, sizeof name, NULL, NULL);
-		/* NT5.2 일부 인터페이스는 wszName 이 빈 문자열 -> interface="" 가 되어
-		 * 엔진 NetIo 검증(min_length>=1)에서 메트릭 메시지 전체가 거부된다.
-		 * description -> "if<index>" 순으로 fallback 해 항상 non-empty 보장. */
+
 		if (name[0] == '\0') {
 			if (r->dwDescrLen > 0 && r->bDescr[0])
 				snprintf(name, sizeof name, "%.*s", (int)r->dwDescrLen, (char *)r->bDescr);
@@ -563,12 +466,6 @@ static cJSON *enumerate_net_io(void)
 }
 #endif
 
-/* ============================================================
- *  IP addresses + MAC addresses (GetAdaptersAddresses, single pass)
- *
- *  mac_addresses[] 는 (machine_id, mac_addresses) 조합으로 이미지 클론
- *  충돌 감지에 사용된다. 가상/터널 인터페이스는 제외, 정렬 + dedup.
- * ============================================================ */
 static int mac_cmp(const void *a, const void *b)
 {
 	return strcmp(*(const char **)a, *(const char **)b);
@@ -617,14 +514,11 @@ static void fill_network_info(cJSON *inv)
 			if (!ip[0]) continue;
 			char cidr[INET6_ADDRSTRLEN + 5];
 #if AGENT_NT6
-			/* CIDR: "<ip>/<prefix>" — OnLinkPrefixLength is supplied by
-			 * GetAdaptersAddresses (Vista+). Buffer fits IPv6 + "/128". */
+
 			snprintf(cidr, sizeof cidr, "%s/%u", ip,
 				(unsigned)u->OnLinkPrefixLength);
 #else
-			/* NT 5.2: IP_ADAPTER_UNICAST_ADDRESS_XP has no OnLinkPrefixLength.
-			 * Emit the bare IP (no prefix) — ip_internal is display-only; the
-			 * engine keys hosts on composite_id. */
+
 			snprintf(cidr, sizeof cidr, "%s", ip);
 #endif
 			cJSON_AddItemToArray(ips, cJSON_CreateString(cidr));
@@ -656,20 +550,6 @@ static void fill_network_info(cJSON *inv)
 	free(aa);
 }
 
-/* ============================================================
- *  composite_id = sha256_hex(machine_id + "\n" + mac1 + "\n" + ...)
- *
- *  이미지 클론으로 machine_id가 중복되는 환경에서 호스트 식별성을 보강하는 보조
- *  식별자. MAC 수집 정책은 fill_network_info()와 동일 (IfOperStatusUp, loopback /
- *  tunnel 제외, PhysicalAddressLength==6, lowercase, dedup, sort). 양 OS agent가
- *  같은 정규형으로 같은 값을 산출.
- *
- *  모든 NIC이 가상이거나 MAC이 비어있으면 sha256(machine_id + "\n")로 떨어지며
- *  식별성이 약해진다 — composite_id로도 못 가르는 엣지 케이스는 한계로 수용.
- *  엔진이 별도 신호로 충돌 감지해야 한다.
- *
- *  프로세스 lifetime 내 1회 계산 후 캐시.
- * ============================================================ */
 const char *cached_composite_id(const char *machine_id)
 {
 	static char hex_buf[65];
@@ -678,7 +558,7 @@ const char *cached_composite_id(const char *machine_id)
 		return hex_buf;
 
 	hex_buf[0] = '\0';
-	cached = 1;   /* fail-once: EVP / GetAdaptersAddresses 실패 시 재시도 회피 */
+	cached = 1;
 
 	enum { MAC_CAP = 64 };
 	char *mac_list[MAC_CAP];
@@ -764,14 +644,6 @@ const char *cached_composite_id(const char *machine_id)
 	return hex_buf;
 }
 
-/* ============================================================
- *  Cloud metadata HTTP fetch (libcurl, 1s timeout, 256B hard cap)
- *
- *  external IP / instance-id 응답은 모두 매우 짧음 — 응답 크기를 256B 로 cap 해
- *  악의/오동작 metadata 서버로부터의 메모리 폭주 방지. AGENT_EXTERNAL_IP env
- *  override 가 있으면 cloud 호출 자체 skip.
- * ============================================================ */
-
 struct http_sink {
 	char  *buf;
 	size_t len;
@@ -785,7 +657,7 @@ static size_t http_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata
 	struct http_sink *s = (struct http_sink *)userdata;
 	size_t n = size * nmemb;
 	if (s->len + n > HTTP_GET_MAX_BYTES) n = HTTP_GET_MAX_BYTES - s->len;
-	if (n == 0) return size * nmemb;  /* swallow remaining bytes silently */
+	if (n == 0) return size * nmemb;
 	if (s->len + n + 1 > s->cap) {
 		size_t new_cap = s->len + n + 64;
 		char *nb = (char *)realloc(s->buf, new_cap);
@@ -830,17 +702,13 @@ static char *http_get_short(const char *url, const char *header, int put_request
 	char *out = (char *)realloc(s.buf, s.len + 1);
 	if (!out) { free(s.buf); return NULL; }
 	out[s.len] = '\0';
-	/* trim trailing whitespace */
+
 	size_t l = strlen(out);
 	while (l > 0 && (out[l-1] == '\n' || out[l-1] == '\r' || out[l-1] == ' ' || out[l-1] == '\t')) out[--l] = '\0';
 	if (l == 0) { free(out); return NULL; }
 	return out;
 }
 
-/*
- * Cloud external IP — AGENT_EXTERNAL_IP override → AWS IMDSv2 → Azure → GCP 순.
- * 전 실패 시 null 리터럴 (server.error 발행 안 함, optional 정책).
- */
 static cJSON *collect_external_ip(void)
 {
 	const char *override = getenv("AGENT_EXTERNAL_IP");
@@ -861,11 +729,10 @@ static cJSON *collect_external_ip(void)
 
 	char *ip = NULL;
 
-	/* AWS IMDSv2 — token PUT 후 GET. */
 	char *token = http_get_short(
 		"http://169.254.169.254/latest/api/token",
 		"X-aws-ec2-metadata-token-ttl-seconds: 60",
-		1 /* PUT */);
+		1 );
 	if (token && *token) {
 		char hdr[256];
 		snprintf(hdr, sizeof hdr, "X-aws-ec2-metadata-token: %s", token);
@@ -896,23 +763,14 @@ static cJSON *collect_external_ip(void)
 	return arr;
 }
 
-/*
- * Cloud IMDS instance-id fallback — Registry MachineGuid 결손/공백 시 호출됨.
- * AWS IMDSv2 / Azure vmId / GCP instance id 순. 전 실패 시 NULL.
- *
- * 형식 차이가 약간 있어도 (AWS = i-xxxxxxxxx, Azure = UUID, GCP = 정수형 string)
- * engine 의 String(64) 제약은 모두 통과 — composite_id 의 해시 source 로만 들어가
- * 형식 일관성은 불필요.
- */
 static char *try_cloud_instance_id(void)
 {
 	char *id = NULL;
 
-	/* AWS IMDSv2 */
 	char *token = http_get_short(
 		"http://169.254.169.254/latest/api/token",
 		"X-aws-ec2-metadata-token-ttl-seconds: 60",
-		1 /* PUT */);
+		1 );
 	if (token && *token) {
 		char hdr[256];
 		snprintf(hdr, sizeof hdr, "X-aws-ec2-metadata-token: %s", token);
@@ -935,9 +793,6 @@ static char *try_cloud_instance_id(void)
 	return id;
 }
 
-/* ============================================================
- *  Services (EnumServicesStatusExW — running only)
- * ============================================================ */
 static cJSON *enumerate_running_services(void)
 {
 	SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ENUMERATE_SERVICE);
@@ -973,12 +828,6 @@ static cJSON *enumerate_running_services(void)
 	return arr;
 }
 
-/* ============================================================
- *  Listen ports (TCP + UDP, IPv4 + IPv6)
- *
- *  uid 는 Windows 에 POSIX uid 가 없으므로 null. comm 은 OpenProcess 권한이
- *  없으면 null. pid 는 항상 채움.
- * ============================================================ */
 static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
 {
 	out[0] = '\0';
@@ -997,8 +846,7 @@ static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
 	}
 	CloseHandle(hp);
 #else
-	/* NT 5.2: QueryFullProcessImageNameW + PROCESS_QUERY_LIMITED_INFORMATION
-	 * are Vista+. comm is nullable by contract — leave empty on legacy. */
+
 	(void)pid; (void)out_sz;
 #endif
 }
@@ -1113,9 +961,6 @@ static cJSON *enumerate_listen_ports(void)
 	return arr;
 }
 
-/* ============================================================
- *  Public API
- * ============================================================ */
 cJSON *build_error_payload(const char *machine_id, const char *agent_version,
                            const char *error_code, const char *error_message,
                            const char *failed_component, int retry_count,
@@ -1162,7 +1007,7 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	cJSON_AddItemToObject(m, "services",     enumerate_running_services());
 	cJSON_AddItemToObject(m, "listen_ports", enumerate_listen_ports());
 
-	fill_network_info(m);  /* adds ip_internal[] and mac_addresses[] */
+	fill_network_info(m);
 	cJSON_AddItemToObject(m, "ip_external", collect_external_ip());
 
 	return m;

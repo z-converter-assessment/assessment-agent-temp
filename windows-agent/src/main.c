@@ -1,22 +1,3 @@
-/**
- * @file main.c
- * @brief Agent entry point (Windows).
- *
- * Modes (selected by argv):
- *   default     : run_as_service()  — SCM dispatcher (used by `sc.exe start`)
- *   --console   : run_as_console()  — foreground, Ctrl+C exits
- *
- * Loop structure mirrors the Linux agent (assessment-agent/src/main.c §lifecycle):
- *   1. parse env (agent.env then shell — shell wins)
- *   2. resolve machine_id once
- *   3. publish initial `inventory` (retry with backoff)
- *   4. loop: `metrics` every AGENT_INTERVAL_SEC, `inventory` republish every
- *      AGENT_INVENTORY_REFRESH_SEC ±15% jitter
- *
- * worker (task.install): RABBITMQ_WORKER_USER 설정 시 활성 — install thread
- * 모델 (Linux fork 모델의 포팅, worker.c 참조).
- */
-
 #include "collect.h"
 #include "installer.h"
 #include "publish.h"
@@ -37,14 +18,6 @@
 #define AGENT_VERSION "1.0.0"
 #endif
 
-/* ============================================================
- *  User-level path defaults (no admin / no system dirs)
- *
- *  When WORKER_STATE_DIR / WORKER_TMP_DIR are not set in the env file, the
- *  agent falls back to per-user locations under %LOCALAPPDATA% / %TEMP% so a
- *  user-level install never needs to write Program Files / ProgramData /
- *  C:\Windows\Temp.
- * ============================================================ */
 static const char *user_worker_state_default(void)
 {
 	static char buf[MAX_PATH];
@@ -62,13 +35,9 @@ static const char *user_tmp_default(void)
 	return (t && *t) ? t : "C:\\Windows\\Temp";
 }
 
-/* ============================================================
- *  publish_config_t builder (env-driven)
- * ============================================================ */
 static publish_config_t make_publish_config(void)
 {
-	/* TLS / verify 플래그는 parse_bool 사용 — atoi 면 "true" 가 0이 되어
-	 * production AMQPS 가 silently plain 으로 떨어지는 보안 회귀를 막는다. */
+
 	publish_config_t cfg;
 	memset(&cfg, 0, sizeof cfg);
 	cfg.host                = getenv_default("RABBITMQ_HOST", "localhost");
@@ -89,12 +58,6 @@ static publish_config_t make_publish_config(void)
 	return cfg;
 }
 
-/* ============================================================
- *  worker_config_t builder (env-driven)
- *
- *  RABBITMQ_WORKER_USER / _PASS 가 비어있으면 worker 비활성 (queue_name 을
- *  비워서 worker_init 가 NULL 반환하도록 유도).
- * ============================================================ */
 static worker_config_t make_worker_config(const publish_config_t *pcfg,
                                           const char *machine_id,
                                           char *queue_name_buf,
@@ -106,7 +69,7 @@ static worker_config_t make_worker_config(const publish_config_t *pcfg,
 	const char *wuser = getenv("RABBITMQ_WORKER_USER");
 	const char *wpass = getenv("RABBITMQ_WORKER_PASS");
 	if (!wuser || !*wuser || !wpass || !*wpass) {
-		return wcfg;  /* worker disabled */
+		return wcfg;
 	}
 
 	wcfg.amqp           = *pcfg;
@@ -114,8 +77,6 @@ static worker_config_t make_worker_config(const publish_config_t *pcfg,
 	wcfg.amqp.password  = wpass;
 	wcfg.amqp.exchange  = getenv_default("WORKER_TASK_EXCHANGE", "assessment.tasks");
 
-	/* 큐 이름은 composite_id 기반 — payload contract v4. portal 측 routing key
-	 * `task.install.<composite_id>` 와 정확히 일치해야 task 매치. */
 	const char *cid = cached_composite_id(machine_id);
 	snprintf(queue_name_buf, qbuf_sz, "%s.%s",
 	         getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks"),
@@ -135,9 +96,6 @@ static worker_config_t make_worker_config(const publish_config_t *pcfg,
 	return wcfg;
 }
 
-/* ============================================================
- *  Helpers
- * ============================================================ */
 static int serialize_and_publish(const publish_config_t *cfg,
                                  const char *routing_key, cJSON *msg)
 {
@@ -166,11 +124,6 @@ static void emit_error(const publish_config_t *cfg, const char *machine_id,
 		        code ? code : "?");
 }
 
-/* Sleep in 1-second slices — SCM stop response 가 1초 단위 + worker AMQP
- * heartbeat 가 매 slice 마다 pump. heartbeat 안 돌면 broker 가 connection 끊으므로
- * (60초 default) sleep 도중 keepalive 호출 필수.
- *
- * worker == NULL 이면 keepalive skip (worker 비활성 모드). */
 static void interruptible_sleep(int seconds, worker_ctx_t *worker)
 {
 	for (int i = 0; i < seconds && !stop_requested(); i++) {
@@ -225,28 +178,16 @@ static int publish_with_retry(const publish_config_t *cfg, const char *rk,
 			backoff = (unsigned int)max_backoff;
 		fprintf(stderr, "[agent] publish failed, retry %d in %us\n",
 		        retry_count, backoff);
-		/* publish_with_retry 는 worker 핸들 없이 호출되는 케이스 (initial inventory) 가
-		 * 있어 keepalive 인자는 NULL. backoff 가 60s 이하라 broker 가 connection 끊지
-		 * 않음 — heartbeat 는 worker tick 의 keepalive 가 처리. */
+
 		interruptible_sleep((int)backoff, NULL);
 		if (stop_requested()) { free(body); return -1; }
 		backoff *= 2;
 	}
 }
 
-/* ============================================================
- *  agent_run — the actual collection loop.
- *
- *  Called by service.c::service_main (SCM mode) or service.c::run_as_console
- *  (foreground mode). Returns the process exit code.
- * ============================================================ */
 int agent_run(void)
 {
-	/* Optional debug log gate. When AGENT_DEBUG_LOG holds a path, stderr is
-	 * redirected (unbuffered) to that file and DBG() lines below are emitted —
-	 * used to diagnose legacy NT5.2 (Server 2003) load/startup issues without a
-	 * rebuild. Unset (the default) leaves stderr on the systemd journal /
-	 * scheduled-task log and DBG() is a no-op. No hardcoded path. */
+
 	const char *dbg_path = getenv("AGENT_DEBUG_LOG");
 	int g_dbg = (dbg_path && *dbg_path);
 	if (g_dbg) {
@@ -260,8 +201,6 @@ int agent_run(void)
 	WSAStartup(MAKEWORD(2, 2), &wsa);
 	DBG("[dbg] after WSAStartup\n");
 
-	/* Try local .env first (dev), then the per-user install paths under
-	 * %LOCALAPPDATA%\assessment-agent (user-level install — no admin). */
 	load_env_file(".env");
 	{
 		char p[MAX_PATH];
@@ -292,7 +231,6 @@ int agent_run(void)
 	}
 	fprintf(stderr, "[agent] machine_id=%s\n", machine_id);
 
-	/* --- Initial inventory --- */
 	DBG("[dbg] before collect_inventory\n");
 	cJSON *inv = collect_inventory_payload(machine_id, AGENT_VERSION);
 	DBG("[dbg] after collect_inventory inv=%p\n", (void*)inv);
@@ -307,7 +245,6 @@ int agent_run(void)
 			fprintf(stderr, "[agent] published inventory\n");
 	}
 
-	/* --- One-shot mode --- */
 	if (interval <= 0) {
 		cJSON *m = collect_metrics_payload(machine_id, AGENT_VERSION);
 		if (!m) {
@@ -322,11 +259,9 @@ int agent_run(void)
 		return rc == 0 ? 0 : 1;
 	}
 
-	/* --- Loop mode --- */
 	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds\n",
 	        interval, inv_refresh);
 
-	/* worker — task.install consumer. 자격증명 미설정 / 초기화 실패 시 NULL → 비활성. */
 	char wqueue_buf[128] = {0};
 	worker_ctx_t *worker = NULL;
 	{
@@ -367,23 +302,12 @@ int agent_run(void)
 			inv_next = next_inventory_deadline(time(NULL), inv_refresh);
 		}
 
-		/* worker tick — task.install polling + child reap + result publish. */
 		if (worker) worker_tick(worker);
 
 		if (stop_requested()) break;
-		interruptible_sleep(interval, worker);   /* sleep 도중 AMQP heartbeat pump */
+		interruptible_sleep(interval, worker);
 	}
 
-	/* --- Drain — Linux 4-phase 패턴 포팅 (CRITICAL #9 / Round 5 H3) ---
-	 *
-	 * Phase 1 (grace)        : AGENT_DRAIN_GRACE_SEC 동안 install 정상 종료 대기
-	 * Phase 2 (term)         : worker_force_child_term soft → AGENT_DRAIN_TERM_SEC 대기
-	 * Phase 3 (kill)         : worker_force_child_term hard (Windows = exec.c Job Object)
-	 * Phase 4 (publish-stuck): child 가 reap 된 후 result publish 가 계속 실패 시
-	 *                          AGENT_DRAIN_PUBLISH_SEC 후 give up — result 파일은 next
-	 *                          startup replay_pending_results 가 처리. dead broker 가
-	 *                          drain 을 영구 wedge 하는 케이스 방지.
-	 */
 	if (worker) {
 		worker_begin_drain(worker);
 		int grace_sec   = getenv_int_or("AGENT_DRAIN_GRACE_SEC",   600);
@@ -399,8 +323,7 @@ int agent_run(void)
 
 		while (!worker_idle(worker)) {
 			worker_tick(worker);
-			/* SCM 에 "아직 stopping 중" 알림 — dwCheckPoint 증분 + wait_hint 2.5s 갱신.
-			 * 호출 안 하면 service_ctrl_handler 의 30s wait_hint 만료 후 SCM stuck 판정. */
+
 			service_stop_pending_update(2500);
 			long elapsed = (long)((monotonic_ms() - t0) / 1000ULL);
 
@@ -414,7 +337,6 @@ int agent_run(void)
 				kill_sent = 1;
 			}
 
-			/* Phase 4: child reap 후 result publish stuck deadline. */
 			if (reap_done_at == 0 && !worker_has_live_child(worker))
 				reap_done_at = monotonic_ms();
 			if (reap_done_at != 0 &&
@@ -435,19 +357,6 @@ int agent_run(void)
 #undef DBG
 }
 
-/* ============================================================
- *  main — subcommand dispatch.
- *
- *   (none)        → SCM dispatcher (default; how `sc start` invokes us)
- *   install       → register service, populate env, start
- *   install --image-prep
- *                 → register but do NOT start (golden-image flow)
- *   uninstall     → stop + delete service
- *   prep-image    → regenerate MachineGuid (clone safety)
- *   prep-image --sysprep
- *                 → also kick Sysprep /generalize /oobe /shutdown
- *   --console / -c → foreground run (debugging)
- * ============================================================ */
 static void print_usage(void)
 {
 	fprintf(stderr,

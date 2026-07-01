@@ -1,29 +1,3 @@
-/**
- * @file worker.c
- * @brief task.install consumer + fork/reap + idempotency state machine.
- *
- * State (per ctx):
- *   IDLE  — no child in flight. tick polls basic_get on the per-machine queue.
- *           If empty → return. If message → fork child → enter BUSY.
- *   BUSY  — child PID set. tick reaps non-blocking; on reap → read result
- *           file (or synthesize on abnormal exit) → publish task.result →
- *           ack broker → move result file to `/done` → enter IDLE.
- *   DRAIN — SIGTERM observed. No new basic_get. tick reaps the in-flight
- *           child if any, then waits idle.
- *
- * Idempotency:
- *   /var/lib/agent-worker/done/<task_id>.json exists  ⇒  this task already
- *     completed in a prior run. Worker emits a synthesized result with
- *     failure_reason="already_done" and acks immediately (no fork).
- *
- * Durability:
- *   The child writes its result JSON to /var/lib/agent-worker/results/
- *   <task_id>.json *before* exiting. The parent — and only the parent —
- *   reads, publishes, acks, then moves the file to /done. A parent
- *   crash between child completion and broker ack leaves the file in
- *   /results; on next startup the worker_init scan replays it.
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "worker.h"
@@ -52,40 +26,26 @@
 #define AGENT_VERSION "0.0.0"
 #endif
 
-/* ============================================================
- * Context
- * ============================================================ */
-
 struct worker_ctx_s {
 	worker_config_t cfg;
 	publish_conn_t *conn;
 
-	int  drain;                    /* set by worker_begin_drain */
-	int  conn_dead;                /* CRITICAL #2: set on transport failure; reconnect on next tick */
-	/* Round 3: monotonic clock to avoid NTP step skew. */
-	struct timespec last_reconnect_attempt;
-	int  reconnect_backoff_sec;    /* current backoff window */
+	int  drain;
+	int  conn_dead;
 
-	/* IDLE when child_pid == 0, BUSY otherwise. */
+	struct timespec last_reconnect_attempt;
+	int  reconnect_backoff_sec;
+
 	pid_t    child_pid;
 	uint64_t inflight_delivery_tag;
 	char     inflight_task_id[128];
 
-	/* Cached dir paths so we don't re-derive on every tick. */
 	char results_dir[512];
 	char done_dir[512];
-	char running_dir[512];   /* CRITICAL #10: in-flight task markers */
+	char running_dir[512];
 };
 
-/*
- * Backoff caps: start at 1s, double each consecutive failure, max 60s.
- * Reset to 0 on a successful reconnect.
- */
 #define WORKER_RECONNECT_BACKOFF_MAX 60
-
-/* ============================================================
- * Small filesystem helpers
- * ============================================================ */
 
 static int mkdir_p(const char *path, mode_t mode)
 {
@@ -112,16 +72,6 @@ static int file_exists(const char *path)
 	return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-/*
- * Atomic write with full durability:
- *   1. write tmp file, fsync the file fd
- *   2. rename(tmp, path) — atomic on POSIX filesystems
- *   3. fsync the parent directory so the rename is durable across power loss
- *
- * Without the dir fsync, a rename can be lost on crash even though the file
- * data is durable. /done idempotency markers must survive crash so we don't
- * silently double-execute redelivered tasks (CRITICAL #13).
- */
 static int fsync_parent_dir(const char *path)
 {
 	char dir[1024];
@@ -130,7 +80,7 @@ static int fsync_parent_dir(const char *path)
 	memcpy(dir, path, n + 1);
 	char *slash = strrchr(dir, '/');
 	if (!slash) { dir[0] = '.'; dir[1] = '\0'; }
-	else if (slash == dir) { dir[1] = '\0'; }    /* path is `/foo`, dir is `/` */
+	else if (slash == dir) { dir[1] = '\0'; }
 	else *slash = '\0';
 
 	int dfd = open(dir, O_RDONLY | O_DIRECTORY);
@@ -180,15 +130,6 @@ static int rmrf(const char *path)
 	return rc;
 }
 
-/* ============================================================
- * task_id validation
- * ============================================================ */
-
-/*
- * Reject any task_id that could escape the state directory or contain
- * shell metacharacters. We accept only the UUID v4 grammar (or its
- * unhyphenated 32-char form) which is what the portal always emits.
- */
 static int task_id_valid(const char *id)
 {
 	if (!id) return 0;
@@ -206,10 +147,6 @@ static int task_id_valid(const char *id)
 	}
 	return 1;
 }
-
-/* ============================================================
- * Result JSON build
- * ============================================================ */
 
 static char *build_result_json(const worker_ctx_t *ctx,
                                const char *task_id,
@@ -245,15 +182,6 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	uuid_v4(msg_id, sizeof msg_id);
 	cJSON_AddStringToObject(root, "message_id", msg_id);
 
-	/*
-	 * Round 4 F16: emit explicit nulls for boot_time / agent_started_at
-	 * so engine consumers see consistent schema between task.result and
-	 * inventory/metrics/error. The actual values live in collect.c's
-	 * static caches; worker.c is intentionally independent of collector
-	 * (CLAUDE.md "single binary single process" with worker module
-	 * separately testable). Portal sees null and knows to source these
-	 * from the same machine_id's most recent metric/inventory message.
-	 */
 	cJSON_AddNullToObject(root, "boot_time");
 	cJSON_AddNullToObject(root, "agent_started_at");
 
@@ -298,10 +226,6 @@ static const char *reason_for_status(download_status_t  ds,
 	return "internal_error";
 }
 
-/* ============================================================
- * Child entry — one task lifecycle
- * ============================================================ */
-
 static void child_write_result_file(const worker_ctx_t *ctx,
                                     const char *task_id,
                                     const char *json)
@@ -313,24 +237,7 @@ static void child_write_result_file(const worker_ctx_t *ctx,
 
 static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 {
-	/*
-	 * CRITICAL #5 (round 2): close the inherited AMQP TLS socket and any
-	 * other parent-side fds *immediately on entry*. FD_CLOEXEC fires only
-	 * at execve, so without this the worker child carries the broker
-	 * socket through download + extract + any helper fork-without-exec.
-	 * The grandchild (install.sh) gets another sweep in exec.c, but that
-	 * window is too late — libcurl/libarchive may fork before then.
-	 *
-	 * CRITICAL #9 (round 2): become our own process group leader so the
-	 * parent's drain escalation `kill(-child_pid, SIG)` actually targets
-	 * us (and our grandchild via group inheritance). Without this, the
-	 * worker child shares the agent's pgid; -child_pid points to a non-
-	 * existent pgid and silently returns ESRCH — drain becomes dead code.
-	 */
-	/*
-	 * Round 3: setpgid first so drain escalation has a target group
-	 * even if close_inherited_fds takes a moment.
-	 */
+
 	(void)setpgid(0, 0);
 	close_inherited_fds();
 
@@ -341,10 +248,9 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 
 	const char *task_id = cJSON_IsString(jid) ? jid->valuestring : NULL;
 	if (!task_id_valid(task_id)) {
-		_exit(2);  /* Parent will synthesize internal_error with no file. */
+		_exit(2);
 	}
 
-	/* Machine_id mismatch: produce already_done-style noop so portal isn't blind. */
 	if (cJSON_IsString(jmachine) && ctx->cfg.machine_id &&
 	    strcmp(jmachine->valuestring, ctx->cfg.machine_id) != 0) {
 		char *res = build_result_json(ctx, task_id, "failure", "internal_error",
@@ -365,7 +271,7 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 		if (cJSON_IsNumber(jb)) size_bytes = (int64_t)jb->valuedouble;
 	}
 
-	const char *install_type = "shell"; /* default — install.type 누락 시 backward-compat */
+	const char *install_type = "shell";
 	const char *script  = "install.sh";
 	int timeout_sec     = 600;
 	const char **iargs  = NULL;
@@ -389,8 +295,6 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 		}
 	}
 
-	/* Linux agent는 install.type="shell" 만 처리. direct_exec / msi 등 자기 OS
-	 * 아닌 type 수신 시 즉시 result 발행 + ack (DLQ 회피). */
 	if (strcmp(install_type, "shell") != 0) {
 		char *res = build_result_json(ctx, task_id, "failure",
 		                              "unsupported_install_type",
@@ -401,7 +305,6 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 		_exit(0);
 	}
 
-	/* Workspace directory. */
 	char work[1024];
 	snprintf(work, sizeof work, "%s/agent-task-%s", ctx->cfg.tmp_dir, task_id);
 	rmrf(work);
@@ -416,7 +319,6 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	struct timespec ts0;
 	clock_gettime(CLOCK_MONOTONIC, &ts0);
 
-	/* 1. Download. */
 	char tar_path[1100];
 	snprintf(tar_path, sizeof tar_path, "%s/package.tar", work);
 	download_status_t ds = (url && sha256 && size_bytes > 0)
@@ -469,10 +371,6 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	_exit(0);
 }
 
-/* ============================================================
- * Parent — publish + ack + move to /done
- * ============================================================ */
-
 static int read_result_file(const char *path, char **out_body)
 {
 	*out_body = read_file_all(path);
@@ -502,32 +400,13 @@ static int publish_result_and_ack(worker_ctx_t *ctx,
 		        task_id);
 		return -1;
 	}
-	/*
-	 * Round 6 M5: rename(/results→/done) failure means /done won't exist.
-	 * If we ack now, broker drops the message and any future redelivery
-	 * (e.g. broker recovers, queue redeclares) re-executes the install.
-	 * Don't ack — let broker hold the unacked tag; replay_pending_results
-	 * on next startup will move /results→/done correctly.
-	 */
+
 	if (move_to_done(ctx, task_id) != 0) {
 		fprintf(stderr, "[worker] move to /done failed for %s: %s — leaving unacked\n",
 		        task_id, strerror(errno));
 		return -1;
 	}
 
-	/*
-	 * Round 5 H1: ack failure is a transport problem, NOT a task problem.
-	 * The result was published and /done is durable. Mark the connection
-	 * dead so the next tick reconnects, but RETURN SUCCESS so the caller
-	 * clears inflight state. Broker redelivery (after consumer_timeout
-	 * on the now-dead channel) hits I1 via /done and emits already_done.
-	 *
-	 * Returning -1 here as round 4 did caused publish_reaped_result to
-	 * retry on next tick, but the result file had already been moved to
-	 * /done — the retry then took the "no result file" branch and
-	 * published a spurious internal_error synth, contradicting the real
-	 * result the portal had already received.
-	 */
 	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
 		fprintf(stderr, "[worker] basic.ack failed for %s — task is durably done; broker will redeliver, I1 will gate\n",
 		        task_id);
@@ -546,17 +425,6 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	                               0, 0, 0, "", err_tail ? err_tail : "");
 	if (!body) return -1;
 
-	/*
-	 * Order matters for crash safety (CRITICAL #13):
-	 *   1. write /done marker durably first so any redelivery is gated by I1
-	 *   2. publish to broker
-	 *   3. ack
-	 *
-	 * Round 6 M5: /done write failure (ENOSPC, EROFS, perms) MUST abort
-	 * the publish. Otherwise broker is acked but no /done marker exists,
-	 * and a future redelivery would re-execute the task — the very
-	 * idempotency hole this ordering exists to close.
-	 */
 	char dst[1024];
 	if ((size_t)snprintf(dst, sizeof dst, "%s/%s.json", ctx->done_dir, task_id) >= sizeof dst) {
 		free(body);
@@ -575,12 +443,7 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	                              body, strlen(body));
 	free(body);
 	if (rc != 0) return -1;
-	/*
-	 * Round 5 H2: same fix as publish_result_and_ack. /done was already
-	 * written before publish; ack failure is purely transport. Mark conn
-	 * dead but return success so caller clears inflight. Broker redelivery
-	 * hits I1 via /done.
-	 */
+
 	if (delivery_tag != 0 && publish_conn_ack(ctx->conn, delivery_tag) != 0) {
 		fprintf(stderr, "[worker] synth ack failed for %s — /done is durable; broker will redeliver, I1 will gate\n",
 		        task_id);
@@ -588,10 +451,6 @@ static int publish_synth_failure(worker_ctx_t *ctx,
 	}
 	return 0;
 }
-
-/* ============================================================
- * Startup cleanup (D3)
- * ============================================================ */
 
 static void purge_expired_done(const worker_ctx_t *ctx)
 {
@@ -610,12 +469,6 @@ static void purge_expired_done(const worker_ctx_t *ctx)
 	closedir(d);
 }
 
-/*
- * Filename must look like `<task_id>.json` where task_id passes the same
- * validator used for incoming messages. Anything else (write_file_atomic
- * leftovers like `*.tmp`, hand-dropped files, files with embedded
- * separators) is left untouched.
- */
 static int replay_filename_to_task_id(const char *fname, char *out, size_t out_sz)
 {
 	size_t n = strlen(fname);
@@ -658,9 +511,7 @@ static void replay_pending_results(worker_ctx_t *ctx)
 			fprintf(stderr, "[worker] replay publish failed for %s — left for next startup\n", e->d_name);
 			continue;
 		}
-		/* Move /results → /done. The original broker delivery_tag is
-		 * long gone after our crash; the redelivered task (if any) hits
-		 * the /done marker and is acked + skipped in worker_tick. */
+
 		char done_path[1024];
 		snprintf(done_path, sizeof done_path, "%s/%s.json", ctx->done_dir, task_id);
 		rename(path, done_path);
@@ -682,13 +533,6 @@ static void purge_stale_workspaces(const worker_ctx_t *ctx)
 	closedir(d);
 }
 
-/*
- * CRITICAL #10: any /running/<task_id> marker present at startup means a
- * previous agent instance died mid-install. We can't know whether the
- * child finished or not; treat as crashed-during-install. Publish a synth
- * failure (best-effort — connection may not be up yet on first init), and
- * move marker to /done so future redeliveries are gated by I1.
- */
 static void recover_stale_running(worker_ctx_t *ctx)
 {
 	DIR *d = opendir(ctx->running_dir);
@@ -699,14 +543,6 @@ static void recover_stale_running(worker_ctx_t *ctx)
 		char task_id[64];
 		if (!replay_filename_to_task_id(e->d_name, task_id, sizeof task_id)) continue;
 
-		/*
-		 * HIGH-C (round 2): if /done/<id>.json or /results/<id>.json
-		 * already exists, the task either completed in a prior run or
-		 * was just replayed by replay_pending_results. Either way the
-		 * authoritative result is already on disk — do NOT overwrite
-		 * with a synth failure body. Just unlink the stale /running
-		 * marker and move on.
-		 */
 		char done_path[1024], results_path[1024], src_path[1024];
 		int have_done    = 0, have_results = 0;
 		if ((size_t)snprintf(done_path,    sizeof done_path,    "%s/%s.json", ctx->done_dir,    task_id) < sizeof done_path)
@@ -721,29 +557,15 @@ static void recover_stale_running(worker_ctx_t *ctx)
 			                               0, 0, 0, "",
 			                               "agent terminated mid-install; recovered on restart\n");
 			if (!body) {
-				/* OOM: leave /running in place; next startup retries. */
+
 				safe_to_unlink_running = 0;
 			} else {
-				/*
-				 * Round 3 CRIT-N3+N4: write /done BEFORE publish (same
-				 * pattern as publish_synth_failure). If the write fails
-				 * (disk full, RO mount, perms), do NOT publish and do
-				 * NOT unlink /running — the next startup retries. Without
-				 * this guard we could end up with /done missing AND
-				 * /running unlinked → broker redelivers → fresh install
-				 * of an already-attempted task.
-				 */
+
 				if (write_file_atomic(done_path, body) != 0) {
 					fprintf(stderr, "[worker] recover: /done write failed for %s — leaving /running for next startup\n", task_id);
 					safe_to_unlink_running = 0;
 				} else {
-					/* /done is durable. Best-effort publish — failure is
-					 * acceptable because next startup will republish via
-					 * replay_pending_results path (no, actually /done is
-					 * already written so I1 will skip). The portal may
-					 * never see this synth-failure if publish fails AND
-					 * broker never redelivers — accepted as "best-effort
-					 * recovery on a permanently-broken connection". */
+
 					(void)publish_conn_publish(ctx->conn,
 					                           ctx->cfg.amqp.exchange,
 					                           ctx->cfg.result_routing_key,
@@ -763,13 +585,6 @@ static void recover_stale_running(worker_ctx_t *ctx)
 	closedir(d);
 }
 
-/*
- * Returns 1 if a /running/<task_id> marker currently exists. Used by
- * try_pick_new_task to detect mid-install redeliveries (broker
- * consumer_timeout fired while child was still running). The current
- * parent will publish the result when the child reaps, so the redelivery
- * just acks and drops with no extra publish.
- */
 static int running_marker_present(const worker_ctx_t *ctx, const char *task_id)
 {
 	char path[1024];
@@ -778,12 +593,6 @@ static int running_marker_present(const worker_ctx_t *ctx, const char *task_id)
 	return file_exists(path);
 }
 
-/*
- * Returns 0 on success, -1 on failure. CRITICAL #10 (round 2): caller
- * MUST abort the fork on failure — without the marker, a redelivery
- * during in-flight install will not be gated by I1 and double-execution
- * becomes possible (the original C10 race uncovered).
- */
 static int write_running_marker(const worker_ctx_t *ctx, const char *task_id)
 {
 	char path[1024];
@@ -807,10 +616,6 @@ static void clear_running_marker(const worker_ctx_t *ctx, const char *task_id)
 	if ((size_t)snprintf(path, sizeof path, "%s/%s.json", ctx->running_dir, task_id) >= sizeof path) return;
 	(void)unlink(path);
 }
-
-/* ============================================================
- * Public API
- * ============================================================ */
 
 worker_ctx_t *worker_init(const worker_config_t *cfg)
 {
@@ -858,21 +663,14 @@ void worker_force_child_term(worker_ctx_t *ctx, int hard)
 	if (!ctx || ctx->child_pid == 0) return;
 	int sig = hard ? SIGKILL : SIGTERM;
 	pid_t pgid = ctx->child_pid;
-	(void)kill(-pgid, sig);    /* ESRCH = pgid already gone — fine. */
+	(void)kill(-pgid, sig);
 	fprintf(stderr, "[worker] forced %s to child pgid=%d\n",
 	        hard ? "SIGKILL" : "SIGTERM", (int)pgid);
 }
 
 int worker_idle(const worker_ctx_t *ctx)
 {
-	/*
-	 * Round 4 F1+F2: idle requires BOTH no live child AND no pending
-	 * publish. After round-3's reap split, child_pid==0 alone means
-	 * "OS process reaped" but the result may still be sitting in
-	 * /results awaiting a successful publish_reaped_result. Drain
-	 * exiting at child_pid==0 alone would orphan that result until
-	 * next agent restart.
-	 */
+
 	return ctx && ctx->child_pid == 0 && ctx->inflight_task_id[0] == '\0';
 }
 
@@ -888,19 +686,9 @@ void worker_shutdown(worker_ctx_t *ctx)
 	free(ctx);
 }
 
-/* ============================================================
- * worker_tick — one main-loop step
- * ============================================================ */
-
-/*
- * Publish the result for the just-reaped child. Called only after
- * reap_child_only returned 1 (child reaped) AND the AMQP connection
- * is alive. Reads /results/<task_id>.json (or synthesizes a failure
- * if missing), publishes, acks, moves to /done, clears /running.
- */
 static int publish_reaped_result(worker_ctx_t *ctx)
 {
-	if (ctx->inflight_task_id[0] == '\0') return 0;  /* nothing to publish */
+	if (ctx->inflight_task_id[0] == '\0') return 0;
 
 	const char *task_id = ctx->inflight_task_id;
 	uint64_t    tag     = ctx->inflight_delivery_tag;
@@ -919,17 +707,16 @@ static int publish_reaped_result(worker_ctx_t *ctx)
 			                                   "result file unreadable after child exit\n");
 		}
 	} else {
-		/* Child died before writing the file (signal / OOM / abort). */
+
 		publish_rc = publish_synth_failure(ctx, task_id, tag, "internal_error",
 		                                   "worker child exited without writing result\n");
 	}
 
 	if (publish_rc != 0) {
-		/* Leave inflight_task_id intact so a later tick can retry. */
+
 		return -1;
 	}
 
-	/* Success: clear /running and inflight state. */
 	clear_running_marker(ctx, task_id);
 	ctx->inflight_delivery_tag   = 0;
 	ctx->inflight_task_id[0]     = '\0';
@@ -938,12 +725,7 @@ static int publish_reaped_result(worker_ctx_t *ctx)
 
 static int try_pick_new_task(worker_ctx_t *ctx)
 {
-	/*
-	 * Round 4 F1+F2: also bail when a previous task's publish is still
-	 * pending (inflight_task_id non-empty). Otherwise basic_get could
-	 * fetch task Y and overwrite inflight_task_id, orphaning task X's
-	 * result file in /results.
-	 */
+
 	if (ctx->drain || ctx->child_pid != 0 || ctx->inflight_task_id[0] != '\0')
 		return 0;
 
@@ -952,8 +734,8 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	uint64_t tag  = 0;
 	int rc = publish_conn_get(ctx->conn, ctx->cfg.queue_name,
 	                          &body, &blen, &tag);
-	if (rc == 1) return 0;         /* queue empty */
-	if (rc < 0)  return -1;        /* connection-level failure */
+	if (rc == 1) return 0;
+	if (rc < 0)  return -1;
 
 	cJSON *task = cJSON_Parse(body);
 	if (!task) {
@@ -973,10 +755,6 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		return 0;
 	}
 
-	/* Idempotency: /done marker present → skip install.
-	 * Round 4 F4+F5: capture publish/ack rc; mark conn_dead on failure
-	 * so the next tick reconnects instead of attempting basic_get on a
-	 * corrupted channel. */
 	char done_path[1024];
 	snprintf(done_path, sizeof done_path, "%s/%s.json", ctx->done_dir, task_id);
 	if (file_exists(done_path)) {
@@ -984,12 +762,7 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		char *res = build_result_json(ctx, task_id, "failure", "already_done",
 		                              0, 0, 0, "", "");
 		if (!res) {
-			/*
-			 * Round 5: OOM building synth body. Do NOT ack — leave the
-			 * message unacked so broker redelivers when memory recovers.
-			 * Acking without publishing would make portal believe the task
-			 * never reached the agent.
-			 */
+
 			fprintf(stderr, "[worker] OOM building already_done synth for %s — leaving unacked\n", task_id);
 			cJSON_Delete(task);
 			free(body);
@@ -1001,7 +774,7 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		                                  res, strlen(res));
 		free(res);
 		if (pub_rc != 0) {
-			/* publish failed → don't ack; broker redelivers. */
+
 			ctx->conn_dead = 1;
 			cJSON_Delete(task);
 			free(body);
@@ -1013,15 +786,6 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		return 0;
 	}
 
-	/*
-	 * CRITICAL #10: redelivery while a previous attempt is still running.
-	 * The /running marker says some agent (this one or a previous instance
-	 * before crash) is mid-install. The original parent will publish the
-	 * result; this redelivery should just be acked and dropped without
-	 * publishing anything to avoid double results. If the original parent
-	 * is dead, recover_stale_running on next startup will publish the synth
-	 * failure for that abandoned task.
-	 */
 	if (running_marker_present(ctx, task_id)) {
 		fprintf(stderr, "[worker] task %s already in-flight — redelivery dropped\n", task_id);
 		if (publish_conn_ack(ctx->conn, tag) != 0) ctx->conn_dead = 1;
@@ -1030,12 +794,6 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		return 0;
 	}
 
-	/* Write /running marker BEFORE fork so a redelivery during this run
-	 * (broker consumer_timeout, agent restart) can detect the in-flight
-	 * state and not double-execute. CRITICAL #10 (round 2): if marker
-	 * write fails (disk full, RO mount, perms), DO NOT fork — there is
-	 * no way to gate the redelivery race. Synthesize a failure result
-	 * so portal sees the task didn't run. */
 	if (write_running_marker(ctx, task_id) != 0) {
 		fprintf(stderr, "[worker] task %s: /running marker write failed — aborting\n", task_id);
 		if (publish_synth_failure(ctx, task_id, tag, "internal_error",
@@ -1046,26 +804,16 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		return 0;
 	}
 
-	/*
-	 * Round 4 F3 + Round 5: fork() failure is a LOCAL resource issue
-	 * (EAGAIN under memory/process pressure), not a broker problem.
-	 * publish_synth_failure writes /done BEFORE publish, so we clear the
-	 * /running marker only AFTER synth has at least committed /done. If
-	 * synth itself OOMs (no /done written, no publish), we leave /running
-	 * in place so the next startup's recover_stale_running can publish
-	 * the synth properly — preventing the double-execute hole where both
-	 * /running and /done would be missing.
-	 */
 	pid_t pid = fork();
 	if (pid < 0) {
 		fprintf(stderr, "[worker] fork failed: %s\n", strerror(errno));
 		int synth_rc = publish_synth_failure(ctx, task_id, tag, "internal_error",
 		                                     "agent could not fork worker child\n");
 		if (synth_rc == 0) {
-			/* /done is durable; safe to drop the in-flight marker. */
+
 			clear_running_marker(ctx, task_id);
 		} else {
-			/* synth failed (publish or OOM); leave /running for next-startup recovery. */
+
 			ctx->conn_dead = 1;
 		}
 		cJSON_Delete(task);
@@ -1073,21 +821,12 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 		return 0;
 	}
 	if (pid == 0) {
-		/*
-		 * Child: do not double-close the AMQP connection on _exit. The
-		 * actual fd closure happens via close_inherited_fds() at the top
-		 * of child_run_task (round 2 CRIT-E).
-		 */
+
 		ctx->conn = NULL;
 		child_run_task(ctx, task);
-		_exit(0);                               /* unreachable */
+		_exit(0);
 	}
 
-	/*
-	 * Parent: also call setpgid(child_pid, child_pid) to close the race
-	 * where drain runs before the child's own setpgid takes effect (round 3
-	 * C-2). One of the two calls is redundant; either succeeding is enough.
-	 */
 	(void)setpgid(pid, pid);
 
 	ctx->child_pid             = pid;
@@ -1102,20 +841,6 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	return 0;
 }
 
-/*
- * CRITICAL #2 + #3: reconnect after transport / channel failures.
- * Closing and re-opening the connection is the simplest way to recover
- * from any of: heartbeat-driven socket close, broker-side channel
- * exception (e.g. NOT_FOUND from basic_get on a queue the portal hasn't
- * declared yet), or TLS-level read/write errors. Outstanding delivery
- * tags are dropped — this is fine because we have not yet acked them and
- * the broker will redeliver after timeout / requeue.
- *
- * HIGH (round 2): exponential backoff against the broker. Without this,
- * a persistent failure (queue not yet declared, broker down for hours)
- * would trigger a TLS handshake every tick — broker rate-limits or
- * connection counter alerts will fire.
- */
 static int reconnect_if_dead(worker_ctx_t *ctx)
 {
 	if (!ctx->conn_dead && ctx->conn) return 0;
@@ -1126,7 +851,7 @@ static int reconnect_if_dead(worker_ctx_t *ctx)
 	    ctx->last_reconnect_attempt.tv_sec != 0) {
 		long elapsed = (long)(now.tv_sec - ctx->last_reconnect_attempt.tv_sec);
 		if (elapsed < ctx->reconnect_backoff_sec)
-			return -1;   /* still inside backoff window */
+			return -1;
 	}
 	ctx->last_reconnect_attempt = now;
 
@@ -1144,12 +869,6 @@ static int reconnect_if_dead(worker_ctx_t *ctx)
 	ctx->reconnect_backoff_sec = 0;
 	fprintf(stderr, "[worker] AMQP connection re-established\n");
 
-	/*
-	 * After a reconnect the in-flight delivery_tag is stale — that channel
-	 * is gone. The broker still has the message unacked from the old
-	 * channel and will redeliver after timeout. /running marker keeps I1
-	 * gating intact for the redelivery.
-	 */
 	ctx->inflight_delivery_tag = 0;
 	return 0;
 }
@@ -1161,25 +880,14 @@ void worker_keepalive(worker_ctx_t *ctx)
 		ctx->conn_dead = 1;
 }
 
-/*
- * Round 3: split waitpid from publish so drain can reap even when the
- * AMQP connection is dead and stuck in backoff. Without this, the OS
- * child becomes a zombie and worker_idle never returns true → drain
- * loop spins forever (or until systemd's TimeoutStopSec SIGKILLs us,
- * losing the broker ack and the result publish).
- */
 static int reap_child_only(worker_ctx_t *ctx)
 {
 	if (ctx->child_pid == 0) return 0;
 	int status = 0;
 	pid_t rc = waitpid(ctx->child_pid, &status, WNOHANG);
-	if (rc == 0) return 0;        /* still running */
+	if (rc == 0) return 0;
 	if (rc < 0)  return -1;
 
-	/* Mark task as no longer in-flight on our side. The result file
-	 * (if any) stays in /results until publish succeeds — either later
-	 * this session (when conn comes back) or on next agent startup
-	 * via replay_pending_results. */
 	(void)status;
 	ctx->child_pid = 0;
 	return 1;
@@ -1189,30 +897,18 @@ int worker_tick(worker_ctx_t *ctx)
 {
 	if (!ctx) return -1;
 
-	/*
-	 * Reap first — independent of AMQP state. Lets drain progress even
-	 * when broker is unreachable.
-	 */
 	int reaped = reap_child_only(ctx);
 	if (reaped < 0) return -1;
 
 	if (reconnect_if_dead(ctx) < 0) {
-		/* Connection still down. If we just reaped, the result file
-		 * remains in /results for next-tick or next-startup replay. */
+
 		return -1;
 	}
-	if (publish_conn_pump(ctx->conn) < 0) {  /* CRITICAL #1: heartbeat keepalive */
+	if (publish_conn_pump(ctx->conn) < 0) {
 		ctx->conn_dead = 1;
 		return -1;
 	}
 
-	/*
-	 * Round 4 F1+F2: publish ANY pending result, not only the just-reaped
-	 * one. After a publish failure on a previous tick, inflight_task_id
-	 * stays set with child_pid==0 (the comment in publish_reaped_result
-	 * documents this "leave intact for retry" intent — but the previous
-	 * gating only fired on `reaped == 1`, so the retry never happened).
-	 */
 	if (ctx->child_pid == 0 && ctx->inflight_task_id[0] != '\0') {
 		if (publish_reaped_result(ctx) < 0) {
 			ctx->conn_dead = 1;

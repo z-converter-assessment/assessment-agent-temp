@@ -1,15 +1,3 @@
-/**
- * @file publish.c
- * @brief librabbitmq-based publisher (Windows). Linux 와 동일 와이어 컨트랙트.
- *
- * Each call opens a fresh connection, publishes one message, and tears down.
- * v1 은 worker 가 없으므로 long-lived connection API (publish_conn_*) 는 제공
- * 하지 않는다.
- *
- * Topology declaration 은 컨슈머 책임. publisher 는 exchange passive declare
- * 로 존재 여부만 확인하고, 큐나 바인딩은 절대 선언하지 않는다.
- */
-
 #include "publish.h"
 #include "util.h"
 
@@ -23,7 +11,7 @@
 #include <string.h>
 #include <time.h>
 
-#include <winsock2.h>   /* struct timeval, on Windows lives here */
+#include <winsock2.h>
 
 static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
 {
@@ -45,13 +33,6 @@ static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
 	return -1;
 }
 
-/**
- * @brief Wait for broker ACK/NACK with a wall-clock deadline.
- *
- * GetTickCount64 (monotonic ms since boot) 로 deadline 추적. wait_frame_noblock
- * 의 per-call timeout 은 select 시간이지 deadline 이 아니므로, 무관한 frame
- * 이 와도 누적 대기 시간이 RABBITMQ_CONFIRM_TIMEOUT_SEC 를 넘지 않게 캡.
- */
 static int wait_confirm(amqp_connection_state_t conn)
 {
 	int t = getenv_int_or("RABBITMQ_CONFIRM_TIMEOUT_SEC", 5);
@@ -160,7 +141,7 @@ int publish_message(const publish_config_t *cfg,
 	amqp_exchange_declare(conn, 1,
 		amqp_cstring_bytes(cfg->exchange),
 		amqp_cstring_bytes("direct"),
-		1 /* passive */, 1 /* durable */, 0, 0, amqp_empty_table);
+		1 , 1 , 0, 0, amqp_empty_table);
 	if (check_rpc(amqp_get_rpc_reply(conn), "exchange.declare(passive)") != 0)
 		goto out_close_channel;
 
@@ -173,7 +154,7 @@ int publish_message(const publish_config_t *cfg,
 	             | AMQP_BASIC_DELIVERY_MODE_FLAG
 	             | AMQP_BASIC_MESSAGE_ID_FLAG;
 	props.content_type  = amqp_cstring_bytes("application/json");
-	props.delivery_mode = 2; /* persistent */
+	props.delivery_mode = 2;
 	props.message_id    = amqp_cstring_bytes(msg_id);
 
 	amqp_bytes_t body_bytes;
@@ -183,7 +164,7 @@ int publish_message(const publish_config_t *cfg,
 	int pub = amqp_basic_publish(conn, 1,
 		amqp_cstring_bytes(cfg->exchange),
 		amqp_cstring_bytes(routing_key),
-		0 /* mandatory */, 0 /* immediate */,
+		0 , 0 ,
 		&props, body_bytes);
 	if (pub != AMQP_STATUS_OK) {
 		fprintf(stderr, "[publish] basic.publish: %s\n",
@@ -204,15 +185,6 @@ out_destroy:
 	amqp_destroy_connection(conn);
 	return rc;
 }
-
-/* ============================================================
- * Long-lived connection (worker role — CM2 second connection)
- *
- * Linux publish.c 의 동일 영역 포팅. Windows 차이:
- *   - fcntl(FD_CLOEXEC) 미사용 — CreateProcessA(bInheritHandles=TRUE) 에
- *     명시 상속하는 핸들은 stdin/stdout/stderr 뿐. AMQP socket 은 winsock
- *     기본 정책상 inheritable 마킹 안 된 채 자식이 못 받음.
- * ============================================================ */
 
 struct publish_conn_s {
 	amqp_connection_state_t conn;
@@ -342,7 +314,7 @@ int publish_conn_get(publish_conn_t *c,
 	*out_delivery_tag = 0;
 
 	amqp_rpc_reply_t r = amqp_basic_get(c->conn, 1,
-		amqp_cstring_bytes(queue), 0 /* no_ack=false */);
+		amqp_cstring_bytes(queue), 0 );
 	if (r.reply_type != AMQP_RESPONSE_NORMAL) {
 		check_rpc(r, "basic.get");
 		return -1;

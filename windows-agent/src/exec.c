@@ -1,31 +1,7 @@
-/**
- * @file exec.c
- * @brief Sandboxed install execution (Windows) — CreateProcessA + Job Object.
- *
- * Linux exec.c 의 1:1 포팅.
- *   - fork/execve            → CreateProcessA(CREATE_SUSPENDED) + AssignProcessToJobObject → ResumeThread
- *   - setrlimit              → JOBOBJECT_EXTENDED_LIMIT_INFORMATION
- *   - clearenv + setenv      → CreateProcessA 의 lpEnvironment 에 minimal ANSI env block
- *   - pipe + select          → CreatePipe + PeekNamedPipe poll (200ms 틱)
- *   - kill(pid,SIG) → +5s SIGKILL → TerminateJobObject(timeout 시) → +5s TerminateProcess
- *
- * 자식 sandbox:
- *   - stdin = NUL  (Linux /dev/null)
- *   - stdout / stderr → anonymous pipe → ring buffer 4KB tail
- *   - CWD = work_dir
- *   - 환경 = PATH / TEMP / USERPROFILE / SystemRoot / TASK_ID / MACHINE_ID 만. 그 외 inherit X
- *   - Job Object: KILL_ON_JOB_CLOSE + ProcessMemoryLimit (mem_limit_mb) + ActiveProcessLimit
- *
- * install.type 분기:
- *   - direct_exec : target_file 직접 실행 ("path" arg1 arg2 ...)
- *   - msi         : msiexec.exe /i "target_file" /quiet /norestart  (argv_extra 무시)
- *                   exit code 0 / 3010 (reboot required) 둘 다 EXEC_OK
- */
-
 #define WIN32_LEAN_AND_MEAN
 
 #include "exec.h"
-#include "util.h"   /* monotonic_ms */
+#include "util.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -37,10 +13,6 @@
 #include <windows.h>
 
 #define WORK_DIR_MAX 1024
-
-/* ============================================================
- * Tail-buffer (Linux 와 동일 알고리즘 — ring + sanitize)
- * ============================================================ */
 
 typedef struct {
 	char  *buf;
@@ -83,13 +55,9 @@ static void tail_finalize(tail_buf_t *t, char *out, size_t out_sz)
 	out[kept] = '\0';
 }
 
-/* ============================================================
- * Env block — minimal ANSI KEY=VALUE\0...\0\0
- * ============================================================ */
-
 static char *build_env_block(const char *task_id, const char *machine_id)
 {
-	/* 호스트의 PATH / TEMP / USERPROFILE / SystemRoot 만 inherit. */
+
 	const char *path_env       = getenv("PATH");
 	const char *temp_env       = getenv("TEMP");
 	const char *userprofile    = getenv("USERPROFILE");
@@ -99,7 +67,6 @@ static char *build_env_block(const char *task_id, const char *machine_id)
 	if (!userprofile) userprofile = "C:\\Windows\\Temp";
 	if (!systemroot)  systemroot  = "C:\\Windows";
 
-	/* 충분히 큰 버퍼 — 모든 키=값 합쳐 8KB 면 여유. */
 	size_t cap = 8192;
 	char *blk = (char *)calloc(1, cap);
 	if (!blk) return NULL;
@@ -116,18 +83,10 @@ static char *build_env_block(const char *task_id, const char *machine_id)
 	if (machine_id && *machine_id) {
 		pos += snprintf(blk + pos, cap - pos, "MACHINE_ID=%s", machine_id); pos++;
 	}
-	/* Final NUL terminator (이중 NUL). calloc 으로 이미 0. */
+
 	(void)pos;
 	return blk;
 }
-
-/* ============================================================
- * Command line builder
- *   - direct_exec : "target_file" arg1 arg2 ...
- *   - msi         : msiexec.exe /i "target_file" /quiet /norestart
- *
- * Windows path 에 공백 가능성 있어 quote 처리. argv_extra 의 인자도 동일.
- * ============================================================ */
 
 static void append_quoted(char *dst, size_t dst_sz, const char *src)
 {
@@ -158,7 +117,6 @@ static int build_cmdline(exec_install_type_t type,
 		return 0;
 	}
 
-	/* direct_exec */
 	append_quoted(out, out_sz, target_file);
 	if (argv_extra) {
 		for (size_t i = 0; argv_extra[i]; i++)
@@ -166,10 +124,6 @@ static int build_cmdline(exec_install_type_t type,
 	}
 	return 0;
 }
-
-/* ============================================================
- * Job Object setup
- * ============================================================ */
 
 static HANDLE create_job(int mem_limit_mb, int active_proc_limit)
 {
@@ -197,12 +151,6 @@ static HANDLE create_job(int mem_limit_mb, int active_proc_limit)
 	return job;
 }
 
-/* ============================================================
- * Pipe drain helper
- *   non-blocking via PeekNamedPipe — 1 = EOF (peer closed), 0 = more,
- *   -1 = real error.
- * ============================================================ */
-
 static int drain_once(HANDLE pipe, tail_buf_t *t)
 {
 	for (;;) {
@@ -227,10 +175,6 @@ static int drain_once(HANDLE pipe, tail_buf_t *t)
 	}
 }
 
-/* ============================================================
- * Public — exec_install
- * ============================================================ */
-
 static long monotonic_ms_since(ULONGLONG t0)
 {
 	return (long)(monotonic_ms() - t0);
@@ -249,13 +193,12 @@ exec_status_t exec_install(void                *job_handle_in,
                            const char          *machine_id,
                            exec_result_t       *out)
 {
-	(void)fsize_limit_mb;  /* Windows 측 직접 강제 어려움 — 향후 disk quota 등으로 보완 */
+	(void)fsize_limit_mb;
 
 	if (!work_dir || !target_file || !out) return EXEC_ERR_INTERNAL;
 	memset(out, 0, sizeof *out);
 	out->exit_code = -1;
 
-	/* Pre-flight: target_file 존재 확인 (msi/direct_exec 양쪽 동일). */
 	DWORD attr = GetFileAttributesA(target_file);
 	if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
 		return EXEC_ERR_SCRIPT_NOT_FOUND;
@@ -263,8 +206,6 @@ exec_status_t exec_install(void                *job_handle_in,
 
 	if (active_proc_limit <= 0) active_proc_limit = 32;
 
-	/* 1. Job Object — caller (worker.c) 가 미리 만들어 전달했으면 그걸 사용 (외부에서
-	 *    TerminateJobObject 로 강제 종료 가능). 없으면 자체 생성 + 자체 close. */
 	HANDLE job = (HANDLE)job_handle_in;
 	int    owns_job = 0;
 	if (!job) {
@@ -272,7 +213,7 @@ exec_status_t exec_install(void                *job_handle_in,
 		if (!job) return EXEC_ERR_INTERNAL;
 		owns_job = 1;
 	} else {
-		/* caller-provided job: limit 정책 적용 (idempotent). */
+
 		JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
 		memset(&info, 0, sizeof info);
 		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -288,7 +229,6 @@ exec_status_t exec_install(void                *job_handle_in,
 		                              &info, sizeof info);
 	}
 
-	/* 2. Pipes (inheritable) + stdin = NUL */
 	SECURITY_ATTRIBUTES sa;
 	sa.nLength              = sizeof sa;
 	sa.bInheritHandle       = TRUE;
@@ -306,7 +246,7 @@ exec_status_t exec_install(void                *job_handle_in,
 		if (owns_job) CloseHandle(job);
 		return EXEC_ERR_INTERNAL;
 	}
-	/* 부모 측 핸들은 자식이 inherit 안 하도록 마킹. */
+
 	SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
 	SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
 
@@ -319,7 +259,6 @@ exec_status_t exec_install(void                *job_handle_in,
 		return EXEC_ERR_INTERNAL;
 	}
 
-	/* 3. CommandLine + env block */
 	char cmdline[4096];
 	if (build_cmdline(type, target_file, argv_extra, cmdline, sizeof cmdline) != 0) {
 		CloseHandle(nul);
@@ -337,7 +276,6 @@ exec_status_t exec_install(void                *job_handle_in,
 		return EXEC_ERR_INTERNAL;
 	}
 
-	/* 4. CreateProcessA — SUSPENDED 로 띄우고 Job 에 attach 후 Resume */
 	STARTUPINFOA si;
 	memset(&si, 0, sizeof si);
 	si.cb         = sizeof si;
@@ -350,12 +288,12 @@ exec_status_t exec_install(void                *job_handle_in,
 	memset(&pi, 0, sizeof pi);
 
 	BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL,
-	                         TRUE,  /* bInheritHandles */
+	                         TRUE,
 	                         CREATE_SUSPENDED | CREATE_NO_WINDOW,
 	                         env_block, work_dir, &si, &pi);
 
 	free(env_block);
-	/* 자식 측 쓰기 끝은 자식만 갖고 있도록 부모 측에서는 즉시 close. */
+
 	CloseHandle(out_w);
 	CloseHandle(err_w);
 	CloseHandle(nul);
@@ -367,7 +305,6 @@ exec_status_t exec_install(void                *job_handle_in,
 		return EXEC_ERR_INTERNAL;
 	}
 
-	/* Job 에 process attach 후 resume. */
 	if (!AssignProcessToJobObject(job, pi.hProcess)) {
 		TerminateProcess(pi.hProcess, 1);
 		CloseHandle(pi.hThread);
@@ -379,7 +316,6 @@ exec_status_t exec_install(void                *job_handle_in,
 	}
 	ResumeThread(pi.hThread);
 
-	/* 5. Drain loop + timeout */
 	ULONGLONG t0 = monotonic_ms();
 	char out_storage[4096];
 	char err_storage[4096];
@@ -392,7 +328,7 @@ exec_status_t exec_install(void                *job_handle_in,
 	int  out_open  = 1, err_open = 1;
 
 	for (;;) {
-		/* drain non-blocking */
+
 		if (out_open) {
 			int r = drain_once(out_r, &out_t);
 			if (r != 0) { CloseHandle(out_r); out_r = NULL; out_open = 0; }
@@ -408,15 +344,14 @@ exec_status_t exec_install(void                *job_handle_in,
 			term_sent = 1;
 		}
 		if (term_sent && !kill_sent && elapsed >= term_at_ms + 5000L) {
-			/* Job 종료 후에도 process 가 살아있다면 직접 종료 */
+
 			TerminateProcess(pi.hProcess, 1);
 			kill_sent = 1;
 		}
 
-		/* Process 종료 대기 — 200ms timeout */
 		DWORD wr = WaitForSingleObject(pi.hProcess, 200);
 		if (wr == WAIT_OBJECT_0) {
-			/* final drain — pipe 에 남은 buffered output */
+
 			if (out_open) { drain_once(out_r, &out_t); CloseHandle(out_r); out_r = NULL; out_open = 0; }
 			if (err_open) { drain_once(err_r, &err_t); CloseHandle(err_r); err_r = NULL; err_open = 0; }
 
@@ -431,15 +366,14 @@ exec_status_t exec_install(void                *job_handle_in,
 			CloseHandle(pi.hProcess);
 			if (owns_job) CloseHandle(job);
 
-			/* msi: 0 / 3010(reboot required) 둘 다 success */
 			if (type == EXEC_INSTALL_TYPE_MSI) {
 				if (exit_code == 0 || exit_code == 3010) return EXEC_OK;
 				return term_sent ? EXEC_ERR_SCRIPT_TIMEOUT : EXEC_ERR_SCRIPT_FAILED;
 			}
-			/* direct_exec */
+
 			if (exit_code == 0) return EXEC_OK;
 			return term_sent ? EXEC_ERR_SCRIPT_TIMEOUT : EXEC_ERR_SCRIPT_FAILED;
 		}
-		/* 그 외 WAIT_TIMEOUT 또는 WAIT_FAILED — loop 계속 */
+
 	}
 }

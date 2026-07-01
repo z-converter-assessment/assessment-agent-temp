@@ -1,12 +1,3 @@
-/**
- * @file collect.c
- * @brief v2 inventory and metrics collectors built on /proc, /sys, syscalls.
- *
- * Output schema lives in docs/payload-schema.md (mirrored by the engine).
- * Stateless: cumulative `/proc` counters are emitted as-is; the engine
- * computes deltas, rates, and percentages from two consecutive snapshots.
- */
-
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
@@ -37,25 +28,6 @@
 
 #define AGENT_VERSION_FALLBACK "0.0.0-dev"
 
-/* ============================================================
- * Common metadata
- * ============================================================ */
-
-/**
- * @brief Return cached boot_time as ISO 8601 UTC, or NULL if unreadable.
- *
- * Source: `btime <epoch>` line in /proc/stat. The kernel reflects NTP
- * corrections into btime, so reading it once at process start and caching
- * is mandatory — re-reading every cycle would jitter by 1~2s per NTP
- * step and produce false counter-reset events on the engine. (The earlier
- * implementation derived this from `CLOCK_REALTIME - /proc/uptime`; the
- * new path is shorter, gives a kernel-consistent value across the fleet,
- * and stays slightly more robust through cold-boot NTP convergence on
- * agent restart.)
- *
- * Read failure is sticky (cached as "unreadable") so we don't retry on
- * every message. Callers emit JSON null in that case.
- */
 static const char *cached_boot_time_iso(void)
 {
 	static char buf[32];
@@ -66,9 +38,7 @@ static const char *cached_boot_time_iso(void)
 		initialized = 1;
 		char *content = read_file_all("/proc/stat");
 		if (content) {
-			/* Locate "btime <epoch>" — typically on its own line. Anchor on
-			 * "\nbtime " to avoid matching an in-line substring; first-line
-			 * match handled by also accepting the file head. */
+
 			const char *p = NULL;
 			if (strncmp(content, "btime ", 6) == 0) {
 				p = content + 6;
@@ -90,13 +60,6 @@ static const char *cached_boot_time_iso(void)
 	return ok ? buf : NULL;
 }
 
-/**
- * @brief Return cached agent_started_at as ISO 8601 UTC.
- *
- * Captured on first call (= first message of the process lifetime).
- * Observability/debugging only — counter-reset detection must not key off
- * this field (see docs/inventory-refresh-and-reset-detection.md §4.1).
- */
 static const char *cached_agent_started_at_iso(void)
 {
 	static char buf[32];
@@ -111,15 +74,6 @@ static const char *cached_agent_started_at_iso(void)
 	return buf;
 }
 
-/* cached_composite_id forward decl 은 collect.h 에 public 으로 노출됨
- * (main.c 가 worker 큐 이름 빌드에 사용). */
-
-/**
- * @brief Add common metadata fields to @p obj.
- *
- * Fields: message_type, machine_id, composite_id, os_family, agent_version,
- * collected_at, hostname, message_id, boot_time, agent_started_at.
- */
 static void add_common_metadata(cJSON *obj,
                                 const char *message_type,
                                 const char *machine_id,
@@ -163,44 +117,17 @@ static void add_common_metadata(cJSON *obj,
 	                        cached_agent_started_at_iso());
 }
 
-/* ============================================================
- * Small helpers
- * ============================================================ */
-
-/**
- * @brief Return @p arr if non-NULL, else a freshly created empty array.
- *
- * Guards JSON output against array fields becoming missing on
- * cJSON_CreateArray() failure inside a collector.
- */
 static cJSON *or_empty_array(cJSON *arr)
 {
 	return arr ? arr : cJSON_CreateArray();
 }
 
-/**
- * @brief Add @p key as a kB number, or null if @p val is negative.
- *
- * Negative inputs come from meminfo_get_kb() when a line is missing or
- * unparseable. "Couldn't read" is encoded as JSON null rather than 0
- * so it can be distinguished from a real zero reading downstream.
- */
 static void add_kb_or_null(cJSON *root, const char *key, long val)
 {
 	if (val < 0) cJSON_AddNullToObject(root, key);
 	else         cJSON_AddNumberToObject(root, key, (double)val);
 }
 
-/**
- * @brief Block device names the agent always excludes from disks[] / disk_io[].
- *
- * Universal noise across all target OSes:
- *   - loop  : snap (Ubuntu), flatpak, losetup-mounted images
- *   - ram   : ramdisk (always present, never analytical interest)
- *   - sr    : optical drives / virtual CDROMs (cloud-init seed iso)
- *   - fd    : floppy (legacy, but still enumerated by some kernels)
- * Centralized here so lsblk / sysfs / diskstats apply identical policy.
- */
 static int is_excluded_block_dev(const char *name)
 {
 	if (!name || !*name) return 1;
@@ -210,46 +137,29 @@ static int is_excluded_block_dev(const char *name)
 	    || strncmp(name, "fd",   2) == 0;
 }
 
-/**
- * @brief Parse "MAJOR:MINOR" into two ints.
- *
- * Used by both lsblk JSON (`MAJ:MIN` column) and `/sys/block/<dev>/dev`
- * sysfs file. Returns 1 on success and writes both ints; on failure both
- * stay -1 so the caller can choose to omit the JSON fields.
- */
 static int parse_major_minor(const char *s, int *major, int *minor)
 {
 	*major = -1;
 	*minor = -1;
 	if (!s) return 0;
 	const char *colon = strchr(s, ':');
-	if (!colon || colon == s) return 0;       /* require non-empty major */
+	if (!colon || colon == s) return 0;
 	char *end = NULL;
 	long mj = strtol(s, &end, 10);
 	if (end != colon) return 0;
 	long mn = strtol(colon + 1, &end, 10);
-	if (end == colon + 1) return 0;            /* require non-empty minor */
+	if (end == colon + 1) return 0;
 	*major = (int)mj;
 	*minor = (int)mn;
 	return 1;
 }
 
-/**
- * @brief Add `major`/`minor` int fields to @p obj, or skip when negative.
- */
 static void add_major_minor(cJSON *obj, int major, int minor)
 {
 	if (major >= 0) cJSON_AddNumberToObject(obj, "major", (double)major);
 	if (minor >= 0) cJSON_AddNumberToObject(obj, "minor", (double)minor);
 }
 
-/* ============================================================
- * machine_id resolution
- * ============================================================ */
-
-/**
- * @brief 32-char hex check (machine-id format).
- */
 static int is_machine_id(const char *s)
 {
 	size_t n = 0;
@@ -287,11 +197,6 @@ static char *try_dbus_uuidgen(void)
 	return raw;
 }
 
-/**
- * @brief Detect cloud vendor by /sys/class/dmi/id/sys_vendor.
- *
- * Returns "aws" / "azure" / "gcp" / NULL. Result is statically allocated.
- */
 static const char *detect_cloud_vendor(void)
 {
 	char *vendor = read_file_all("/sys/class/dmi/id/sys_vendor");
@@ -306,21 +211,11 @@ static const char *detect_cloud_vendor(void)
 		result = "azure";
 	else if (strstr(vendor, "Google"))
 		result = "gcp";
-	/* Legacy AWS Xen instances had sys_vendor="Xen". Modern Nitro is
-	 * "Amazon EC2", and non-AWS Xen IaaS exists, so we no longer treat
-	 * a bare "Xen" vendor as AWS. Hosts that lose vendor detection
-	 * fall back to /etc/machine-id and dbus-uuidgen. */
 
 	free(vendor);
 	return result;
 }
 
-/**
- * @brief Fetch instance-id from cloud metadata service.
- *
- * Best-effort: any failure returns NULL. The agent then falls back to
- * other strategies. 1-second timeout to avoid blocking on non-cloud hosts.
- */
 static char *try_cloud_instance_id(void)
 {
 	const char *vendor = detect_cloud_vendor();
@@ -329,7 +224,7 @@ static char *try_cloud_instance_id(void)
 
 	char *out = NULL;
 	if (strcmp(vendor, "aws") == 0) {
-		/* IMDSv2 — token first, then fetch. */
+
 		char *token = run_cmd(
 			"curl -fsS -m 1 -X PUT "
 			"-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "
@@ -378,15 +273,6 @@ char *resolve_machine_id(void)
 	return try_cloud_instance_id();
 }
 
-/* ============================================================
- * Inventory collectors
- * ============================================================ */
-
-/**
- * @brief Parse `KEY=VALUE` line where VALUE may be quoted.
- *
- * Writes a malloc'd string to *@p out and returns 1 if found, 0 otherwise.
- */
 static int read_os_release_field(const char *content, const char *key, char **out)
 {
 	*out = NULL;
@@ -417,17 +303,6 @@ static int read_os_release_field(const char *content, const char *key, char **ou
 	return 0;
 }
 
-/**
- * @brief Pre-systemd EL6 (CentOS/RHEL/Oracle 6) fallback.
- *
- * EL6 predates `/etc/os-release`; OS identity lives in `/etc/redhat-release`
- * (or `centos-release` / `oracle-release` / `system-release`). Without this the
- * legacy binary reports os_id/os_version=null on CentOS 6. Mirrors the installer
- * logic in `deploy/lib/detect-os.sh` (detect_redhat_release_el6).
- *
- * Sets os_id (centos/rhel/ol/rocky/almalinux/amzn) + os_version ("6.10") +
- * os_codename(null) on @p root. Returns 1 if a release file yielded a version.
- */
 static int add_redhat_release_fallback(cJSON *root)
 {
 	static const char *files[] = {
@@ -445,19 +320,17 @@ static int add_redhat_release_fallback(cJSON *root)
 	if (!content)
 		return 0;
 
-	/* first line only */
 	char *nl = strchr(content, '\n');
 	if (nl)
 		*nl = '\0';
 
-	/* lowercase copy for case-insensitive keyword match */
 	char low[256];
 	size_t i = 0;
 	for (; content[i] && i < sizeof low - 1; i++)
 		low[i] = (char)tolower((unsigned char)content[i]);
 	low[i] = '\0';
 
-	const char *os_id = "rhel";  /* EL-family default */
+	const char *os_id = "rhel";
 	if (strstr(low, "centos"))            os_id = "centos";
 	else if (strstr(low, "rocky"))        os_id = "rocky";
 	else if (strstr(low, "almalinux"))    os_id = "almalinux";
@@ -465,11 +338,10 @@ static int add_redhat_release_fallback(cJSON *root)
 	else if (strstr(low, "amazon"))       os_id = "amzn";
 	else if (strstr(low, "red hat") || strstr(low, "redhat")) os_id = "rhel";
 
-	/* version: text after "release " — capture [0-9.] run (e.g. "6.10") */
 	char ver[32] = {0};
 	const char *rel = strstr(low, "release ");
 	if (rel) {
-		const char *p = rel + 8;  /* strlen("release ") */
+		const char *p = rel + 8;
 		while (*p == ' ' || *p == '\t')
 			p++;
 		size_t v = 0;
@@ -493,14 +365,11 @@ static int add_redhat_release_fallback(cJSON *root)
 	return 1;
 }
 
-/**
- * @brief Add `os_id`, `os_version`, `os_codename` to @p root.
- */
 static int add_os_release(cJSON *root)
 {
 	char *content = read_file_all("/etc/os-release");
 	if (!content) {
-		/* pre-systemd EL6 — fall back to /etc/redhat-release family */
+
 		if (add_redhat_release_fallback(root))
 			return 1;
 		cJSON_AddNullToObject(root, "os_id");
@@ -577,11 +446,6 @@ static void add_cpu_model(cJSON *root)
 	free(content);
 }
 
-/**
- * @brief Read a single kB-suffixed value from /proc/meminfo.
- *
- * @return >= 0 on success, -1 on missing key or parse failure.
- */
 static long meminfo_get_kb(const char *content, const char *key)
 {
 	size_t key_len = strlen(key);
@@ -620,20 +484,6 @@ static int add_mem_total_swap_total(cJSON *root)
 	return 1;
 }
 
-/**
- * @brief Collect disk list via lsblk JSON output.
- *
- * Command: `lsblk -dn -b -e 7,11 -o NAME,MAJ:MIN,SIZE,TYPE -J`
- *   -e 7,11 excludes loop (major 7) and sr/cdrom (major 11) at source.
- *   MAJ:MIN is added so disks[] can be joined with mounts[] / disk_io[].
- *
- * Defense-in-depth: even with `-e`, the name prefix filter
- * (`is_excluded_block_dev`) drops anything that slipped through.
- *
- * Returns an empty array if lsblk is missing or output is unparsable
- * (older util-linux predates `-J`, e.g. CentOS 7's 2.23 — see
- * collect_disks for the sysfs fallback path).
- */
 static cJSON *collect_disks_via_lsblk(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -653,8 +503,7 @@ static cJSON *collect_disks_via_lsblk(void)
 	cJSON *dev = NULL;
 	cJSON_ArrayForEach(dev, devices) {
 		cJSON *name = cJSON_GetObjectItemCaseSensitive(dev, "name");
-		/* util-linux pre-2.33 emits the JSON key as "MAJ:MIN" (uppercase);
-		 * 2.33+ emits "maj:min". Try lowercase first, then uppercase. */
+
 		cJSON *majmin = cJSON_GetObjectItemCaseSensitive(dev, "maj:min");
 		if (!majmin)
 			majmin = cJSON_GetObjectItemCaseSensitive(dev, "MAJ:MIN");
@@ -688,16 +537,6 @@ static cJSON *collect_disks_via_lsblk(void)
 	return arr;
 }
 
-/**
- * @brief Fallback disk list from /sys/block (no lsblk required).
- *
- * Used on hosts where lsblk is missing or too old for `-J` (e.g. CentOS 7
- * util-linux 2.23). Applies the same exclusion policy as the lsblk path
- * via `is_excluded_block_dev`. Skips entries without `/sys/block/<name>/device`
- * (synthetic devices). `major`/`minor` come from `/sys/block/<name>/dev`.
- * `type` is always `"disk"` since sysfs does not classify rotational vs SSD
- * vs LVM at this layer.
- */
 static cJSON *collect_disks_via_sysfs(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -749,14 +588,6 @@ static cJSON *collect_disks_via_sysfs(void)
 	return arr;
 }
 
-/**
- * @brief Disk list with lsblk-first, /sys/block fallback.
- *
- * lsblk knows partition vs disk vs LVM types and reports byte-accurate
- * sizes, so it is preferred. If lsblk is unavailable (missing binary,
- * pre-2.27 util-linux without `-J`) or returns no entries, we fall through
- * to a minimal /sys/block scan that always works on Linux 2.6+.
- */
 static cJSON *collect_disks(void)
 {
 	cJSON *arr = collect_disks_via_lsblk();
@@ -766,17 +597,6 @@ static cJSON *collect_disks(void)
 	return collect_disks_via_sysfs();
 }
 
-/**
- * @brief Pseudo / virtual filesystems excluded from mounts[].
- *
- * These exist for kernel/snap/k8s interfaces, not user data storage.
- * Centralised so inventory.mounts[] and metrics.mounts[] always agree.
- *
- *   nsfs     — k8s / container namespaces
- *   squashfs — snap (Ubuntu) and other read-only image mounts
- *   overlay  — container layered fs (docker/podman/k8s)
- *   tmpfs/devtmpfs/proc/sysfs/cgroup* etc — kernel pseudo-fs
- */
 static int is_excluded_fstype(const char *fstype)
 {
 	static const char *skip_fs[] = {
@@ -785,7 +605,7 @@ static int is_excluded_fstype(const char *fstype)
 		"tracefs", "securityfs", "pstore", "autofs", "rpc_pipefs",
 		"binfmt_misc", "configfs", "bpf", "ramfs", "overlay", "squashfs",
 		"nsfs",
-		/* container / VM virtual fs */
+
 		"9p", "virtiofs", "fuse.lxcfs", "fuse.gvfsd-fuse",
 		NULL,
 	};
@@ -796,13 +616,6 @@ static int is_excluded_fstype(const char *fstype)
 	return 0;
 }
 
-/**
- * @brief Single mount entry produced by list_real_mounts().
- *
- * `mount` and `fstype` are owned malloc'd strings. (major,minor) is the
- * device id parsed from /proc/self/mountinfo field 3. Used as the dedup
- * key so bind mounts (same device, multiple mountpoints) only count once.
- */
 struct mount_entry {
 	int   major;
 	int   minor;
@@ -820,24 +633,6 @@ static void free_mount_entries(struct mount_entry *arr, size_t n)
 	free(arr);
 }
 
-/**
- * @brief Parse a single /proc/self/mountinfo line.
- *
- * Format (man 5 proc):
- *   ID PARENT MAJOR:MINOR ROOT MOUNTPOINT MOUNT_OPTS [optional...] - FSTYPE SOURCE SUPER_OPTS
- *
- * Single-pass token scan — only positions 3 (maj:min), 5 (mount), and
- * the field after "-" (fstype) are captured. Avoids any fixed-size
- * fields[] cap so hosts with many optional fields (mount propagation
- * tags: shared:N master:M propagate_from:K unbindable, …) parse safely.
- *
- * Mountpoints with whitespace appear as `\040`-escaped — left as-is
- * (rare in our target environments; engine can decode if it matters).
- *
- * @return 1 on full success and writes @p major, @p minor, @p mount_out
- *         (malloc'd), @p fstype_out (malloc'd). 0 on parse failure
- *         (out-pointers untouched).
- */
 static int parse_mountinfo_line(const char *line,
                                 int *major, int *minor,
                                 char **mount_out, char **fstype_out)
@@ -865,7 +660,7 @@ static int parse_mountinfo_line(const char *line,
 		} else if (seen_dash && !fst) {
 			fst = strdup(tok);
 			if (!fst) goto fail;
-			break; /* fstype is the only post-dash field we need */
+			break;
 		}
 	}
 	free(copy);
@@ -888,13 +683,6 @@ fail:
 	return 0;
 }
 
-/**
- * @brief Dedup by (major, minor). Keeps the first occurrence (typically the
- *        canonical mountpoint; bind mounts are skipped).
- *
- * In-place: rewrites @p arr and updates @p count. Frees freed-out entries'
- * strings. Stable order — first-seen wins.
- */
 static void dedup_mounts(struct mount_entry *arr, size_t *count)
 {
 	size_t out = 0;
@@ -918,16 +706,6 @@ static void dedup_mounts(struct mount_entry *arr, size_t *count)
 	*count = out;
 }
 
-/**
- * @brief Build the canonical mount list from /proc/self/mountinfo.
- *
- * Excludes pseudo filesystems (`is_excluded_fstype`) and dedups by
- * (major,minor) so bind mounts of the same device only appear once.
- *
- * @param out_count  receives entry count.
- * @return malloc'd array (caller frees via free_mount_entries) or NULL on
- *         OOM / mountinfo unreadable. *out_count is 0 in that case.
- */
 static struct mount_entry *list_real_mounts(size_t *out_count)
 {
 	*out_count = 0;
@@ -968,9 +746,6 @@ static struct mount_entry *list_real_mounts(size_t *out_count)
 	return arr;
 }
 
-/**
- * @brief Build inventory `mounts[]` (raw bytes + fstype + major/minor).
- */
 static cJSON *collect_mounts_inventory(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1000,12 +775,6 @@ static cJSON *collect_mounts_inventory(void)
 	return arr;
 }
 
-/**
- * @brief Build metrics `mounts[]` (raw bytes + major/minor; no fstype).
- *
- * fstype lives in inventory only — it doesn't change per metric tick and
- * keeping it out of the 60-second message reduces wire traffic.
- */
 static cJSON *collect_mounts_metrics(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1034,9 +803,6 @@ static cJSON *collect_mounts_metrics(void)
 	return arr;
 }
 
-/* Count contiguous high bits in a network-order IPv4 mask (e.g. 0xffffff00
- * → 24). Non-contiguous masks are rare in practice — we still count the
- * popcount and let the engine notice via prefix length validity. */
 static int ipv4_netmask_prefix(uint32_t mask_n)
 {
 	uint32_t m = ntohl(mask_n);
@@ -1064,8 +830,6 @@ static cJSON *collect_internal_ips(void)
 		if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip))
 			continue;
 
-		/* CIDR: "<ip>/<prefix>". Missing netmask → prefix 0 (rare; e.g.
-		 * point-to-point without IFA_NETMASK). Buffer fits "xxx.xxx.xxx.xxx/32". */
 		int prefix = 0;
 		if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET) {
 			struct sockaddr_in *mask = (struct sockaddr_in *)ifa->ifa_netmask;
@@ -1079,21 +843,6 @@ static cJSON *collect_internal_ips(void)
 	return arr;
 }
 
-/**
- * @brief Collect MAC addresses of physical (Ethernet) interfaces.
- *
- * Source: /sys/class/net/<iface>/address (sysfs — universally available on
- * supported kernels). Used by the engine together with `machine_id` to detect
- * image-clone collisions (same machine_id but different MAC set).
- *
- * Filter policy (matches docs/payload-schema.md "필터링 정책"):
- *   - skip lo
- *   - skip docker bridge / veth / virbr (engine doesn't need them, and they
- *     are unstable across reboots — would generate false clone alerts)
- *   - skip non-Ethernet (type != ARPHRD_ETHER = 1) — tunnels, infiniband, etc.
- *   - skip all-zero MAC (uninitialized / hidden)
- *   - sort + dedup for stable comparison on the engine side
- */
 static int mac_str_cmp(const void *a, const void *b)
 {
 	return strcmp(*(const char * const *)a, *(const char * const *)b);
@@ -1127,7 +876,7 @@ static cJSON *collect_mac_addresses(void)
 			continue;
 		int iftype = atoi(type_str);
 		free(type_str);
-		if (iftype != 1)   /* ARPHRD_ETHER only */
+		if (iftype != 1)
 			continue;
 
 		char addr_path[256];
@@ -1138,7 +887,6 @@ static cJSON *collect_mac_addresses(void)
 			continue;
 		trim_inplace(addr);
 
-		/* Normalize to lowercase + reject all-zero (uninitialized). */
 		int nonzero = 0;
 		for (char *p = addr; *p; p++) {
 			*p = (char)tolower((unsigned char)*p);
@@ -1158,7 +906,7 @@ static cJSON *collect_mac_addresses(void)
 			}
 		}
 		if (!dup && count < MAC_CAP) {
-			macs[count++] = addr;   /* take ownership */
+			macs[count++] = addr;
 		} else {
 			free(addr);
 		}
@@ -1173,19 +921,6 @@ static cJSON *collect_mac_addresses(void)
 	return arr;
 }
 
-/**
- * @brief composite_id = sha256_hex(machine_id + "\n" + mac1 + "\n" + mac2 + ...).
- *
- * VM 이미지 클론으로 machine_id가 중복되는 환경에서 호스트 식별성을 보강하기 위한
- * 보조 식별자. MAC 목록은 collect_mac_addresses() 결과 (lowercase / sorted / dedup /
- * filtered)를 그대로 재사용 — 양 OS agent가 같은 알고리즘으로 같은 값을 산출하기 위함.
- *
- * 모든 NIC이 가상이거나 MAC이 비어있으면 결과는 sha256(machine_id + "\n")으로
- * 식별성이 떨어진다 — composite_id로도 못 가르는 엣지 케이스는 한계로 인정한 사안.
- * engine 측이 composite_id 충돌을 별도 신호로 감지해야 한다.
- *
- * 프로세스 lifetime 내 1회 계산 후 캐시.
- */
 const char *cached_composite_id(const char *machine_id)
 {
 	static char hex_buf[65];
@@ -1194,7 +929,7 @@ const char *cached_composite_id(const char *machine_id)
 		return hex_buf;
 
 	hex_buf[0] = '\0';
-	cached = 1;   /* fail-once: EVP 실패 시 매 메시지마다 재시도 회피 */
+	cached = 1;
 
 	cJSON *macs = collect_mac_addresses();
 	EVP_MD_CTX *md = EVP_MD_CTX_new();
@@ -1242,11 +977,6 @@ const char *cached_composite_id(const char *machine_id)
 	return hex_buf;
 }
 
-/**
- * @brief Resolve external IP via env override → cloud metadata.
- *
- * @return cJSON array (empty allowed) or null literal if both fail.
- */
 static cJSON *collect_external_ip(void)
 {
 	const char *override = getenv("AGENT_EXTERNAL_IP");
@@ -1311,30 +1041,6 @@ static cJSON *collect_external_ip(void)
 	return arr;
 }
 
-/**
- * @brief Collect active systemd service + socket units.
- *
- * Source: `systemctl list-units --type=service --type=socket
- *         --state=running --state=listening --no-pager --plain --no-legend`
- * Output line layout: `UNIT  LOAD  ACTIVE  SUB  DESCRIPTION...`
- *
- * Socket units are included so socket-activated workloads surface even when
- * their .service is not currently running — notably `podman.socket`
- * (rootless OCI runtime; sub=listening). The engine classifier substring-
- * matches the unit name (e.g. "podman" in "podman.socket"), so reporting the
- * socket is enough for container-workload recognition. Other listening
- * sockets fall through to the engine's "unknown" bucket and are harmless.
- *
- * On non-systemd hosts (Amazon Linux 1, custom containers) systemctl is
- * absent — `run_cmd` returns NULL and we emit a JSON null literal so the
- * engine can distinguish "no systemd" from "systemd present, no running
- * services" (the latter yields an empty array).
- *
- * Per v3 contract: agent emits raw unit names; categorisation
- * (`web`/`db`/...) and OS-name normalisation (`httpd`↔`apache2`) is the
- * engine's responsibility — keeps the per-OS mapping table out of the
- * binary so adding an OS does not require an agent re-deploy.
- */
 static cJSON *collect_services(void)
 {
 	char *out = run_cmd(
@@ -1368,17 +1074,6 @@ static cJSON *collect_services(void)
 	return arr;
 }
 
-/* ============================================================
- * listen_ports[] — TCP listen sockets + owning process
- * ============================================================ */
-
-/**
- * @brief Map entry: socket inode → owning pid + comm.
- *
- * Built once per inventory tick by walking /proc/<pid>/fd. comm is a fixed
- * 64-byte buffer (Linux TASK_COMM_LEN is 16; 64 is comfortable headroom for
- * any future widening).
- */
 struct sock_inode_owner {
 	long inode;
 	int  pid;
@@ -1400,17 +1095,6 @@ static int read_pid_comm(int pid, char *out, size_t out_len)
 	return 1;
 }
 
-/**
- * @brief Walk /proc/PID/fd/N to build a socket-inode → (pid, comm) map.
- *
- * Unprivileged agent: many `/proc/<pid>/fd` directories are unreadable
- * (EACCES — owned by a different uid). Those are silently skipped, leaving
- * those sockets with `pid`/`comm` = null in the final output. uid is still
- * recoverable from /proc/net/tcp regardless.
- *
- * @return malloc'd array (caller frees) or NULL on opendir failure / OOM.
- *         *@p out_count receives the entry count.
- */
 static struct sock_inode_owner *build_socket_owner_map(size_t *out_count)
 {
 	*out_count = 0;
@@ -1467,16 +1151,6 @@ done:
 	return map;
 }
 
-/**
- * @brief Decode `/proc/net/tcp` IPv4 hex address (8 hex chars, host order).
- *
- * The kernel writes the 32-bit IP via `%08X` from a host-order int, so on
- * x86_64 (little-endian) `127.0.0.1` (network byte order 0x7F000001) is
- * stored as int 0x0100007F and printed `"0100007F"`. Extracting bytes
- * LSB-first reconstructs the dotted quad.
- *
- * x86_64 only — matches the agent's target architecture (CLAUDE.md).
- */
 static void parse_tcp_v4_hex_addr(const char *hex8, char *out, size_t out_len)
 {
 	unsigned int a = (unsigned int)strtoul(hex8, NULL, 16);
@@ -1485,12 +1159,6 @@ static void parse_tcp_v4_hex_addr(const char *hex8, char *out, size_t out_len)
 	         (a >> 16) & 0xff, (a >> 24) & 0xff);
 }
 
-/**
- * @brief Decode `/proc/net/tcp6` IPv6 hex address (32 hex chars).
- *
- * Stored as 4 little-endian uint32. Each is byte-swapped into network order
- * to populate `struct in6_addr`, then formatted via inet_ntop.
- */
 static void parse_tcp_v6_hex_addr(const char *hex32, char *out, size_t out_len)
 {
 	struct in6_addr addr;
@@ -1508,17 +1176,8 @@ static void parse_tcp_v6_hex_addr(const char *hex32, char *out, size_t out_len)
 	inet_ntop(AF_INET6, &addr, out, (socklen_t)out_len);
 }
 
-/* TCP_LISTEN per linux/include/net/tcp_states.h is 0x0A. */
 #define TCP_STATE_LISTEN_HEX "0A"
 
-/**
- * @brief Returns 1 if @p remote is an all-zero address:port string.
- *
- * /proc/net/{tcp,udp}{,6} prints the remote endpoint as "addr:port"
- * (hex). UDP sockets without a `connect()`ed peer have all-zero remote
- * — used as the "server-like / no peer" filter for UDP since UDP has no
- * LISTEN state.
- */
 static int is_remote_unconnected(const char *remote)
 {
 	if (!remote || !*remote) return 0;
@@ -1529,18 +1188,6 @@ static int is_remote_unconnected(const char *remote)
 	return 1;
 }
 
-/**
- * @brief Parse `/proc/net/{tcp,udp}{,6}` and append server-like sockets to @p arr.
- *
- * Format columns (post-`sl:`): local rem state tx_q:rx_q tr:tm retr uid
- *                              timeout inode [...].
- *
- * @param is_udp  0 = TCP (filter state == "0A" LISTEN)
- *                1 = UDP (filter remote == 0:0, i.e. no connect()ed peer —
- *                         covers bound server sockets and unconnected
- *                         clients alike; engine can post-filter ephemeral
- *                         high ports if needed)
- */
 static void scan_proto_sockets(const char *path, const char *proto,
                                int is_v6, int is_udp,
                                cJSON *arr,
@@ -1553,7 +1200,7 @@ static void scan_proto_sockets(const char *path, const char *proto,
 	char *save = NULL;
 	for (char *line = strtok_r(content, "\n", &save); line;
 	     line = strtok_r(NULL, "\n", &save)) {
-		if (line_no++ == 0) continue; /* header row */
+		if (line_no++ == 0) continue;
 
 		while (*line == ' ' || *line == '\t') line++;
 		char *colon = strchr(line, ':');
@@ -1615,16 +1262,6 @@ static void scan_proto_sockets(const char *path, const char *proto,
 	free(content);
 }
 
-/**
- * @brief Build inventory `listen_ports[]` from /proc/net/{tcp,udp}{,6}.
- *
- * Combines:
- *   - TCP LISTEN sockets (state == 0A)
- *   - UDP unconnected sockets (no `connect()`ed peer — typical server pattern)
- *
- * Per-socket `pid`/`comm` may be `null` when the socket is owned by a
- * process the unprivileged agent cannot inspect; `uid` is always populated.
- */
 static cJSON *collect_listen_ports(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1658,12 +1295,12 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	cJSON_AddItemToObject(root, "disks",       or_empty_array(collect_disks()));
 	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts_inventory()));
-	/* services may be null literal by design (non-systemd host). */
+
 	cJSON_AddItemToObject(root, "services",     collect_services());
 	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
 	cJSON_AddItemToObject(root, "ip_internal",   or_empty_array(collect_internal_ips()));
 	cJSON_AddItemToObject(root, "mac_addresses", or_empty_array(collect_mac_addresses()));
-	/* ip_external may be null literal by design (cloud metadata unreachable). */
+
 	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
 
 	if (!ok) {
@@ -1672,10 +1309,6 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	}
 	return root;
 }
-
-/* ============================================================
- * Metrics collectors
- * ============================================================ */
 
 static int add_cpu_stat(cJSON *root)
 {
@@ -1701,13 +1334,6 @@ static int add_cpu_stat(cJSON *root)
 	return 1;
 }
 
-/**
- * @brief Sum of per-zone "low" watermarks from /proc/zoneinfo, in pages.
- *
- * Each memory zone prints a "low" line; the kernel's MemAvailable formula
- * uses their sum. Returns the page-count total, or -1 if /proc/zoneinfo is
- * unreadable or contains no "low" line.
- */
 static long zoneinfo_wmark_low_pages(void)
 {
 	char *content = read_file_all("/proc/zoneinfo");
@@ -1739,22 +1365,6 @@ static long zoneinfo_wmark_low_pages(void)
 	return found ? total : -1;
 }
 
-/**
- * @brief Reproduce the kernel si_mem_available() value for kernels that do
- *        not export MemAvailable (< 3.14: CentOS 6, CentOS 7.0~7.1).
- *
- * This is the *same algorithm* the kernel uses to fill /proc/meminfo's
- * MemAvailable, evaluated in user space:
- *
- *   available = MemFree − wmark_low
- *             + (pagecache  − min(pagecache/2,  wmark_low))   # Active(file)+Inactive(file)
- *             + (SReclaimable − min(SReclaimable/2, wmark_low))
- *
- * so the result matches a kernel that does export it, rather than the coarse
- * MemFree+Buffers+Cached estimate (which over-reports availability). All
- * inputs exist on CentOS 6 (kernel 2.6.32). Returns kB, or -1 if any required
- * input is missing — caller then falls back to the coarse estimate.
- */
 static long derive_mem_available_kb(const char *meminfo, long mem_free)
 {
 	if (mem_free < 0)
@@ -1770,7 +1380,7 @@ static long derive_mem_available_kb(const char *meminfo, long mem_free)
 		return -1;
 	long page_kb = sysconf(_SC_PAGESIZE) / 1024;
 	if (page_kb <= 0)
-		page_kb = 4;                      /* 4 KiB page default */
+		page_kb = 4;
 	long wmark_low = wmark_pages * page_kb;
 
 	long available = mem_free - wmark_low;
@@ -1800,13 +1410,6 @@ static int add_meminfo_full(cJSON *root)
 	long swap_total    = meminfo_get_kb(content, "SwapTotal");
 	long swap_free     = meminfo_get_kb(content, "SwapFree");
 
-	/* MemAvailable absent (kernel < 3.14: CentOS 6, CentOS 7.0~7.1). First
-	   reproduce the kernel si_mem_available() formula from /proc/zoneinfo
-	   watermarks + reclaimable pagecache/slab — same algorithm the kernel
-	   uses, so it matches kernels that do export it. Only if that fails
-	   (e.g. /proc/zoneinfo unreadable, missing Active(file)/SReclaimable)
-	   drop to the coarse MemFree+Buffers+Cached estimate. derive_* needs the
-	   meminfo text, so compute before free(). */
 	if (mem_available < 0)
 		mem_available = derive_mem_available_kb(content, mem_free);
 	if (mem_available < 0 && mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0)
@@ -1843,17 +1446,6 @@ static int add_loadavg(cJSON *root)
 	return 1;
 }
 
-/**
- * @brief Parse /proc/diskstats first 14 columns per device.
- *
- * Filtering policy (matches inventory.disks[]):
- *   - Excludes loop / ram / sr / fd via is_excluded_block_dev.
- *   - Keeps only top-level block devices: /sys/block/<dev> must exist
- *     (drops partitions like vda1 by leaving them out of the parent's row).
- *
- * Emits major/minor so the engine can join with inventory.disks[] /
- * mounts[] without doing string-level device-name matching.
- */
 static cJSON *collect_disk_io(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1884,7 +1476,6 @@ static cJSON *collect_disk_io(void)
 		if (is_excluded_block_dev(dev))
 			continue;
 
-		/* Only keep top-level block devices: /sys/block/<dev> exists. */
 		char path[256];
 		snprintf(path, sizeof path, "/sys/block/%s", dev);
 		if (access(path, F_OK) != 0)
@@ -1918,7 +1509,7 @@ static cJSON *collect_net_io(void)
 	     line = strtok_r(NULL, "\n", &save)) {
 		line_no++;
 		if (line_no <= 2)
-			continue; /* header rows */
+			continue;
 
 		char *colon = strchr(line, ':');
 		if (!colon)
@@ -1932,11 +1523,7 @@ static cJSON *collect_net_io(void)
 
 		long rx_bytes = 0, rx_packets = 0, rx_errors = 0;
 		long tx_bytes = 0, tx_packets = 0, tx_errors = 0;
-		/* /proc/net/dev rx: bytes packets errs drop fifo frame compressed multicast
-		 *               tx: bytes packets errs drop fifo colls carrier compressed
-		 * We only keep bytes/packets/errors per direction; the rest are skipped
-		 * with assignment-suppression (%*d) so the matched-count reflects the
-		 * fields we actually need. */
+
 		int n = sscanf(colon + 1,
 		               "%ld %ld %ld %*d %*d %*d %*d %*d "
 		               "%ld %ld %ld",
@@ -1982,10 +1569,6 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	return root;
 }
 
-/* ============================================================
- * Error payload
- * ============================================================ */
-
 cJSON *build_error_payload(const char *machine_id,
                            const char *agent_version,
                            const char *error_code,
@@ -2000,7 +1583,6 @@ cJSON *build_error_payload(const char *machine_id,
 		return NULL;
 	add_common_metadata(root, "error", machine_id, agent_version);
 
-	/* Error-specific: collected_at carries millisecond precision. */
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
 	char ms_buf[32];

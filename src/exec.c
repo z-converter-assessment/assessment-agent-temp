@@ -1,20 +1,3 @@
-/**
- * @file exec.c
- * @brief fork + execve of install.sh under EC1 environment.
- *
- * Parent side: opens two pipes (stdout, stderr), forks, then drains both
- * pipes via poll()-style select loop while watching the child PID. On
- * timeout, sends SIGTERM to the child's process group (set via setsid in
- * the child); +5s after that, SIGKILL. Pipe drain continues until both
- * ends close so the result tails capture any output flushed during
- * shutdown.
- *
- * Child side: clearenv → whitelist rebuild → setsid → chdir → stdio
- * redirection → setrlimit → execve. All steps before execve are wrapped
- * in `if (...) _exit(EXEC_CHILD_BOOTSTRAP_FAIL)` so a parent waitpid sees
- * a distinguishable exit code on bootstrap failure.
- */
-
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
@@ -38,25 +21,12 @@
 
 extern char **environ;
 
-/*
- * Distinguishable from POSIX shell conventions:
- *   126 = "command found but not executable"
- *   127 = "command not found"
- *   128+N = "killed by signal N"
- * Picking 124 leaves all of those alone so a parent waitpid can tell
- * "child failed to set up its environment" from "the install script
- * itself died with a similar status".
- */
 #define EXEC_CHILD_BOOTSTRAP_FAIL 124
-
-/* ============================================================
- * Tail-buffer helpers — keep only the last N bytes
- * ============================================================ */
 
 typedef struct {
 	char  *buf;
 	size_t cap;
-	size_t len;      /* total bytes ever appended */
+	size_t len;
 } tail_buf_t;
 
 static void tail_append(tail_buf_t *t, const char *data, size_t n)
@@ -86,7 +56,7 @@ static void tail_finalize(tail_buf_t *t, char *out, size_t out_sz)
 		memcpy(out, t->buf + start, first);
 		if (kept > first) memcpy(out + first, t->buf, kept - first);
 	}
-	/* Sanitize: replace bytes outside ASCII printable + \t\n with '?'. */
+
 	for (size_t i = 0; i < kept; i++) {
 		unsigned char c = (unsigned char)out[i];
 		if (c == '\t' || c == '\n') continue;
@@ -95,20 +65,6 @@ static void tail_finalize(tail_buf_t *t, char *out, size_t out_sz)
 	out[kept] = '\0';
 }
 
-/* ============================================================
- * Child-side bootstrap
- * ============================================================ */
-
-/*
- * Round 3: parameter is overloaded by resource type:
- *   RLIMIT_CPU      → seconds (raw value)
- *   RLIMIT_NOFILE   → fd count (raw value)
- *   RLIMIT_AS / RLIMIT_FSIZE → MB (multiplied to bytes)
- *
- * Previously RLIMIT_NOFILE was treated as MB and multiplied by 1024*1024,
- * setting fd table to 1 GB entries — kernel clamps to a hard limit but
- * the requested value was nonsense.
- */
 static int set_rlimit(int resource, long value)
 {
 	if (value <= 0) return 0;
@@ -129,14 +85,7 @@ static int child_bootstrap(const char *extract_dir,
                            int timeout_sec, int mem_mb, int fsize_mb,
                            int nofile)
 {
-	/*
-	 * Round 3 C-1: do NOT call setsid() here. The grandchild must stay
-	 * in the worker child's process group so that the agent's drain
-	 * escalation `kill(-worker_child_pid, SIGTERM)` reaches install.sh.
-	 * Previously setsid() created a new session; -worker_child_pid then
-	 * targeted only the worker child, leaving install.sh as a long-running
-	 * orphan reparented to init.
-	 */
+
 	if (chdir(extract_dir) != 0)            return -1;
 
 	if (dup2(stdin_fd, STDIN_FILENO)   < 0) return -1;
@@ -150,15 +99,6 @@ static int child_bootstrap(const char *extract_dir,
 
 	umask(022);
 
-	/*
-	 * Round 10: reset SIGPIPE to SIG_DFL before execve. POSIX guarantees
-	 * SIG_IGN dispositions survive execve, so without this reset install.sh
-	 * inherits the agent's SIGPIPE-ignore (round-9 fix for broker reset
-	 * crashes). install scripts relying on classic pipeline semantics
-	 * (`yes | foo`, `tar | head`) would then hang because SIGPIPE never
-	 * fires when the pipe peer closes. Restoring SIG_DFL here applies
-	 * only to the install.sh process tree.
-	 */
 	signal(SIGPIPE, SIG_DFL);
 
 	if (clearenv() != 0) return -1;
@@ -178,10 +118,6 @@ static int child_bootstrap(const char *extract_dir,
 	return 0;
 }
 
-/* ============================================================
- * Parent-side drain + timeout enforcement
- * ============================================================ */
-
 static long elapsed_ms(struct timespec start)
 {
 	struct timespec now;
@@ -198,28 +134,18 @@ static int set_nonblocking(int fd)
 	return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-/*
- * Returns 1 if peer closed the pipe (EOF), 0 if more data may arrive,
- * -1 on a real read error. Distinguishing EOF from EAGAIN lets the caller
- * retire the fd from the select set instead of spinning at 200ms ticks
- * on an already-closed pipe (CRITICAL #12).
- */
 static int drain_once(int fd, tail_buf_t *t)
 {
 	char buf[4096];
 	for (;;) {
 		ssize_t n = read(fd, buf, sizeof buf);
 		if (n > 0)            { tail_append(t, buf, (size_t)n); continue; }
-		if (n == 0)           return 1;             /* EOF */
+		if (n == 0)           return 1;
 		if (errno == EINTR)   continue;
 		if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
 		return -1;
 	}
 }
-
-/* ============================================================
- * Public — exec_install_script
- * ============================================================ */
 
 exec_status_t exec_install_script(const char  *extract_dir,
                                   const char  *script,
@@ -237,7 +163,6 @@ exec_status_t exec_install_script(const char  *extract_dir,
 	memset(out, 0, sizeof *out);
 	out->exit_code = -1;
 
-	/* Pre-flight: script exists and is regular. */
 	{
 		char full[4096];
 		snprintf(full, sizeof full, "%s/%s", extract_dir, script);
@@ -272,7 +197,7 @@ exec_status_t exec_install_script(const char  *extract_dir,
 	}
 
 	if (pid == 0) {
-		/* CHILD */
+
 		close(out_pipe[0]); close(err_pipe[0]);
 		if (child_bootstrap(extract_dir, task_id, machine_id,
 		                    devnull, out_pipe[1], err_pipe[1],
@@ -280,7 +205,6 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		                    nofile_limit > 0 ? nofile_limit : 4096) != 0)
 			_exit(EXEC_CHILD_BOOTSTRAP_FAIL);
 
-		/* Build argv: "./script" [+ argv_extra...]. */
 		size_t extra_count = 0;
 		if (argv_extra) while (argv_extra[extra_count]) extra_count++;
 
@@ -297,7 +221,6 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		_exit(EXEC_CHILD_BOOTSTRAP_FAIL);
 	}
 
-	/* PARENT */
 	close(out_pipe[1]); close(err_pipe[1]); close(devnull);
 	set_nonblocking(out_pipe[0]);
 	set_nonblocking(err_pipe[0]);
@@ -318,15 +241,10 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		if (out_pipe[0] >= 0) { FD_SET(out_pipe[0], &rfds); if (out_pipe[0] > maxfd) maxfd = out_pipe[0]; }
 		if (err_pipe[0] >= 0) { FD_SET(err_pipe[0], &rfds); if (err_pipe[0] > maxfd) maxfd = err_pipe[0]; }
 
-		struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };  /* 200ms */
+		struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
 		int sr = (maxfd >= 0) ? select(maxfd + 1, &rfds, NULL, NULL, &tv) : 0;
 		if (sr < 0 && errno != EINTR) break;
 
-		/*
-		 * After EOF, retire the fd from the select set (CRITICAL #12) by
-		 * closing it and setting it to -1 — otherwise select() would
-		 * report it ready every iteration and we'd burn CPU at 5Hz.
-		 */
 		if (out_pipe[0] >= 0 && (sr < 0 || FD_ISSET(out_pipe[0], &rfds))) {
 			int r = drain_once(out_pipe[0], &out_t);
 			if (r != 0) { close(out_pipe[0]); out_pipe[0] = -1; }
@@ -338,13 +256,7 @@ exec_status_t exec_install_script(const char  *extract_dir,
 
 		long elapsed = elapsed_ms(t0);
 		if (term_at_ms >= 0 && !term_sent && elapsed >= term_at_ms) {
-			/*
-			 * Round 3 C-1: grandchild no longer setsid()s, so it shares
-			 * our pgid. `kill(-pid)` would target a non-existent group.
-			 * Use single-process kill — install.sh's own forked helpers
-			 * (rare) inherit our group and will be cleaned up when the
-			 * agent's drain escalation targets the worker_child pgid.
-			 */
+
 			kill(pid, SIGTERM);
 			term_sent = 1;
 		}
@@ -356,7 +268,7 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		int status = 0;
 		pid_t rc = waitpid(pid, &status, WNOHANG);
 		if (rc == pid) {
-			/* final drain — pipes may still hold buffered output. */
+
 			if (out_pipe[0] >= 0) { drain_once(out_pipe[0], &out_t); close(out_pipe[0]); out_pipe[0] = -1; }
 			if (err_pipe[0] >= 0) { drain_once(err_pipe[0], &err_t); close(err_pipe[0]); err_pipe[0] = -1; }
 
@@ -380,7 +292,6 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		if (rc < 0 && errno != EINTR) break;
 	}
 
-	/* Unreachable in well-behaved cases — fall-through. */
 	if (out_pipe[0] >= 0) { close(out_pipe[0]); out_pipe[0] = -1; }
 	if (err_pipe[0] >= 0) { close(err_pipe[0]); err_pipe[0] = -1; }
 	kill(pid, SIGKILL);

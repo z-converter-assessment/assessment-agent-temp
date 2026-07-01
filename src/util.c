@@ -1,8 +1,3 @@
-/**
- * @file util.c
- * @brief util.h implementation. No domain dependencies (no AMQP, no cJSON).
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "util.h"
@@ -22,7 +17,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ---------- run_cmd ---------- */
 char *run_cmd(const char *cmd)
 {
 	FILE *fp = popen(cmd, "r");
@@ -64,7 +58,6 @@ char *run_cmd(const char *cmd)
 	return buf;
 }
 
-/* ---------- read_file_all ---------- */
 char *read_file_all(const char *path)
 {
 	int fd = open(path, O_RDONLY);
@@ -105,7 +98,6 @@ char *read_file_all(const char *path)
 	return buf;
 }
 
-/* ---------- env helpers ---------- */
 const char *getenv_default(const char *name, const char *fallback)
 {
 	const char *v = getenv(name);
@@ -123,7 +115,7 @@ int parse_bool(const char *s, int fallback)
 	    !strcasecmp(s, "no")   || !strcasecmp(s, "off")   ||
 	    !strcasecmp(s, "n")    || !strcasecmp(s, "f"))
 		return 0;
-	/* Unrecognized — return -1 sentinel; getenv_bool surfaces a warning. */
+
 	return -1;
 }
 
@@ -222,7 +214,6 @@ void load_env_file(const char *path)
 	fclose(f);
 }
 
-/* ---------- time / uuid helpers ---------- */
 char *iso8601_utc(time_t t, char *buf, size_t len)
 {
 	struct tm tm;
@@ -256,7 +247,6 @@ char *uuid_v4(char *buf, size_t len)
 		fclose(f);
 	}
 
-	/* Synthetic fallback (not RFC-4122 compliant but unique enough). */
 	char hostname[64] = "unknown";
 	gethostname(hostname, sizeof hostname);
 	struct timeval tv;
@@ -278,10 +268,6 @@ int jitter_seconds(int base_sec, double frac)
 	return (int)v;
 }
 
-/* ============================================================
- * close_inherited_fds — fd hygiene for forked children
- * ============================================================ */
-
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -302,12 +288,7 @@ static int sweep_via_proc_self_fd(void)
 		saw_any = 1;
 	}
 	closedir(d);
-	/*
-	 * /proc may exist but readdir return zero numeric entries (hidepid=2,
-	 * unusual mount, security policy). Treat zero hits as "fall through to
-	 * numeric sweep" — empty success is indistinguishable from real success
-	 * but the numeric sweep is cheap.
-	 */
+
 	return saw_any ? 0 : -1;
 }
 
@@ -319,7 +300,7 @@ static void sweep_numeric(void)
 	    rl.rlim_cur != RLIM_INFINITY) {
 		max_fd = (long)rl.rlim_cur;
 	}
-	if (max_fd > 4096) max_fd = 4096;   /* cap to prevent 1M-syscall storms */
+	if (max_fd > 4096) max_fd = 4096;
 	for (long fd = STDERR_FILENO + 1; fd < max_fd; fd++)
 		(void)close((int)fd);
 }

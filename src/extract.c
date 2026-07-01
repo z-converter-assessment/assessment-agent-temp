@@ -1,18 +1,3 @@
-/**
- * @file extract.c
- * @brief libarchive-based tar extractor with TP1 entry/permission policy.
- *
- * Each archive entry is inspected before any write:
- *   1. path safety (no `..`, no leading `/`)
- *   2. entry type whitelist (regular file or directory only)
- *   3. permission mask (`mode &= 0777`)
- *   4. owner override (uid/gid → process uid/gid)
- *
- * The first failing entry aborts extraction and returns an error. The
- * extraction directory is left as-is for the worker to `rm -rf` along
- * with the rest of the task workspace.
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "extract.h"
@@ -27,40 +12,28 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* ============================================================
- * Path safety
- * ============================================================ */
-
 int extract_path_safe(const char *path)
 {
 	if (!path || !*path) return 0;
-	if (path[0] == '/')  return 0;                 /* absolute */
+	if (path[0] == '/')  return 0;
 
 	const char *p = path;
 	while (*p) {
-		/* Skip any leading `./` segments. */
+
 		while (p[0] == '.' && p[1] == '/') p += 2;
 		if (p[0] == '.' && p[1] == '.' &&
-		    (p[2] == '\0' || p[2] == '/'))         return 0;  /* `..` segment */
-		/* Advance to next `/`. */
+		    (p[2] == '\0' || p[2] == '/'))         return 0;
+
 		while (*p && *p != '/') p++;
 		if (*p == '/') p++;
 	}
 	return 1;
 }
 
-/* ============================================================
- * Entry-type whitelist
- * ============================================================ */
-
 static int entry_type_allowed(mode_t filetype)
 {
 	return filetype == AE_IFREG || filetype == AE_IFDIR;
 }
-
-/* ============================================================
- * Public — extract_tarball
- * ============================================================ */
 
 extract_status_t extract_tarball(const char *archive_path, const char *dest_dir)
 {
@@ -74,14 +47,6 @@ extract_status_t extract_tarball(const char *archive_path, const char *dest_dir)
 		return EXTRACT_ERR_INTERNAL;
 	}
 
-	/*
-	 * Disk-writer flags: no_acl + no_fflags + no_xattr + no_owner ensures
-	 * the writer does not attempt to chown/setflags (which would fail
-	 * unprivileged anyway) and silently strips ACLs / extended attrs that
-	 * may be carried in the archive but should not survive the sandbox.
-	 * `SECURE_NODOTDOT` and `SECURE_SYMLINKS` are belt-and-suspenders on
-	 * top of our own path-safety check.
-	 */
 	int wflags = ARCHIVE_EXTRACT_TIME
 	           | ARCHIVE_EXTRACT_NO_OVERWRITE
 	           | ARCHIVE_EXTRACT_SECURE_NODOTDOT
@@ -118,17 +83,14 @@ extract_status_t extract_tarball(const char *archive_path, const char *dest_dir)
 
 		if (!extract_path_safe(raw_path)) { rc = EXTRACT_ERR_PATH_TRAVERSAL; break; }
 		if (!entry_type_allowed(ftype))   { rc = EXTRACT_ERR_FORBIDDEN_TYPE; break; }
-		/* Defensive: hardlinks carry a non-empty `hardlink` field even when
-		 * filetype reads as regular. Reject those too. */
+
 		if (archive_entry_hardlink(entry) != NULL) { rc = EXTRACT_ERR_FORBIDDEN_TYPE; break; }
 		if (archive_entry_symlink(entry)  != NULL) { rc = EXTRACT_ERR_FORBIDDEN_TYPE; break; }
 
-		/* Apply policy: mask perms, force ownership. */
 		archive_entry_set_perm(entry, perm & 0777);
 		archive_entry_set_uid(entry, (la_int64_t)my_uid);
 		archive_entry_set_gid(entry, (la_int64_t)my_gid);
 
-		/* Prepend dest_dir to the entry path. */
 		size_t dlen = strlen(dest_dir);
 		size_t plen = strlen(raw_path);
 		size_t need = dlen + 1 + plen + 1;
@@ -142,7 +104,6 @@ extract_status_t extract_tarball(const char *archive_path, const char *dest_dir)
 			rc = EXTRACT_ERR_WRITE; break;
 		}
 
-		/* Stream content (regular files only). */
 		if (ftype == AE_IFREG) {
 			const void *buf = NULL;
 			size_t size = 0;

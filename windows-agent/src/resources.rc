@@ -1,13 +1,1 @@
-/* resources.rc — PE resources embedded into assessment-agent.exe.
- *
- * AGENT_ENV_EXAMPLE: the canonical agent.env.example text. The installer
- * subcommand reads this via FindResourceW(L"AGENT_ENV_EXAMPLE", RT_RCDATA)
- * to seed the on-disk env file and to drive the interactive prompt loop —
- * deploy/agent.env.example stays the single source of truth, but operators
- * never need it on the target host.
- *
- * windres treats RCDATA payload as opaque bytes, so UTF-8 (incl. Korean
- * comments in the example) round-trips intact.
- */
-
 AGENT_ENV_EXAMPLE RCDATA "deploy/agent.env.example"

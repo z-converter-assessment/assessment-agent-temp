@@ -1,18 +1,3 @@
-/**
- * @file publish.h
- * @brief RabbitMQ publisher (Windows). Same wire contract as Linux agent.
- *
- * Topology contract:
- *   - Exchange : `assessment` (direct, durable)
- *   - Routing keys: `server.inventory`, `server.metrics`, `server.error`
- *   - Vhost   : `/` for local dev, `/assessment` in production
- *
- * Collector 는 publish_message() 한 함수로 open-publish-close 패턴. worker (v2,
- * task.install consumer) 는 long-lived publish_conn_* API 로 동일 채널에서
- * basic_get / basic_publish / basic_ack 를 처리한다 (broker delivery_tag 가
- * 채널 lifetime 동안만 유효하므로).
- */
-
 #ifndef ASSESSMENT_AGENT_PUBLISH_H
 #define ASSESSMENT_AGENT_PUBLISH_H
 
@@ -21,7 +6,7 @@
 
 typedef struct {
 	const char *host;
-	int         port;       /**< 5672 AMQP, 5671 AMQPS */
+	int         port;
 	const char *vhost;
 	const char *user;
 	const char *password;
@@ -37,23 +22,10 @@ typedef struct {
 	const char *tls_key_path;
 } publish_config_t;
 
-/**
- * @brief Publish a single JSON message to the broker.
- *
- * Internally: open socket → optional TLS → login → channel.open
- *             → confirm.select → exchange.declare(passive)
- *             → basic.publish(persistent, JSON) → wait broker ACK → close
- *
- * @return 0 on success, negative on failure. Diagnostic to stderr.
- */
 int publish_message(const publish_config_t *cfg,
                     const char *routing_key,
                     const char *body,
                     size_t      body_len);
-
-/* ============================================================
- * Long-lived connection (worker role — CM2 second connection)
- * ============================================================ */
 
 typedef struct publish_conn_s publish_conn_t;
 

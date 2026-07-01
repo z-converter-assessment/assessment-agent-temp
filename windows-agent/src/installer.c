@@ -1,14 +1,3 @@
-/**
- * @file installer.c
- * @brief Self-installer subcommands (install / uninstall / prep-image).
- *
- * Replaces deploy/install.ps1 + deploy/env-setup.ps1 + scripts/image-prep.ps1
- * with Win32 API calls so operators only need assessment-agent.exe — no
- * PowerShell scripts on the target host.
- *
- * Behaviour mirrors the prior ps1 trio one-to-one; see header for surface.
- */
-
 #include "installer.h"
 #include "service.h"
 #include "util.h"
@@ -27,15 +16,6 @@
 #include <sddl.h>
 #include <shlobj.h>
 
-/* ====================================================================
- *  User-level install layout — everything under
- *  %LOCALAPPDATA%\assessment-agent, resolved at runtime. No admin is needed
- *  to read/write these; only registering the boot scheduled task wants a
- *  one-time elevation.
- *
- *  Lazy accessors return pointers to per-path static buffers. The installer
- *  is single-threaded, so the lazy init needs no locking.
- * ==================================================================== */
 static const wchar_t *p_base(void)
 {
     static wchar_t b[MAX_PATH];
@@ -67,11 +47,9 @@ static const wchar_t *p_worker(void)
     return b;
 }
 
-/* Scheduled-task name (replaces the prior Windows service). */
 #define TASK_NAME    L"AssessmentAgent"
 #define SERVICE_DESC L"Resource assessment collector — publishes inventory/metrics/error to RabbitMQ."
 
-/* env-setup.ps1 의 PromptKeys / SecretKeys 와 1:1 매핑. */
 static const char *const PROMPT_KEYS[] = {
     "RABBITMQ_HOST",
     "WORKER_DOWNLOAD_ALLOWED_HOSTS",
@@ -90,9 +68,6 @@ static int str_in_list(const char *needle, const char *const *list)
     return 0;
 }
 
-/* ====================================================================
- *  Win admin / version gates
- * ==================================================================== */
 static int is_elevated(void)
 {
     HANDLE tok = NULL;
@@ -104,7 +79,6 @@ static int is_elevated(void)
     return ok && el.TokenIsElevated;
 }
 
-/* Use RtlGetVersion — GetVersionExW lies without an app manifest entry. */
 static int check_windows_version(void)
 {
     typedef LONG (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOEXW);
@@ -125,10 +99,6 @@ static int check_windows_version(void)
     return 1;
 }
 
-/* ====================================================================
- *  Embedded RT_RCDATA — agent.env.example bytes shipped inside the exe.
- *  Returned buffer is the resource lock (do NOT free).
- * ==================================================================== */
 static const char *load_env_example(size_t *out_len)
 {
     HRSRC h = FindResourceW(NULL, L"AGENT_ENV_EXAMPLE", RT_RCDATA);
@@ -142,9 +112,6 @@ static const char *load_env_example(size_t *out_len)
     return p;
 }
 
-/* ====================================================================
- *  Filesystem helpers
- * ==================================================================== */
 static int ensure_dir(const wchar_t *path)
 {
     int rc = SHCreateDirectoryExW(NULL, path, NULL);
@@ -153,11 +120,6 @@ static int ensure_dir(const wchar_t *path)
     fprintf(stderr, "[install] SHCreateDirectoryEx failed (%d) on %ls\n", rc, path);
     return -1;
 }
-
-/* (Former apply_strict_acl removed: user-level install lives under the user's
- * own %LOCALAPPDATA%, whose default ACL already restricts access to that user
- * plus SYSTEM/Administrators. A SYSTEM+Administrators-only ACL would lock out
- * the agent itself, which now runs as the user rather than LocalSystem.) */
 
 static int copy_self_to(const wchar_t *target)
 {
@@ -168,7 +130,7 @@ static int copy_self_to(const wchar_t *target)
         return -1;
     }
     if (_wcsicmp(self, target) == 0) {
-        /* Already in place (re-running from the install dir) — skip. */
+
         return 0;
     }
     if (!CopyFileW(self, target, FALSE)) {
@@ -179,22 +141,6 @@ static int copy_self_to(const wchar_t *target)
     return 0;
 }
 
-/* ====================================================================
- *  Scheduled-task control (replaces the Windows service)
- *
- *  User-level model: the agent runs as a per-user Task Scheduler job, not as
- *  a LocalSystem service. Registering an ONSTART (boot, whether-logged-on-or-
- *  not) task for the current user needs admin ONCE (it creates an S4U task —
- *  no stored password); the agent itself then runs unprivileged as that user.
- *
- *  We drive schtasks.exe rather than the Task Scheduler COM API: far less code
- *  and no extra dependency. CreateProcessW (not _wsystem) avoids a cmd.exe
- *  quoting layer.
- * ==================================================================== */
-
-/* Run a command line synchronously, no console window. Returns the child exit
- * code, or -1 on spawn failure. The buffer is copied because CreateProcessW
- * may write into its lpCommandLine argument. */
 static int run_process_w(const wchar_t *cmdline)
 {
     wchar_t buf[2048];
@@ -216,8 +162,6 @@ static int run_process_w(const wchar_t *cmdline)
     return (int)code;
 }
 
-/* "DOMAIN\user" of the current process, for schtasks /RU. Falls back to the
- * bare username if USERDOMAIN is unset. */
 static int current_user_w(wchar_t *out, size_t cap)
 {
     wchar_t dom[128] = {0}, usr[128] = {0};
@@ -237,8 +181,7 @@ static int task_exists(void)
 
 static int stop_task_if_running(void)
 {
-    /* Best-effort: /End is harmless if the task is not running, and lets the
-     * exe file be overwritten on upgrade. */
+
     run_process_w(L"schtasks /End /TN " TASK_NAME);
     Sleep(1500);
     return 0;
@@ -252,15 +195,6 @@ static int register_task(void)
         return -1;
     }
 
-    /* Action = "<exe>" run  (foreground agent loop). On the schtasks command
-     * line the /TR value is one quoted token that itself contains quotes
-     * around the exe path, so the inner quotes are backslash-escaped.
-     *
-     * /SC ONSTART       — start at boot, before any interactive logon.
-     * /RU <user> (no /RP)— S4U: runs whether logged on or not, no stored
-     *                      password. Creating this requires admin ONCE.
-     * /RL LIMITED       — runtime stays unprivileged (no elevation).
-     * /F                — overwrite an existing task (upgrade/idempotent). */
     wchar_t cmd[1536];
     int w = _snwprintf(cmd, 1536,
         L"schtasks /Create /TN " TASK_NAME
@@ -285,17 +219,10 @@ static int run_task(void)
     return run_process_w(L"schtasks /Run /TN " TASK_NAME) == 0 ? 0 : -1;
 }
 
-/* ====================================================================
- *  env-setup — embedded example drives the prompt loop.
- *
- *  Key list: parsed from the embedded agent.env.example. Both bare
- *  (KEY=value) and commented-out (# KEY=value) lines feed the canonical
- *  key list; commented secrets are tracked separately via SECRET_KEYS.
- * ==================================================================== */
 typedef struct kv {
     char *key;
     char *value;
-    int   commented;  /* from a "# KEY=value" line in the example */
+    int   commented;
 } kv_t;
 
 typedef struct kv_arr {
@@ -365,10 +292,6 @@ static int is_key_char(int c, int first)
     return c == '_' || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
 }
 
-/* Parse a single "KEY=value" line.
- *   leading_hash != NULL → also accept a single leading `#` (commented-out
- *                          template entry). *leading_hash set to 1 if seen.
- * Returns 0 on success (key/value written to out), -1 if not a kv line. */
 static int parse_kv_line(const char *line, char *key, size_t kcap,
                          char *val, size_t vcap, int *leading_hash)
 {
@@ -402,7 +325,7 @@ static int parse_kv_line(const char *line, char *key, size_t kcap,
     }
     val[vl] = '\0';
     trim_inplace(val);
-    /* Strip matching surrounding quotes. */
+
     size_t vlen = strlen(val);
     if (vlen >= 2 &&
         ((val[0] == '"'  && val[vlen - 1] == '"') ||
@@ -414,8 +337,6 @@ static int parse_kv_line(const char *line, char *key, size_t kcap,
     return 0;
 }
 
-/* Parse a byte buffer or file by splitting on newlines, feeding each line
- * into a callback. Used for both the embedded example and on-disk files. */
 typedef void (*line_cb_t)(const char *line, void *ctx);
 
 static void iterate_lines(const char *buf, size_t len, line_cb_t cb, void *ctx)
@@ -472,8 +393,6 @@ static int read_file_all(const wchar_t *path, char **out, size_t *out_len)
     return 0;
 }
 
-/* Atomic write — UTF-8, no BOM (matches env-setup.ps1 behaviour and the
- * Linux env file format read by load_env_file). */
 static int write_env_file(const wchar_t *path, const kv_arr_t *a, int skip_commented)
 {
     wchar_t tmp[MAX_PATH];
@@ -496,8 +415,6 @@ static int write_env_file(const wchar_t *path, const kv_arr_t *a, int skip_comme
     return 0;
 }
 
-/* Console input with optional echo suppression. Returns the trimmed line.
- * Wide is not needed — values are ASCII / UTF-8 bytes. */
 static int read_console_line(char *buf, size_t cap, int echo)
 {
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
@@ -516,20 +433,18 @@ static int read_console_line(char *buf, size_t cap, int echo)
     }
     if (restored) {
         SetConsoleMode(in, prev);
-        fputc('\n', stdout);  /* echo-off swallowed the user's Enter */
+        fputc('\n', stdout);
     }
     return rc;
 }
 
 static int env_setup_run(const char *example, size_t example_len)
 {
-    kv_arr_t schema = {0};  /* canonical key list from the example */
+    kv_arr_t schema = {0};
     iterate_lines(example, example_len, example_line_cb, &schema);
 
-    /* --- agent.env (non-secret) --- */
     kv_arr_t env_state = {0};
-    /* Seed from example so the file is complete even if every non-prompt key
-     * silently takes the default (preserves Linux env_setup behaviour). */
+
     for (size_t i = 0; i < schema.len; i++) {
         if (schema.items[i].commented) continue;
         if (str_in_list(schema.items[i].key, SECRET_KEYS)) continue;
@@ -551,11 +466,10 @@ static int env_setup_run(const char *example, size_t example_len)
         kv_t *cur = kv_arr_find(&env_state, k);
         if (cur && cur->value && *cur->value &&
             strcmp(cur->value, schema.items[i].value) != 0) {
-            /* already customized — never overwrite */
+
             continue;
         }
-        /* Non-interactive (high-latency / no console): a preset in the
-         * environment wins outright — `set RABBITMQ_HOST=broker & install`. */
+
         const char *envp = getenv(k);
         if (envp && *envp) {
             kv_arr_set(&env_state, k, envp);
@@ -582,7 +496,6 @@ static int env_setup_run(const char *example, size_t example_len)
     }
     fprintf(stdout, "[install] wrote %ls\n", p_env());
 
-    /* --- agent.env.local (secret) --- */
     kv_arr_t local_state = {0};
     {
         char *existing = NULL; size_t elen = 0;
@@ -594,7 +507,7 @@ static int env_setup_run(const char *example, size_t example_len)
     for (const char *const *k = SECRET_KEYS; *k; k++) {
         kv_t *cur = kv_arr_find(&local_state, *k);
         if (cur && cur->value && *cur->value) continue;
-        /* Preset secret in the environment → use it, no prompt. */
+
         const char *envp = getenv(*k);
         if (envp && *envp) {
             kv_arr_set(&local_state, *k, envp);
@@ -611,10 +524,7 @@ static int env_setup_run(const char *example, size_t example_len)
         kv_arr_free(&schema); kv_arr_free(&env_state); kv_arr_free(&local_state);
         return -1;
     }
-    /* No explicit ACL: the file lives under the user's own %LOCALAPPDATA%,
-     * whose default ACL already grants only this user (+ SYSTEM/Admins). The
-     * old SYSTEM+Administrators-only ACL would lock out the agent itself,
-     * which now runs as this user, not LocalSystem. */
+
     fprintf(stdout, "[install] wrote %ls (user-private)\n", p_env_local());
 
     kv_arr_free(&schema);
@@ -623,9 +533,6 @@ static int env_setup_run(const char *example, size_t example_len)
     return 0;
 }
 
-/* ====================================================================
- *  install
- * ==================================================================== */
 int installer_run_install(int image_prep)
 {
     fprintf(stdout, "\n=== Assessment Agent installer (user-level) ===\n");
@@ -647,7 +554,6 @@ int installer_run_install(int image_prep)
         return 1;
     }
 
-    /* Stop a previously-registered task so the exe can be overwritten. */
     if (task_exists())
         stop_task_if_running();
 
@@ -670,7 +576,6 @@ int installer_run_install(int image_prep)
     if (env_setup_run(ex, ex_len) != 0)
         return 1;
 
-    /* Register / refresh the boot scheduled task (needs admin once). */
     fprintf(stdout, "[install] registering scheduled task '%ls'...\n", TASK_NAME);
     if (register_task() != 0)
         return 1;
@@ -696,13 +601,6 @@ int installer_run_install(int image_prep)
     return 0;
 }
 
-/* ====================================================================
- *  uninstall — stop + delete the scheduled task; leave on-disk state alone.
- *
- *  Removing a boot task that was registered to "run whether logged on or not"
- *  needs the same one-time admin as install. We attempt it regardless and let
- *  schtasks report a clear error if not elevated.
- * ==================================================================== */
 int installer_run_uninstall(void)
 {
     if (!task_exists()) {
@@ -720,14 +618,9 @@ int installer_run_uninstall(void)
     return 0;
 }
 
-/* ====================================================================
- *  prep-image — regenerate HKLM MachineGuid (+ optional sysprep).
- * ==================================================================== */
 static int regenerate_machine_guid(void)
 {
-    /* Build a UUID v4 string via compat_rand_bytes (bcrypt → CryptoAPI
-     * fallback, so this works on NT 5.2 / Server 2003 too). 36-char canonical
-     * form, lowercased, to match the format Windows stores under MachineGuid. */
+
     unsigned char r[16];
     if (!compat_rand_bytes(r, sizeof r)) return -1;
     r[6] = (r[6] & 0x0f) | 0x40;
@@ -747,7 +640,7 @@ static int regenerate_machine_guid(void)
         fprintf(stderr, "[prep-image] RegOpenKey failed: %ld\n", rc);
         return -1;
     }
-    /* Old value, for the operator's audit trail. */
+
     wchar_t prev[64] = {0};
     DWORD plen = sizeof prev;
     DWORD type = REG_SZ;
@@ -771,14 +664,9 @@ int installer_run_prep_image(int run_sysprep)
     fprintf(stdout, "\n=== Assessment Agent — image preparation ===\n");
     fprintf(stdout, "Run once on the GOLDEN TEMPLATE before snapshotting.\n\n");
 
-    /* Stop the scheduled task so it isn't running in the sealed image. */
     if (task_exists())
         stop_task_if_running();
 
-    /* MachineGuid regen is best-effort: machine_id is display-only — the
-     * engine keys hosts on composite_id = sha256(machine_id + MACs), which
-     * already diverges per clone via fresh NIC MACs. Regen needs admin (HKLM);
-     * when not elevated we skip with a note instead of failing. */
     if (!is_elevated()) {
         fprintf(stdout, "[prep-image] not elevated — SKIP MachineGuid reset.\n");
         fprintf(stdout, "[prep-image]   Not fatal: composite_id diverges via per-clone MACs.\n");

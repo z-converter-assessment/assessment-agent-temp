@@ -1,32 +1,9 @@
-/**
- * @file worker.c
- * @brief task.install consumer (Windows) — state machine + idempotency + drain.
- *
- * Linux worker.c 의 Windows 포팅. 핵심 흐름 동일, fork 대신 install thread:
- *   IDLE   — basic_get 폴링. message 받으면 install thread 생성 → BUSY
- *   BUSY   — WaitForSingleObject(thread, 0) 으로 종료 폴링. 종료 시 result 파일 읽음 →
- *            publish → ack → /done 마커 이동 → IDLE
- *   DRAIN  — Service Stop 신호 후. 신규 basic_get 정지. 진행 중 thread 마무리 대기.
- *
- * Install thread:
- *   download_package() + exec_install() → result JSON 을 results\<task_id>.json 에 쓰고 종료.
- *   부모 (worker_tick) 가 그 파일 읽어 publish 후 done\ 으로 이동.
- *
- * Idempotency:
- *   done\<task_id>.json 가 있으면 install 시도 없이 "already_done" result 합성 후 ack.
- *
- * v1 단순화 (Linux 대비 생략한 디테일):
- *   - startup /results scan 후 재발행 (TODO: 다음 PR)
- *   - /running marker (mid-install 크래시 감지) — Service Stop 만으로는 부족할 때 필요. TODO.
- *   - drain escalation 의 정밀한 +5s SIGKILL 타이머 — exec.c 내부 Job Object timeout 으로 흡수.
- */
-
 #define WIN32_LEAN_AND_MEAN
 
 #include "worker.h"
 #include "download.h"
 #include "exec.h"
-#include "service.h"   /* stop_requested — download cancel hook */
+#include "service.h"
 #include "util.h"
 #include "cJSON.h"
 
@@ -38,22 +15,18 @@
 #include <time.h>
 
 #include <windows.h>
-#include <process.h>      /* _beginthreadex */
-#include <direct.h>       /* _mkdir */
-#include "nt52_compat.h"  /* strncpy_s — NT5.2 msvcrt 부재 대비(legacy 빌드) */
+#include <process.h>
+#include <direct.h>
+#include "nt52_compat.h"
 
 #ifndef AGENT_VERSION
 #define AGENT_VERSION "1.0.0"
 #endif
 
-/* ============================================================
- * Context
- * ============================================================ */
-
 typedef enum { WSTATE_IDLE = 0, WSTATE_BUSY, WSTATE_DRAIN } worker_state_t;
 
 typedef struct {
-	/* Install thread arguments (heap-allocated, freed by thread on exit). */
+
 	char         *task_id;
 	char         *url;
 	char         *sha256;
@@ -65,16 +38,16 @@ typedef struct {
 	int           active_proc_limit;
 	char         *work_dir;
 	char         *target_file;
-	char         *result_path;     /* 결과 파일 — thread 가 작성 */
-	char         *running_marker_path;  /* /running\<task_id>.json — thread 정상 종료 시 제거 */
-	HANDLE        job;             /* Job Object handle — caller (worker) 가 소유. exec_install 에 전달 */
-	const char   *allowed_hosts_csv;  /* config 참조 — context lifetime */
+	char         *result_path;
+	char         *running_marker_path;
+	HANDLE        job;
+	const char   *allowed_hosts_csv;
 	const char   *tmp_dir;
 	int           disk_reserve_mb;
 	const char   *machine_id;
 	const char   *agent_version;
-	char        **install_args;    /* install.args 복제 — NULL-terminated. exec_install argv_extra 로 전달.
-	                                  thread 가 주소공간 공유 → 각 문자열 strdup 필수 (task JSON free 후 UAF 방지). */
+	char        **install_args;
+
 } install_thread_arg_t;
 
 struct worker_ctx_s {
@@ -84,27 +57,20 @@ struct worker_ctx_s {
 
 	worker_state_t  state;
 
-	/* In-flight install state (state == BUSY 일 때만 유효). */
 	HANDLE          install_thread;
-	HANDLE          install_job;          /* exec_install 에 전달한 Job — drain 시 TerminateJobObject 로 강제 종료 */
+	HANDLE          install_job;
 	char            inflight_task_id[128];
 	uint64_t        inflight_delivery_tag;
 
-	/* Cached dir paths. */
 	char            results_dir[512];
 	char            done_dir[512];
 	char            running_dir[512];
 
-	/* AMQP reconnect backoff with monotonic clock (Linux clock_gettime 대응). */
-	int             reconnect_backoff_sec;       /* current window (s), 1→2→4→...→60 */
-	ULONGLONG       last_reconnect_attempt_ms;   /* monotonic_ms() of last attempt; 0 = never */
+	int             reconnect_backoff_sec;
+	ULONGLONG       last_reconnect_attempt_ms;
 };
 
 #define WORKER_RECONNECT_BACKOFF_MAX 60
-
-/* ============================================================
- * Filesystem helpers
- * ============================================================ */
 
 static int ensure_dir(const char *path)
 {
@@ -113,7 +79,7 @@ static int ensure_dir(const char *path)
 	if (attr != INVALID_FILE_ATTRIBUTES) {
 		return (attr & FILE_ATTRIBUTE_DIRECTORY) ? 0 : -1;
 	}
-	/* Recursive create — strip last segment 까지 재귀. */
+
 	char tmp[1024];
 	size_t n = strlen(path);
 	if (n >= sizeof tmp) return -1;
@@ -151,7 +117,7 @@ static int write_file_atomic(const char *path, const char *content)
 	if (fwrite(content, 1, len, f) != len) { fclose(f); DeleteFileA(tmp); return -1; }
 	if (fflush(f) != 0)                    { fclose(f); DeleteFileA(tmp); return -1; }
 	if (fclose(f) != 0) { DeleteFileA(tmp); return -1; }
-	/* MoveFileExA REPLACE_EXISTING 으로 atomic rename. */
+
 	if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
 		DeleteFileA(tmp);
 		return -1;
@@ -203,9 +169,6 @@ static int rmrf_recursive(const char *path)
 	return rc;
 }
 
-/* ============================================================
- * task_id 검증 (Linux 와 동일 grammar: UUID 또는 32-char hex)
- * ============================================================ */
 static int task_id_valid(const char *id)
 {
 	if (!id) return 0;
@@ -224,10 +187,6 @@ static int task_id_valid(const char *id)
 	return 1;
 }
 
-/* ============================================================
- * Result JSON builder
- * ============================================================ */
-
 static char *iso8601_now(void)
 {
 	static char buf[32];
@@ -238,10 +197,6 @@ static char *iso8601_now(void)
 	return buf;
 }
 
-/* OS 버전 식별자 — Registry CurrentBuildNumber (bare, UBR 미포함). 엔진의 성공 exit code
- * 보정 정책 키 (예: Windows Server 2022 = "20348"). collect.c 의 인벤토리용 os_version_info
- * 는 build.UBR 형식이지만, 정책은 빌드 메이저만 보면 되므로 task.result 에는 bare build 만 발행.
- * 읽기 실패 시 빈 문자열 (엔진은 nullable 로 흡수). */
 static void os_build_number(char *out, size_t out_sz)
 {
 	if (out_sz) out[0] = '\0';
@@ -310,14 +265,6 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	return s;
 }
 
-/* ============================================================
- * Startup cleanup + recovery (Linux D3 / CRITICAL #10 패턴 포팅)
- * ============================================================ */
-
-/*
- * 파일명이 `<task_id>.json` 형식인지 검증하고 task_id 부분 추출.
- * write_file_atomic 의 `*.tmp` 잔여물 / 수기 파일 등은 skip.
- */
 static int replay_filename_to_task_id(const char *fname, char *out, size_t out_sz)
 {
 	size_t n = strlen(fname);
@@ -332,9 +279,6 @@ static int replay_filename_to_task_id(const char *fname, char *out, size_t out_s
 	return task_id_valid(out);
 }
 
-/*
- * /done\<task_id>.json 중 retention 지난 파일 삭제. 디스크 점유 방지.
- */
 static void purge_expired_done(const struct worker_ctx_s *ctx)
 {
 	char pattern[1024];
@@ -366,9 +310,6 @@ static void purge_expired_done(const struct worker_ctx_s *ctx)
 	FindClose(h);
 }
 
-/*
- * %TEMP%\agent-task-* 잔여 workspace 삭제. 부모 crash 후 남은 폴더.
- */
 static void purge_stale_workspaces(const struct worker_ctx_s *ctx)
 {
 	char pattern[1024];
@@ -385,11 +326,6 @@ static void purge_stale_workspaces(const struct worker_ctx_s *ctx)
 	FindClose(h);
 }
 
-/*
- * /running\<task_id>.json marker 헬퍼.
- * spawn_install 직전 작성 + install thread 정상 종료 시 제거.
- * worker_init 의 recover_stale_running 가 잔존 marker 를 mid-install 크래시로 처리.
- */
 static int running_marker_present(const struct worker_ctx_s *ctx, const char *task_id)
 {
 	char path[1024];
@@ -418,11 +354,6 @@ static void clear_running_marker(const struct worker_ctx_s *ctx, const char *tas
 	DeleteFileA(path);
 }
 
-/*
- * Startup /results scan — 부모 crash 후 미발행 result 파일들을 broker 에 재발행.
- * 원본 delivery_tag 는 채널 close 로 무효이지만, redelivered task 가 /done 마커를 통해
- * already_done 으로 처리되도록 publish 후 /done 으로 이동.
- */
 static void replay_pending_results(struct worker_ctx_s *ctx)
 {
 	if (!ctx->conn || ctx->conn_dead) return;
@@ -459,21 +390,12 @@ static void replay_pending_results(struct worker_ctx_s *ctx)
 	FindClose(h);
 }
 
-/*
- * Forward decl — recover_stale_running 가 사용. build_result_json 은 아래쪽에 정의.
- */
 static char *build_result_json(const struct worker_ctx_s *ctx,
                                const char *task_id, const char *status,
                                const char *failure_reason,
                                int has_exit_code, int exit_code, long duration_ms,
                                const char *stdout_tail, const char *stderr_tail);
 
-/*
- * Startup /running scan — marker 존재 = 이전 인스턴스가 mid-install 크래시.
- * /done 또는 /results 에 이미 결과가 있으면 그 결과를 신뢰하고 marker 만 제거.
- * 둘 다 없으면 synth failure 를 /done 에 쓰고 best-effort publish (connection
- * 다운된 케이스에서는 broker redelivery + I1 로 복구).
- */
 static void recover_stale_running(struct worker_ctx_s *ctx)
 {
 	char pattern[1024];
@@ -502,7 +424,7 @@ static void recover_stale_running(struct worker_ctx_s *ctx)
 			if (!body) {
 				safe_to_unlink = 0;
 			} else {
-				/* /done 먼저 쓰고 publish (write 실패 시 /running 유지 — 다음 startup 재시도) */
+
 				if (write_file_atomic(done_path, body) != 0) {
 					fprintf(stderr, "[worker] recover: /done write failed for %s — leaving /running for next startup\n", task_id);
 					safe_to_unlink = 0;
@@ -526,7 +448,6 @@ static void recover_stale_running(struct worker_ctx_s *ctx)
 	FindClose(h);
 }
 
-/* failure_reason mapping from download / exec status. */
 static const char *reason_for_status(download_status_t ds, exec_status_t xs)
 {
 	if (ds == DOWNLOAD_ERR_URL_NOT_ALLOWED)   return "url_not_allowed";
@@ -542,23 +463,12 @@ static const char *reason_for_status(download_status_t ds, exec_status_t xs)
 	return "internal_error";
 }
 
-/* ============================================================
- * Install thread
- *
- * thread 함수 — download → exec → result 파일 작성 → 종료.
- * thread 가 stage 별 결과를 results\<task_id>.json 에 쓰면
- * worker_tick (부모) 가 그 파일 읽어 publish 처리.
- * ============================================================ */
-
-/* libcurl cancellation wrapper — Service Stop 시 download 진행 중인 thread 가 즉시 abort.
- * drain 시 PUBLISH-stuck 4-phase 의 wedge 회피. */
 static int worker_download_cancel_cb(void *user)
 {
 	(void)user;
 	return stop_requested();
 }
 
-/* install_args (NULL-terminated, 각 원소 strdup) 해제. */
 static void free_install_args(char **args)
 {
 	if (!args) return;
@@ -570,7 +480,6 @@ static unsigned __stdcall install_thread_main(void *arg)
 {
 	install_thread_arg_t *a = (install_thread_arg_t *)arg;
 
-	/* Pre-create work dir */
 	rmrf_recursive(a->work_dir);
 	ensure_dir(a->work_dir);
 
@@ -596,7 +505,6 @@ static unsigned __stdcall install_thread_main(void *arg)
 	const char *reason = success ? "" : reason_for_status(ds, xs);
 	int has_exit = (ds == DOWNLOAD_OK && xs != EXEC_ERR_SCRIPT_NOT_FOUND && xs != EXEC_ERR_INTERNAL);
 
-	/* Result JSON 작성 — 부모가 읽음. ctx 가 없으니 stub fields 직접 채움. */
 	cJSON *root = cJSON_CreateObject();
 	if (root) {
 		cJSON_AddStringToObject(root, "message_type",     "task.result");
@@ -647,16 +555,10 @@ static unsigned __stdcall install_thread_main(void *arg)
 		cJSON_Delete(root);
 	}
 
-	/* Workspace 정리 (다운로드 파일 + 추출 흔적 제거 — Windows direct_exec / msi 는
-	 * target_file 만 work_dir 안에 있음). */
 	rmrf_recursive(a->work_dir);
 
-	/* CRITICAL #10: result 파일 작성이 끝났으니 /running marker 제거.
-	 * 이 시점 이후 부모가 crash 해도 startup replay_pending_results 가 /results 파일을
-	 * 처리하고, 이 task 는 /done 으로 이동되어 redelivery 시 I1 가드에 막힘. */
 	if (a->running_marker_path) DeleteFileA(a->running_marker_path);
 
-	/* free thread args */
 	free(a->task_id);    free(a->url);         free(a->sha256);
 	free(a->work_dir);   free(a->target_file); free(a->result_path);
 	free(a->running_marker_path);
@@ -664,10 +566,6 @@ static unsigned __stdcall install_thread_main(void *arg)
 	free(a);
 	return 0;
 }
-
-/* ============================================================
- * worker_init / worker_shutdown
- * ============================================================ */
 
 worker_ctx_t *worker_init(const worker_config_t *cfg)
 {
@@ -692,7 +590,6 @@ worker_ctx_t *worker_init(const worker_config_t *cfg)
 		return NULL;
 	}
 
-	/* AMQP 시도 — 성공/실패 모두 OK (실패 시 다음 tick 재시도, replay 만 deferred). */
 	ctx->conn = publish_conn_open(&ctx->cfg.amqp);
 	ctx->conn_dead = (ctx->conn == NULL);
 	ctx->reconnect_backoff_sec = 0;
@@ -702,15 +599,6 @@ worker_ctx_t *worker_init(const worker_config_t *cfg)
 		fprintf(stderr, "[worker] AMQP initial connect failed - will retry on next tick\n");
 	}
 
-	/* Startup procedures — Linux 패턴 포팅.
-	 *   1. recover_stale_running: 이전 인스턴스 mid-install 크래시 처리 (/running marker 잔존)
-	 *   2. replay_pending_results: 미발행 result 파일 publish + /done 이동 (connect 필요)
-	 *   3. purge_expired_done: retention 지난 /done 마커 삭제 (connect 무관)
-	 *   4. purge_stale_workspaces: 잔존 %TEMP%\agent-task-* 정리
-	 *
-	 * 순서 주의: recover 가 /done 을 쓰므로 replay 보다 먼저. replay 는 /done 이동을
-	 * 위해 recover 가 만든 /done 마커와 충돌 없게 task_id 가 다르다는 가정 (다른
-	 * 시점 task 들이라 OK). purge_expired_done 은 두 작업 다 끝난 뒤. */
 	recover_stale_running(ctx);
 	replay_pending_results(ctx);
 	purge_expired_done(ctx);
@@ -723,8 +611,7 @@ void worker_shutdown(worker_ctx_t *ctx)
 {
 	if (!ctx) return;
 	if (ctx->install_thread) {
-		/* drain 패턴 가정 — thread 가 이미 종료된 상태에서 호출돼야 함.
-		 * 만약 살아있으면 Job kill 후 짧게 wait. */
+
 		if (ctx->install_job) TerminateJobObject(ctx->install_job, 1);
 		WaitForSingleObject(ctx->install_thread, 5000);
 		CloseHandle(ctx->install_thread);
@@ -738,15 +625,10 @@ void worker_shutdown(worker_ctx_t *ctx)
 	free(ctx);
 }
 
-/* ============================================================
- * AMQP reconnect (lazy, called from worker_tick)
- * ============================================================ */
 static int ensure_connection(worker_ctx_t *ctx)
 {
 	if (ctx->conn && !ctx->conn_dead) return 0;
 
-	/* Backoff: 직전 attempt 이후 backoff_sec 가 안 지났으면 skip — broker 다운 시
-	 * 매 tick (1m) 무의미한 connect 시도 회피. Monotonic clock (GetTickCount64). */
 	ULONGLONG now_ms = monotonic_ms();
 	if (ctx->reconnect_backoff_sec > 0 && ctx->last_reconnect_attempt_ms > 0) {
 		ULONGLONG since_ms = now_ms - ctx->last_reconnect_attempt_ms;
@@ -769,10 +651,6 @@ static int ensure_connection(worker_ctx_t *ctx)
 	return 0;
 }
 
-/* ============================================================
- * worker_tick — state machine
- * ============================================================ */
-
 static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 {
 	const cJSON *jid       = cJSON_GetObjectItemCaseSensitive(task, "task_id");
@@ -783,8 +661,6 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	const char *task_id = cJSON_IsString(jid) ? jid->valuestring : NULL;
 	if (!task_id_valid(task_id)) return -1;
 
-	/* machine_id mismatch — portal 라우팅 오류 안전망. 합성 result + 즉시 ack.
-	 * (Linux child_run_task 의 mismatch 가드 포팅) */
 	if (cJSON_IsString(jmachine) && ctx->cfg.machine_id &&
 	    strcmp(jmachine->valuestring, ctx->cfg.machine_id) != 0) {
 		char *res = build_result_json(ctx, task_id, "failure", "internal_error",
@@ -798,10 +674,10 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		}
 		strncpy_s(ctx->inflight_task_id, sizeof ctx->inflight_task_id,
 		          task_id, _TRUNCATE);
-		return 1;  /* result ready, no thread */
+		return 1;
 	}
 
-	const char *install_type_s = "shell";   /* backward-compat default */
+	const char *install_type_s = "shell";
 	int timeout_sec = 600;
 	if (cJSON_IsObject(jinstall)) {
 		const cJSON *jty = cJSON_GetObjectItemCaseSensitive(jinstall, "type");
@@ -810,12 +686,11 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		if (cJSON_IsNumber(jt)) timeout_sec = (int)jt->valuedouble;
 	}
 
-	/* Windows agent 는 direct_exec / msi 만 처리. shell 은 즉시 reject. */
 	exec_install_type_t install_type;
 	if (strcmp(install_type_s, "direct_exec") == 0)      install_type = EXEC_INSTALL_TYPE_DIRECT_EXEC;
 	else if (strcmp(install_type_s, "msi") == 0)         install_type = EXEC_INSTALL_TYPE_MSI;
 	else {
-		/* unsupported — 합성 result publish + ack. */
+
 		char *res = build_result_json(ctx, task_id, "failure",
 		                              "unsupported_install_type",
 		                              0, 0, 0, "",
@@ -826,10 +701,10 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 			write_file_atomic(rp, res);
 			free(res);
 		}
-		/* state 를 BUSY 처럼 두지 않고 즉시 IDLE 유지 — tick 끝에 publish + ack. */
+
 		strncpy_s(ctx->inflight_task_id, sizeof ctx->inflight_task_id,
 		          task_id, _TRUNCATE);
-		return 1;  /* "result file ready, no thread" 신호 */
+		return 1;
 	}
 
 	const char *url = NULL, *sha256 = NULL;
@@ -860,10 +735,6 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	a->machine_id        = ctx->cfg.machine_id;
 	a->agent_version     = ctx->cfg.agent_version;
 
-	/* install.args 파싱 — direct_exec 패키지(NSIS)에 -s/-u 등 인자 전달.
-	 * Linux worker 는 fork 라 valuestring 참조로 충분하지만, Windows 는 install thread 가
-	 * 부모와 주소공간을 공유하므로 각 문자열을 strdup 으로 복제한다(task JSON free 후 UAF 방지).
-	 * NULL-terminated → exec_install 의 argv_extra 로 그대로 전달. msi 타입은 exec.c 에서 무시. */
 	{
 		const cJSON *ja = cJSON_IsObject(jinstall)
 			? cJSON_GetObjectItemCaseSensitive(jinstall, "args") : NULL;
@@ -901,8 +772,6 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		return -1;
 	}
 
-	/* CRITICAL #10: /running marker 작성 실패 시 thread 시작 금지. 없이 시작하면
-	 * redelivery 시 I1 가드가 작동 안 해서 double-execute 가능. */
 	if (write_running_marker(ctx, a->task_id) != 0) {
 		fprintf(stderr, "[worker] write_running_marker failed for %s - aborting spawn\n", a->task_id);
 		free(a->task_id); free(a->url); free(a->sha256);
@@ -913,9 +782,6 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		return -1;
 	}
 
-	/* Job Object 사전 생성 — worker 가 핸들 소유. drain escalation 시
-	 * worker_force_child_term(ctx, 1) 이 TerminateJobObject(ctx->install_job, 1) 로
-	 * 자식 process tree 즉시 강제 종료할 수 있게 됨. 실패 시 spawn abort. */
 	HANDLE job = CreateJobObjectA(NULL, NULL);
 	if (!job) {
 		fprintf(stderr, "[worker] CreateJobObjectA failed for %s - aborting spawn\n", a->task_id);
@@ -934,7 +800,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	if (th == 0) {
 		CloseHandle(job);
 		ctx->install_job = NULL;
-		clear_running_marker(ctx, a->task_id);  /* thread 시작 실패 — marker 회수 */
+		clear_running_marker(ctx, a->task_id);
 		free(a->task_id); free(a->url); free(a->sha256);
 		free(a->work_dir); free(a->target_file); free(a->result_path);
 		free(a->running_marker_path);
@@ -948,11 +814,6 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	return 0;
 }
 
-/*
- * Publish + ack 시도. 성공 시 0 반환 + inflight 비움 + result 파일 → /done 이동.
- * 실패 시 -1 반환 + inflight 유지 (다음 tick 또는 다음 startup replay 가 처리).
- * 영구 실패 (파일 missing + synth 도 실패) 도 inflight 비움 + drop.
- */
 static int publish_result_and_ack(worker_ctx_t *ctx)
 {
 	char rp[1024];
@@ -970,13 +831,12 @@ static int publish_result_and_ack(worker_ctx_t *ctx)
 	}
 
 	if (!body) {
-		/* 결과 파일도 없고 synth OOM — drop (보고 못 함). inflight 비움. */
+
 		ctx->inflight_task_id[0] = '\0';
 		ctx->inflight_delivery_tag = 0;
 		return -1;
 	}
 
-	/* conn dead — 다음 tick / startup replay 에 미룸. inflight 유지. */
 	if (!ctx->conn || ctx->conn_dead) {
 		free(body);
 		return -1;
@@ -991,19 +851,17 @@ static int publish_result_and_ack(worker_ctx_t *ctx)
 	if (pub_rc != 0) {
 		fprintf(stderr, "[worker] result publish failed - connection marked dead, will retry next tick\n");
 		ctx->conn_dead = 1;
-		return -1;  /* inflight 유지 — 다음 tick 재시도 */
+		return -1;
 	}
 
 	if (ctx->inflight_delivery_tag != 0 &&
 	    publish_conn_ack(ctx->conn, ctx->inflight_delivery_tag) != 0) {
 		fprintf(stderr, "[worker] basic.ack failed - connection marked dead\n");
 		ctx->conn_dead = 1;
-		/* publish 는 성공했지만 ack 실패 — 다음 tick 에 ack 만 다시 시도. inflight 유지.
-		 * 단 result 가 broker 에 이미 들어갔으니 redelivery 시 done 마커 + I1 로 가드. */
+
 		return -1;
 	}
 
-	/* 전 성공: result 파일을 /done\ 으로 이동 (atomic, fail-safe — Linux와 동일). */
 	if (!from_synth) {
 		char dp[1024];
 		snprintf(dp, sizeof dp, "%s\\%s.json", ctx->done_dir, ctx->inflight_task_id);
@@ -1019,28 +877,25 @@ int worker_tick(worker_ctx_t *ctx)
 {
 	if (!ctx) return -1;
 
-	/* AMQP 연결 보장. 실패 시 다음 tick 으로. */
 	if (ensure_connection(ctx) != 0) return 0;
 
-	/* BUSY: install thread 종료 폴링 + result publish. publish 실패 시 BUSY 유지하여
-	 * 다음 tick 재시도 (conn 살아나거나 다음 startup replay). */
 	if (ctx->state == WSTATE_BUSY) {
 		if (ctx->install_thread) {
 			DWORD wr = WaitForSingleObject(ctx->install_thread, 0);
 			if (wr == WAIT_OBJECT_0) {
 				CloseHandle(ctx->install_thread);
 				ctx->install_thread = NULL;
-				/* Job 도 정리 — KILL_ON_JOB_CLOSE 로 잔여 process 자동 cleanup. */
+
 				if (ctx->install_job) {
 					CloseHandle(ctx->install_job);
 					ctx->install_job = NULL;
 				}
 				if (publish_result_and_ack(ctx) == 0)
 					ctx->state = WSTATE_IDLE;
-				/* else: inflight 유지 — 다음 tick 에서 thread==NULL 분기로 재진입 */
+
 			}
 		} else {
-			/* thread 없음 (unsupported_install_type / mismatch / publish 재시도 케이스) */
+
 			if (publish_result_and_ack(ctx) == 0)
 				ctx->state = WSTATE_IDLE;
 		}
@@ -1048,19 +903,17 @@ int worker_tick(worker_ctx_t *ctx)
 
 	if (ctx->state != WSTATE_IDLE) return 0;
 
-	/* IDLE: basic_get 시도. */
 	char *body = NULL;
 	size_t body_len = 0;
 	uint64_t tag = 0;
 	int gr = publish_conn_get(ctx->conn, ctx->cfg.queue_name, &body, &body_len, &tag);
-	if (gr == 1) return 0;       /* empty */
+	if (gr == 1) return 0;
 	if (gr < 0) { ctx->conn_dead = 1; return 0; }
 
-	/* 메시지 받음 — parse + spawn. */
 	cJSON *task = cJSON_ParseWithLength(body, body_len);
 	free(body);
 	if (!task) {
-		/* malformed — ack 후 drop (DLQ 회피, 즉시 처리). */
+
 		publish_conn_ack(ctx->conn, tag);
 		return 0;
 	}
@@ -1068,7 +921,6 @@ int worker_tick(worker_ctx_t *ctx)
 	const cJSON *jid = cJSON_GetObjectItemCaseSensitive(task, "task_id");
 	const char *tid = cJSON_IsString(jid) ? jid->valuestring : NULL;
 
-	/* Idempotency: /done/<task_id>.json 발견 → already_done 합성. */
 	if (tid && task_id_valid(tid)) {
 		char dp[1024];
 		snprintf(dp, sizeof dp, "%s\\%s.json", ctx->done_dir, tid);
@@ -1110,8 +962,6 @@ int worker_tick(worker_ctx_t *ctx)
 		return 0;
 	}
 
-	/* sr == 0: thread 시작, sr == 1: 합성 result 즉시 작성됨 (unsupported_install_type).
-	 * 둘 다 state = BUSY 로 둠 — 다음 tick 에 publish + ack. */
 	ctx->state = WSTATE_BUSY;
 	return 0;
 }
@@ -1127,18 +977,14 @@ void worker_begin_drain(worker_ctx_t *ctx)
 	if (!ctx) return;
 	ctx->state = (ctx->install_thread || ctx->inflight_task_id[0])
 		? WSTATE_BUSY : WSTATE_DRAIN;
-	/* state 가 BUSY 면 다음 tick 에서 thread 종료 대기 → publish → DRAIN 으로. */
+
 }
 
 void worker_force_child_term(worker_ctx_t *ctx, int hard)
 {
 	if (!ctx) return;
-	(void)hard;  /* Windows 에 graceful term 개념 없음 — soft/hard 모두 즉시 kill. */
+	(void)hard;
 
-	/* Job Object 단위로 강제 종료 — 자식 process tree (download / install / msiexec)
-	 * 전체가 즉시 종료됨 (KILL_ON_JOB_CLOSE 와 별개로 즉시 효과). 그 결과 install
-	 * thread 의 exec_install 도 WaitForSingleObject 에서 깨어나 EXEC_ERR_SCRIPT_TIMEOUT
-	 * 으로 반환 → result 파일 작성 후 thread 종료 → worker_tick 의 reap path 진입. */
 	if (ctx->install_job) {
 		fprintf(stderr, "[worker] worker_force_child_term: TerminateJobObject (hard kill)\n");
 		TerminateJobObject(ctx->install_job, 1);

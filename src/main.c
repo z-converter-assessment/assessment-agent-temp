@@ -1,28 +1,3 @@
-/**
- * @file main.c
- * @brief Agent entry point — orchestrates inventory + metrics + error publish.
- *
- * Lifecycle:
- *   1. Parse env (.env then shell — shell wins).
- *   2. Resolve machine_id once (cached for the process).
- *   3. Publish `inventory` once. Failure here is fatal in one-shot mode but
- *      not in loop mode (we keep trying with backoff so a slow startup
- *      doesn't kill the agent).
- *   4. Loop: publish `metrics` every AGENT_INTERVAL_SEC seconds, and
- *      republish `inventory` every AGENT_INVENTORY_REFRESH_SEC ±15% jitter
- *      (default 3600s; 0 disables) so the engine can recover inventory
- *      state without an agent restart.
- *
- * Error policy (matches docs/payload-schema.md §3):
- *   - Optional source unavailable → field is null/empty, no error message.
- *   - Critical collect failure (`collect_*_payload` returned NULL) → emit
- *     a single `server.error` and continue.
- *   - Publish failure → exponential backoff retry. Inside the retry loop we
- *     do NOT publish errors (we'd be publishing into a broken broker). On
- *     recovery, emit a single `PUBLISH_RECOVERED` summary message including
- *     `retry_count`, `first_failed_at`, `recovered_at`.
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "collect.h"
@@ -48,29 +23,14 @@
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
-/**
- * @brief Compute the next inventory-refresh deadline with ±15% jitter.
- *
- * Spreads herd-formed publishes (e.g., a fleet booted by the same
- * orchestrator at the same minute) across a ~18-minute window for a
- * 1-hour base.
- */
 static time_t next_inventory_deadline(time_t now, int refresh_sec)
 {
 	return now + (time_t)jitter_seconds(refresh_sec, 0.15);
 }
 
-/**
- * @brief Build a publish_config_t from current environment.
- */
 static publish_config_t make_publish_config(void)
 {
-	/*
-	 * Round 7 CRITICAL: TLS / verify flags MUST use parse_bool, not atoi.
-	 * `atoi("true") == 0` would silently disable TLS even when the operator
-	 * sets RABBITMQ_TLS_ENABLED=true (the value we ship in agent.env.example).
-	 * That would downgrade production deploys to plain TCP — security regression.
-	 */
+
 	publish_config_t cfg = {
 		.host        = getenv_default("RABBITMQ_HOST", "localhost"),
 		.port        = getenv_int_or("RABBITMQ_PORT", 0),
@@ -93,9 +53,6 @@ static publish_config_t make_publish_config(void)
 	return cfg;
 }
 
-/**
- * @brief Serialize @p msg, publish via @p routing_key, free both.
- */
 static int serialize_and_publish(const publish_config_t *cfg,
                                  const char *routing_key,
                                  cJSON *msg)
@@ -111,9 +68,6 @@ static int serialize_and_publish(const publish_config_t *cfg,
 	return rc;
 }
 
-/**
- * @brief Publish a `server.error` message (best-effort, never recurses).
- */
 static void emit_error(const publish_config_t *cfg,
                        const char *machine_id,
                        const char *error_code,
@@ -137,15 +91,6 @@ static void emit_error(const publish_config_t *cfg,
 	}
 }
 
-/**
- * @brief Publish a payload with exponential-backoff retry.
- *
- * On retry, the function records `first_failed_at` once and increments
- * `retry_count`. On final success after >0 retries, emits a
- * `PUBLISH_RECOVERED` error summary so operators can observe the outage.
- *
- * @return 0 on success, -1 if signal-stopped.
- */
 static int publish_with_retry(const publish_config_t *cfg,
                               const char *routing_key,
                               cJSON *msg,
@@ -203,13 +148,6 @@ static int publish_with_retry(const publish_config_t *cfg,
 	}
 }
 
-/**
- * @brief Build a publish_config_t for the worker's CM2 second connection.
- *
- * Identical to make_publish_config() but pulls the worker credentials
- * (RABBITMQ_WORKER_USER / RABBITMQ_WORKER_PASS) instead. All other fields
- * — host, port, vhost, TLS — are shared with the collector connection.
- */
 static publish_config_t make_worker_publish_config(void)
 {
 	publish_config_t cfg = make_publish_config();
@@ -219,14 +157,6 @@ static publish_config_t make_worker_publish_config(void)
 	return cfg;
 }
 
-/**
- * @brief Probe optional shell-out commands and log their availability.
- *
- * The agent has silent fallbacks (or `null`) for missing tools, so a
- * field becoming empty does not necessarily indicate a collect failure.
- * Logging command presence at startup lets operators distinguish
- * "no disks found" from "lsblk missing".
- */
 static void log_optional_cmds(void)
 {
 	const char *cmds[] = { "lsblk", "curl", "dbus-uuidgen", NULL };
@@ -281,30 +211,14 @@ int main(int argc, char **argv)
 
 	signal(SIGINT,  on_signal);
 	signal(SIGTERM, on_signal);
-	/*
-	 * Round 9: ignore SIGPIPE. librabbitmq does not pass MSG_NOSIGNAL to
-	 * its write()/SSL_write() calls, so a broker-side TCP reset mid-publish
-	 * would otherwise raise SIGPIPE → default disposition is process
-	 * termination. With SIG_IGN the write returns EPIPE, the publish path
-	 * sees an error, and the existing reconnect logic recovers. Same risk
-	 * applies to install.sh stdout/stderr pipes (round-3 exec.c reads them
-	 * via select+read, but install.sh writing to a closed pipe — e.g. agent
-	 * was killed mid-task — would also raise SIGPIPE without this guard).
-	 */
+
 	signal(SIGPIPE, SIG_IGN);
 
-	/*
-	 * Round 9: tighten default umask so /var/lib/agent-worker/{done,running,results}
-	 * files are owner-only (0600). systemd's StateDirectoryMode=0700 already
-	 * protects the directory; this hardens the files inside it (which contain
-	 * task_id, machine_id, install.sh stdout/stderr tails).
-	 */
 	umask(077);
 
 	load_env_file(".env");
 	log_optional_cmds();
 
-	/* Jitter seed — once per process, mixing pid so co-booted hosts diverge. */
 	srand((unsigned int)(time(NULL) ^ getpid()));
 
 	int interval = getenv_int_or("AGENT_INTERVAL_SEC", 60);
@@ -316,22 +230,15 @@ int main(int argc, char **argv)
 
 	char *machine_id = resolve_machine_id();
 	if (!machine_id) {
-		/* machine_id is display-only — the canonical host key is composite_id =
-		 * sha256(machine_id + "\n" + sorted MACs), which stays stable from the
-		 * MAC set even when machine_id is empty. Pre-systemd hosts (CentOS/RHEL
-		 * 6) often have no /etc/machine-id and no dbus-uuidgen, and on-prem boxes
-		 * have no IMDS — that is NOT fatal and NOT a server.error (optional source
-		 * absent). Continue with an empty machine_id; the engine keys on
-		 * composite_id. */
+
 		fprintf(stderr, "[agent] machine_id unresolved (no /etc/machine-id, no "
 		                "dbus-uuidgen, no IMDS) — continuing; composite_id is "
 		                "derived from MAC addresses (machine_id is display-only).\n");
 		machine_id = strdup("");
-		if (!machine_id) return 2;   /* OOM only */
+		if (!machine_id) return 2;
 	}
 	fprintf(stderr, "[agent] machine_id=%s\n", machine_id);
 
-	/* --- Initial inventory --- */
 	cJSON *inv = collect_inventory_payload(machine_id, AGENT_VERSION);
 	if (!inv) {
 		emit_error(&cfg, machine_id,
@@ -345,7 +252,6 @@ int main(int argc, char **argv)
 			fprintf(stderr, "[agent] published inventory\n");
 	}
 
-	/* --- One-shot mode: collect & publish metrics once and exit --- */
 	if (interval <= 0) {
 		cJSON *m = collect_metrics_payload(machine_id, AGENT_VERSION);
 		if (!m) {
@@ -361,16 +267,14 @@ int main(int argc, char **argv)
 		return rc == 0 ? 0 : 1;
 	}
 
-	/* --- Worker initialization (optional — gated by RABBITMQ_WORKER_USER) --- */
 	worker_ctx_t *worker = NULL;
 	const char *worker_user = getenv_default("RABBITMQ_WORKER_USER", "");
 	if (*worker_user) {
-		/* RABBITMQ_WORKER_USER blank disables worker entirely. */
+
 		publish_config_t wcfg = make_worker_publish_config();
 
 		const char *queue_prefix = getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks");
-		/* 큐 이름은 composite_id 기반 — payload contract v4. portal 측 routing key
-		 * `task.install.<composite_id>` 와 정확히 일치해야 task 매치. */
+
 		const char *cid = cached_composite_id(machine_id);
 		char queue_name[256];
 		snprintf(queue_name, sizeof queue_name, "%s.%s", queue_prefix, cid);
@@ -398,7 +302,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "[agent] RABBITMQ_WORKER_USER unset — worker disabled\n");
 	}
 
-	/* --- Loop mode --- */
 	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds, worker=%s (Ctrl+C to exit)\n",
 	        interval, inv_refresh, worker ? "on" : "off");
 
@@ -437,18 +340,6 @@ int main(int argc, char **argv)
 
 		if (g_stop) break;
 
-		/*
-		 * CRITICAL #1: chunked sleep keeps the worker AMQP connection
-		 * alive. librabbitmq sends heartbeats inside `wait_frame_noblock`,
-		 * which we trigger via `worker_keepalive`. With heartbeat=60s,
-		 * sleeping in 25s chunks lands well inside the broker's
-		 * 2× heartbeat tolerance window.
-		 *
-		 * HIGH (round 2): re-check g_stop AFTER sleep returns (SIGTERM
-		 * may have woken it) BEFORE calling worker_keepalive — keepalive
-		 * could in principle block on a half-open socket and delay
-		 * shutdown.
-		 */
 		int remaining = interval;
 		const int chunk = 25;
 		while (remaining > 0 && !g_stop) {
@@ -460,36 +351,17 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/*
-	 * --- Drain pattern (S2) with bounded escalation (CRITICAL #9) ---
-	 *
-	 * Phase 1 (grace): wait up to AGENT_DRAIN_GRACE_SEC for the in-flight
-	 *                  install to finish on its own.
-	 * Phase 2 (term):  send SIGTERM to the child's process group; wait
-	 *                  AGENT_DRAIN_TERM_SEC for clean shutdown.
-	 * Phase 3 (kill):  send SIGKILL.
-	 * Phase 4 (publish-stuck): if the install completed but the result
-	 *                  publish keeps failing (broker unreachable) for
-	 *                  AGENT_DRAIN_PUBLISH_SEC, give up. The result file
-	 *                  in /results will be replayed on next startup.
-	 *                  Round 5 H3: prevents drain wedging when the only
-	 *                  thing keeping us busy is a dead broker.
-	 */
 	if (worker) {
 		worker_begin_drain(worker);
 		int grace_sec   = getenv_int_or("AGENT_DRAIN_GRACE_SEC",   600);
 		int term_sec    = getenv_int_or("AGENT_DRAIN_TERM_SEC",    30);
-		/*
-		 * Round 6: default publish-stuck deadline must comfortably exceed
-		 * WORKER_RECONNECT_BACKOFF_MAX (60s) so at least 2-3 reconnect
-		 * attempts can fire during drain. 180s gives ~3 reconnect windows.
-		 */
+
 		int publish_sec = getenv_int_or("AGENT_DRAIN_PUBLISH_SEC", 180);
 		fprintf(stderr, "[agent] draining worker (grace=%ds, term=%ds, publish-stuck=%ds)\n",
 		        grace_sec, term_sec, publish_sec);
 
 		time_t t0 = time(NULL);
-		time_t reap_done_at = 0;            /* when child_pid first hit 0 */
+		time_t reap_done_at = 0;
 		int term_sent = 0;
 		int kill_sent = 0;
 		while (!worker_idle(worker)) {
@@ -504,7 +376,6 @@ int main(int argc, char **argv)
 				kill_sent = 1;
 			}
 
-			/* Round 5 H3: track when the OS child went away. */
 			if (reap_done_at == 0 && !worker_has_live_child(worker))
 				reap_done_at = time(NULL);
 			if (reap_done_at != 0 &&

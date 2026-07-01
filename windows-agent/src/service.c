@@ -1,18 +1,3 @@
-/**
- * @file service.c
- * @brief Windows Service Control Manager dispatcher + console-mode wrapper.
- *
- * SCM lifecycle:
- *   StartServiceCtrlDispatcherW → service_main → RegisterServiceCtrlHandlerExW
- *   → report RUNNING → agent_run() → report STOPPED.
- *
- * Stop semantics:
- *   - SCM SERVICE_CONTROL_STOP / SHUTDOWN → request_stop() → agent loop checks
- *     stop_requested() between iterations and after each sleep slice.
- *   - Console mode: SetConsoleCtrlHandler catches Ctrl+C / window close /
- *     system shutdown and triggers the same stop flag.
- */
-
 #include "service.h"
 
 #include <stdio.h>
@@ -20,7 +5,6 @@
 
 #include <windows.h>
 
-/* Defined in main.c — the actual collection loop. */
 extern int agent_run(void);
 
 static volatile LONG       g_stop          = 0;
@@ -39,13 +23,13 @@ int stop_requested(void)
 
 void service_stop_pending_update(unsigned long wait_hint_ms)
 {
-	if (!g_status_handle) return;  /* console mode — SCM 없음 */
-	/* report_status 는 internal; STOP_PENDING 으로 reaffirm + checkpoint 증분. */
+	if (!g_status_handle) return;
+
 	static DWORD pending_checkpoint = 1;
 	g_status.dwCurrentState  = SERVICE_STOP_PENDING;
 	g_status.dwWin32ExitCode = NO_ERROR;
 	g_status.dwWaitHint      = (DWORD)wait_hint_ms;
-	g_status.dwControlsAccepted = 0;   /* STOP 신호 추가 수신 안 받음 (이미 stop 중) */
+	g_status.dwControlsAccepted = 0;
 	g_status.dwCheckPoint    = pending_checkpoint++;
 	SetServiceStatus(g_status_handle, &g_status);
 }
@@ -125,9 +109,6 @@ int run_as_service(void)
 	return 0;
 }
 
-/* ============================================================
- *  Console mode (debug / install.ps1 smoke test)
- * ============================================================ */
 static BOOL WINAPI console_ctrl_handler(DWORD ctrl)
 {
 	switch (ctrl) {

@@ -1,23 +1,3 @@
-/**
- * @file publish.c
- * @brief librabbitmq-based publisher with publisher confirms and optional TLS.
- *
- * Each call opens a fresh connection, publishes one message, and tears down.
- * Reuse is intentionally avoided to keep the producer code path minimal —
- * loop mode amortizes the cost across the metric interval (default 60s).
- *
- * Topology declaration is the consumer's responsibility. The publisher only
- * verifies the exchange exists (passive declare) and never declares queues
- * or bindings on its own.
- *
- * References:
- *   - AMQP 0-9-1: https://www.rabbitmq.com/amqp-0-9-1-reference.html
- *   - rabbitmq-c: https://github.com/alanxz/rabbitmq-c
- *   - Heartbeats: https://www.rabbitmq.com/heartbeats.html
- *   - TLS:        https://www.rabbitmq.com/ssl.html
- *   - Publisher Confirms: https://www.rabbitmq.com/publishers.html#confirms
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include "publish.h"
@@ -55,15 +35,6 @@ static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
 	return -1;
 }
 
-/**
- * @brief Wait for broker ACK/NACK with a wall-clock deadline.
- *
- * The per-call @c tv passed to amqp_simple_wait_frame_noblock is a select(2)
- * timeout, not a deadline. If the broker delivers an unrelated frame on
- * channel 1 before the ACK, the loop's `continue` would otherwise restart
- * a fresh timeout each iteration. Tracking the deadline ourselves caps
- * total wait at @c RABBITMQ_CONFIRM_TIMEOUT_SEC.
- */
 static int wait_confirm(amqp_connection_state_t conn)
 {
 	int t = getenv_int_or("RABBITMQ_CONFIRM_TIMEOUT_SEC", 5);
@@ -91,7 +62,7 @@ static int wait_confirm(amqp_connection_state_t conn)
 		amqp_maybe_release_buffers(conn);
 		int status = amqp_simple_wait_frame_noblock(conn, &frame, &tv);
 		if (status == AMQP_STATUS_TIMEOUT)
-			continue; /* loop will detect deadline expiry */
+			continue;
 		if (status != AMQP_STATUS_OK) {
 			fprintf(stderr, "[publish] confirm: frame error: %s\n",
 			        amqp_error_string2(status));
@@ -159,10 +130,7 @@ int publish_message(const publish_config_t *cfg,
 
 	const char *vhost = (cfg->vhost && *cfg->vhost) ? cfg->vhost : "/";
 	int heartbeat = cfg->heartbeat_sec > 0 ? cfg->heartbeat_sec : 60;
-	/* amqp_login(state, vhost, channel_max, frame_max, heartbeat, sasl, ...).
-	 * channel_max = 0  -> broker chooses (effectively unlimited).
-	 * frame_max   = 131072 -> librabbitmq + RabbitMQ default.
-	 * heartbeat negotiated per AMQP 0-9-1 1.4.2.7. */
+
 	amqp_rpc_reply_t login = amqp_login(
 		conn, vhost, 0, 131072, heartbeat, AMQP_SASL_METHOD_PLAIN,
 		cfg->user, cfg->password);
@@ -180,7 +148,7 @@ int publish_message(const publish_config_t *cfg,
 	amqp_exchange_declare(conn, 1,
 		amqp_cstring_bytes(cfg->exchange),
 		amqp_cstring_bytes("direct"),
-		1 /* passive */, 1 /* durable */, 0, 0, amqp_empty_table);
+		1 , 1 , 0, 0, amqp_empty_table);
 	if (check_rpc(amqp_get_rpc_reply(conn), "exchange.declare(passive)") != 0)
 		goto out_close_channel;
 
@@ -193,7 +161,7 @@ int publish_message(const publish_config_t *cfg,
 	             | AMQP_BASIC_DELIVERY_MODE_FLAG
 	             | AMQP_BASIC_MESSAGE_ID_FLAG;
 	props.content_type  = amqp_cstring_bytes("application/json");
-	props.delivery_mode = 2; /* persistent */
+	props.delivery_mode = 2;
 	props.message_id    = amqp_cstring_bytes(msg_id);
 
 	amqp_bytes_t body_bytes = { .len = body_len, .bytes = (void *)body };
@@ -201,7 +169,7 @@ int publish_message(const publish_config_t *cfg,
 	int pub = amqp_basic_publish(conn, 1,
 		amqp_cstring_bytes(cfg->exchange),
 		amqp_cstring_bytes(routing_key),
-		0 /* mandatory */, 0 /* immediate */,
+		0 , 0 ,
 		&props, body_bytes);
 	if (pub != AMQP_STATUS_OK) {
 		fprintf(stderr, "[publish] basic.publish: %s\n",
@@ -222,10 +190,6 @@ out_destroy:
 	amqp_destroy_connection(conn);
 	return rc;
 }
-
-/* ============================================================
- * Long-lived connection (worker role)
- * ============================================================ */
 
 struct publish_conn_s {
 	amqp_connection_state_t conn;
@@ -261,17 +225,6 @@ static int open_amqp_connection(const publish_config_t *cfg,
 		amqp_destroy_connection(conn); return -1;
 	}
 
-	/*
-	 * CRITICAL #4: keep this socket out of forked children (install.sh).
-	 * Without FD_CLOEXEC the worker fork inherits a duplicate of the broker
-	 * TLS socket; install.sh could read/write broker frames. Set CLOEXEC
-	 * immediately after the socket is connected so the next fork+exec drops it.
-	 *
-	 * HIGH (round 2): older librabbitmq (e.g. 0.8 on CentOS 7 EPEL) returns
-	 * -1 from amqp_get_sockfd for SSL connections. Log loudly so operators
-	 * notice CLOEXEC protection is unavailable. The worker also calls
-	 * close_inherited_fds() in the child as defense-in-depth.
-	 */
 	int sockfd = amqp_get_sockfd(conn);
 	if (sockfd >= 0) {
 		int fl = fcntl(sockfd, F_GETFD, 0);
@@ -375,20 +328,19 @@ int publish_conn_get(publish_conn_t *c,
 	*out_delivery_tag = 0;
 
 	amqp_rpc_reply_t r = amqp_basic_get(c->conn, 1,
-		amqp_cstring_bytes(queue), 0 /* no_ack=false */);
+		amqp_cstring_bytes(queue), 0 );
 	if (r.reply_type != AMQP_RESPONSE_NORMAL) {
 		check_rpc(r, "basic.get");
 		return -1;
 	}
 	if (r.reply.id == AMQP_BASIC_GET_EMPTY_METHOD)
-		return 1; /* queue empty */
+		return 1;
 	if (r.reply.id != AMQP_BASIC_GET_OK_METHOD)
 		return -1;
 
 	amqp_basic_get_ok_t *get_ok = (amqp_basic_get_ok_t *)r.reply.decoded;
 	uint64_t tag = get_ok->delivery_tag;
 
-	/* Read body frames. */
 	amqp_message_t msg;
 	amqp_rpc_reply_t rr = amqp_read_message(c->conn, 1, &msg, 0);
 	if (rr.reply_type != AMQP_RESPONSE_NORMAL) {
@@ -411,7 +363,7 @@ int publish_conn_get(publish_conn_t *c,
 int publish_conn_ack(publish_conn_t *c, uint64_t delivery_tag)
 {
 	if (!c || !c->conn) return -1;
-	if (amqp_basic_ack(c->conn, 1, delivery_tag, 0 /* multiple */) != AMQP_STATUS_OK)
+	if (amqp_basic_ack(c->conn, 1, delivery_tag, 0 ) != AMQP_STATUS_OK)
 		return -1;
 	return 0;
 }
@@ -419,17 +371,7 @@ int publish_conn_ack(publish_conn_t *c, uint64_t delivery_tag)
 int publish_conn_pump(publish_conn_t *c)
 {
 	if (!c || !c->conn) return -1;
-	/*
-	 * CRITICAL #1 (round 2): give librabbitmq a non-zero timeout so
-	 * `recv_with_timeout` enters its select() path. The library's
-	 * `amqp_try_send_heartbeat` is called from inside that select-wait
-	 * branch — with `tv={0,0}` the function may short-circuit before
-	 * the heartbeat send is triggered. 1ms is small enough to be
-	 * effectively non-blocking yet drives the heartbeat machinery.
-	 *
-	 * Returns -1 on detected transport failure so the caller can mark
-	 * the connection dead and trigger reconnect on the next tick.
-	 */
+
 	struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
 	amqp_frame_t frame;
 	amqp_maybe_release_buffers(c->conn);
@@ -443,6 +385,6 @@ int publish_conn_pump(publish_conn_t *c)
 		        amqp_error_string2(s));
 		return -1;
 	}
-	/* Other errors: log + treat as transient. */
+
 	return 0;
 }
