@@ -56,6 +56,10 @@ docker run --rm \
     bash -lc "
         set -e
         bash scripts/build-prep.sh
+        # cmake 컴파일러 자동감지가 manylinux2010에서 실행 불가한 devtoolset cc
+        # 절대경로(/opt/rh/devtoolset-10/root/usr/bin/cc)를 잡는 문제 회피 —
+        # PATH의 gcc/g++를 명시한다(modern 이미지에도 무해).
+        export CC=gcc CXX=g++
         make vendor-fetch
         make vendor-build
         make USE_VENDORED=1 ${BUILD_TARGET}

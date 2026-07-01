@@ -171,6 +171,13 @@ vendor-build-cjson:
 	$(CMAKE) --build $(CJSON_DIR)/build --target cjson -- -j$(JOBS)
 
 vendor-build-rabbitmq:
+	# legacy32(NT5.2): rabbitmq-c win32/threads가 SRWLock(Vista+)을 써서 NT5.2에
+	# undefined reference가 난다. CRITICAL_SECTION 패치본으로 교체(patches/nt52-threads/).
+	@if [ "$(PROFILE)" = "legacy32" ]; then \
+		cp patches/nt52-threads/rabbitmq-threads.h $(RABBITMQ_C_DIR)/librabbitmq/win32/threads.h; \
+		cp patches/nt52-threads/rabbitmq-threads.c $(RABBITMQ_C_DIR)/librabbitmq/win32/threads.c; \
+		echo "[patch] NT5.2 win32/threads applied (SRWLock -> CRITICAL_SECTION)"; \
+	fi
 	# GCC 14+ promotes -Wincompatible-pointer-types to error (rabbitmq-c v0.15.0
 	# amqp_socket.c ioctlsocket mismatch) — demote until upstream fix.
 	$(CMAKE) -S $(RABBITMQ_C_DIR) -B $(RABBITMQ_C_DIR)/build \
