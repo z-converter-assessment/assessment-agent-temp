@@ -2,6 +2,8 @@ name: release
 
 # v* 태그가 push되면 5종을 빌드해 그 태그의 GitHub Release에 에셋으로 올린다.
 #   git tag v1.2.3 && git push origin v1.2.3
+# required(항상 있어야 함): linux-x86_64, win2016-x64
+# best-effort(빌드 깨져도 릴리즈 진행): linux-x86_64-glibc2.12, win2008r2-x64, win2003-x86
 on:
   push:
     tags:
@@ -17,9 +19,12 @@ permissions:
 jobs:
   # Linux 2종 — glibc ABI 하한을 manylinux 컨테이너 glibc로 고정.
   # checkout은 host(node20)에서, 빌드만 컨테이너 안에서 (scripts/build-linux.sh가 docker run).
+  # legacy(manylinux2010)는 upstream EOL/archived라 pull이 막힐 수 있어 best-effort.
   build-linux:
+    name: Linux (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +35,7 @@ jobs:
           - name: legacy
             image: quay.io/pypa/manylinux2010_x86_64
             target: release-legacy
+            experimental: true
     steps:
       - uses: actions/checkout@v4
       - name: build (${{ matrix.name }})
@@ -42,11 +48,13 @@ jobs:
 
   # Windows 3종 — ubuntu에서 MinGW-w64 크로스컴파일.
   # modern/win7는 x86_64 툴체인을 넘기고, legacy32(i686/NT5.2)는 Makefile 내부 값을 쓴다.
-  # 주의: legacy32는 NT 5.2 startup을 여전히 내는 구형 i686 MinGW가 필요 —
-  #       ubuntu-latest의 최신 i686 툴체인은 XP/2003 로드가 안 될 수 있다(실행 검증은 별도).
+  # legacy32는 NT 5.2 startup을 여전히 내는 구형 i686 MinGW가 필요 — ubuntu-latest의
+  # 최신 i686 툴체인은 빌드가 되어도 XP/2003 로드가 안 될 수 있어 experimental(best-effort).
   build-windows:
+    name: Windows (${{ matrix.profile }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +65,7 @@ jobs:
             cross: "CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar WINDRES=x86_64-w64-mingw32-windres OPENSSL_TARGET=mingw64 OPENSSL_CROSS=--cross-compile-prefix=x86_64-w64-mingw32-"
           - profile: legacy32
             cross: ""
+            experimental: true
     steps:
       - uses: actions/checkout@v4
       - name: install mingw-w64 toolchain
@@ -77,29 +86,42 @@ jobs:
           path: windows-agent/dist/*.exe
           if-no-files-found: error
 
-  # 5종을 모아 통합 SHA256SUMS 생성 후 태그 릴리즈에 게시.
+  # 성공한 산출물을 모아 통합 SHA256SUMS 생성 후 태그 릴리즈에 upsert 게시.
+  # required 2종은 없으면 릴리즈 실패, best-effort 3종은 있으면 붙이고 없으면 skip.
   release:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@v4
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: checksums + publish
+      - name: verify required + checksums
         working-directory: dist
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
+          # required — 없으면 릴리즈 실패 (loud fail)
+          test -f assessment-agent-linux-x86_64 || { echo "MISSING required: linux-x86_64"; exit 1; }
+          test -f assessment-agent-win2016-x64.exe || { echo "MISSING required: win2016-x64"; exit 1; }
+          # best-effort 결측은 경고만
+          for f in assessment-agent-linux-x86_64-glibc2.12 assessment-agent-win2008r2-x64.exe assessment-agent-win2003-x86.exe; do
+            test -f "$f" || echo "[release] best-effort 결측 — skip: $f"
+          done
           sha256sum assessment-agent-* > SHA256SUMS
           ls -la
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            assessment-agent-linux-x86_64 \
-            assessment-agent-linux-x86_64-glibc2.12 \
-            assessment-agent-win2016-x64.exe \
-            assessment-agent-win2008r2-x64.exe \
-            assessment-agent-win2003-x86.exe \
-            SHA256SUMS
+          cat SHA256SUMS
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            dist/assessment-agent-linux-x86_64
+            dist/assessment-agent-linux-x86_64-glibc2.12
+            dist/assessment-agent-win2016-x64.exe
+            dist/assessment-agent-win2008r2-x64.exe
+            dist/assessment-agent-win2003-x86.exe
+            dist/SHA256SUMS
