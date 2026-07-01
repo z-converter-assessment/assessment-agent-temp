@@ -47,7 +47,6 @@ static const wchar_t *p_worker(void)
     return b;
 }
 
-#define TASK_NAME    L"AssessmentAgent"
 #define SERVICE_DESC L"Resource assessment collector — publishes inventory/metrics/error to RabbitMQ."
 
 static const char *const PROMPT_KEYS[] = {
@@ -79,24 +78,18 @@ static int is_elevated(void)
     return ok && el.TokenIsElevated;
 }
 
-static int check_windows_version(void)
+static void print_os_info(void)
 {
     typedef LONG (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOEXW);
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-    if (!nt) return 0;
+    if (!nt) return;
     RtlGetVersion_t fn = (RtlGetVersion_t)(void *)GetProcAddress(nt, "RtlGetVersion");
-    if (!fn) return 0;
+    if (!fn) return;
     RTL_OSVERSIONINFOEXW v = { .dwOSVersionInfoSize = sizeof v };
-    if (fn(&v) != 0) return 0;
-    if (v.dwMajorVersion < 10) {
-        fprintf(stderr, "[install] unsupported Windows %lu.%lu — requires 10 / Server 2016+\n",
-                (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion);
-        return 0;
-    }
+    if (fn(&v) != 0) return;
     fprintf(stderr, "[install] OS         : Windows %lu.%lu build %lu\n",
             (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion,
             (unsigned long)v.dwBuildNumber);
-    return 1;
 }
 
 static const char *load_env_example(size_t *out_len)
@@ -141,82 +134,158 @@ static int copy_self_to(const wchar_t *target)
     return 0;
 }
 
-static int run_process_w(const wchar_t *cmdline)
-{
-    wchar_t buf[2048];
-    if ((size_t)_snwprintf(buf, 2048, L"%ls", cmdline) >= 2048) return -1;
+/* ---- Windows service (SCM) registration --------------------------------
+ * The agent runs as a LocalSystem auto-start service on every supported
+ * generation (NT 5.2 / 2003 through NT 10). No args -> run_as_service()
+ * (StartServiceCtrlDispatcher), so binPath carries no arguments. */
 
-    STARTUPINFOW si = { .cb = sizeof si };
-    PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessW(NULL, buf, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        fprintf(stderr, "[install] CreateProcess failed: %lu\n",
-                (unsigned long)GetLastError());
-        return -1;
+static SC_HANDLE open_scm(DWORD access)
+{
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, access);
+    if (!scm) {
+        DWORD e = GetLastError();
+        if (e == ERROR_ACCESS_DENIED)
+            fprintf(stderr, "[install] access denied — run from an elevated "
+                            "(Administrator) command prompt.\n");
+        else
+            fprintf(stderr, "[install] OpenSCManager failed: %lu\n",
+                    (unsigned long)e);
     }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return (int)code;
+    return scm;
 }
 
-static int current_user_w(wchar_t *out, size_t cap)
+static int service_exists(void)
 {
-    wchar_t dom[128] = {0}, usr[128] = {0};
-    DWORD nd = GetEnvironmentVariableW(L"USERDOMAIN", dom, 128);
-    DWORD nu = GetEnvironmentVariableW(L"USERNAME",   usr, 128);
-    if (nu == 0 || nu >= 128) return -1;
-    int w = (nd > 0 && nd < 128)
-        ? _snwprintf(out, cap, L"%ls\\%ls", dom, usr)
-        : _snwprintf(out, cap, L"%ls", usr);
-    return (w > 0 && (size_t)w < cap) ? 0 : -1;
+    SC_HANDLE scm = open_scm(SC_MANAGER_CONNECT);
+    if (!scm) return 0;
+    SC_HANDLE s = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
+                              SERVICE_QUERY_STATUS);
+    int ex = (s != NULL);
+    if (s) CloseServiceHandle(s);
+    CloseServiceHandle(scm);
+    return ex;
 }
 
-static int task_exists(void)
+static int stop_service_wait(void)
 {
-    return run_process_w(L"schtasks /Query /TN " TASK_NAME) == 0;
-}
-
-static int stop_task_if_running(void)
-{
-
-    run_process_w(L"schtasks /End /TN " TASK_NAME);
-    Sleep(1500);
+    SC_HANDLE scm = open_scm(SC_MANAGER_CONNECT);
+    if (!scm) return -1;
+    SC_HANDLE s = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
+                              SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (s) {
+        SERVICE_STATUS st = {0};
+        if (ControlService(s, SERVICE_CONTROL_STOP, &st)) {
+            for (int i = 0; i < 60; i++) {
+                if (!QueryServiceStatus(s, &st)) break;
+                if (st.dwCurrentState == SERVICE_STOPPED) break;
+                Sleep(500);
+            }
+        }
+        CloseServiceHandle(s);
+    }
+    CloseServiceHandle(scm);
     return 0;
 }
 
-static int register_task(void)
+static void set_failure_actions(SC_HANDLE s)
 {
-    wchar_t user[260];
-    if (current_user_w(user, 260) != 0) {
-        fprintf(stderr, "[install] could not resolve current user for task principal\n");
-        return -1;
+    SC_ACTION acts[3] = {
+        { SC_ACTION_RESTART,  5000 },
+        { SC_ACTION_RESTART, 10000 },
+        { SC_ACTION_RESTART, 30000 },
+    };
+    SERVICE_FAILURE_ACTIONSW fa = {0};
+    fa.dwResetPeriod = 86400;
+    fa.cActions      = 3;
+    fa.lpsaActions   = acts;
+    ChangeServiceConfig2W(s, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
+}
+
+static int register_service(void)
+{
+    wchar_t bin[MAX_PATH + 4];
+    int w = _snwprintf(bin, MAX_PATH + 4, L"\"%ls\"", p_exe());
+    if (w <= 0 || (size_t)w >= MAX_PATH + 4) return -1;
+
+    SC_HANDLE scm = open_scm(SC_MANAGER_CREATE_SERVICE);
+    if (!scm) return -1;
+
+    SC_HANDLE s = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
+                              SERVICE_CHANGE_CONFIG | SERVICE_START |
+                              SERVICE_QUERY_STATUS);
+    if (s) {
+        if (!ChangeServiceConfigW(s, SERVICE_WIN32_OWN_PROCESS,
+                                  SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                                  bin, NULL, NULL, NULL, NULL, NULL,
+                                  L"Assessment Agent")) {
+            fprintf(stderr, "[install] ChangeServiceConfig failed: %lu\n",
+                    (unsigned long)GetLastError());
+            CloseServiceHandle(s);
+            CloseServiceHandle(scm);
+            return -1;
+        }
+    } else {
+        s = CreateServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
+                           L"Assessment Agent",
+                           SERVICE_CHANGE_CONFIG | SERVICE_START |
+                           SERVICE_QUERY_STATUS,
+                           SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
+                           SERVICE_ERROR_NORMAL, bin,
+                           NULL, NULL, NULL, NULL, NULL);
+        if (!s) {
+            fprintf(stderr, "[install] CreateService failed: %lu\n",
+                    (unsigned long)GetLastError());
+            CloseServiceHandle(scm);
+            return -1;
+        }
     }
 
-    wchar_t cmd[1536];
-    int w = _snwprintf(cmd, 1536,
-        L"schtasks /Create /TN " TASK_NAME
-        L" /TR \"\\\"%ls\\\" run\""
-        L" /SC ONSTART /RU \"%ls\" /RL LIMITED /F",
-        p_exe(), user);
-    if (w <= 0 || (size_t)w >= 1536) return -1;
+    SERVICE_DESCRIPTIONW desc = { (LPWSTR)SERVICE_DESC };
+    ChangeServiceConfig2W(s, SERVICE_CONFIG_DESCRIPTION, &desc);
+    set_failure_actions(s);
 
-    int rc = run_process_w(cmd);
-    if (rc != 0) {
-        fprintf(stderr, "[install] schtasks /Create failed (exit %d).\n", rc);
-        fprintf(stderr, "[install]   Registering a boot task that runs whether you are\n");
-        fprintf(stderr, "[install]   logged on or not needs a one-time elevated (Admin)\n");
-        fprintf(stderr, "[install]   shell. The agent then runs as you, unprivileged.\n");
-        return -1;
-    }
+    CloseServiceHandle(s);
+    CloseServiceHandle(scm);
     return 0;
 }
 
-static int run_task(void)
+static int start_service(void)
 {
-    return run_process_w(L"schtasks /Run /TN " TASK_NAME) == 0 ? 0 : -1;
+    SC_HANDLE scm = open_scm(SC_MANAGER_CONNECT);
+    if (!scm) return -1;
+    SC_HANDLE s = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME,
+                              SERVICE_START | SERVICE_QUERY_STATUS);
+    int rc = -1;
+    if (s) {
+        if (StartServiceW(s, 0, NULL) ||
+            GetLastError() == ERROR_SERVICE_ALREADY_RUNNING)
+            rc = 0;
+        else
+            fprintf(stderr, "[install] StartService failed: %lu\n",
+                    (unsigned long)GetLastError());
+        CloseServiceHandle(s);
+    }
+    CloseServiceHandle(scm);
+    return rc;
+}
+
+static int delete_service(void)
+{
+    SC_HANDLE scm = open_scm(SC_MANAGER_CONNECT);
+    if (!scm) return -1;
+    SC_HANDLE s = OpenServiceW(scm, ASSESSMENT_AGENT_SERVICE_NAME, DELETE);
+    int rc = -1;
+    if (s) {
+        if (DeleteService(s) ||
+            GetLastError() == ERROR_SERVICE_MARKED_FOR_DELETE)
+            rc = 0;
+        else
+            fprintf(stderr, "[uninstall] DeleteService failed: %lu\n",
+                    (unsigned long)GetLastError());
+        CloseServiceHandle(s);
+    }
+    CloseServiceHandle(scm);
+    return rc;
 }
 
 typedef struct kv {
@@ -535,15 +604,15 @@ static int env_setup_run(const char *example, size_t example_len)
 
 int installer_run_install(int image_prep)
 {
-    fprintf(stdout, "\n=== Assessment Agent installer (user-level) ===\n");
-    fprintf(stdout, "Installs under %%LOCALAPPDATA%%\\assessment-agent and runs as you.\n");
-    fprintf(stdout, "One-time Administrator rights are needed only to register the\n");
-    fprintf(stdout, "boot scheduled task; the agent itself runs unprivileged.\n\n");
+    fprintf(stdout, "\n=== Assessment Agent installer ===\n");
+    fprintf(stdout, "Installs under %%ProgramData%%\\assessment-agent and registers a\n");
+    fprintf(stdout, "LocalSystem auto-start Windows service. Run from an elevated\n");
+    fprintf(stdout, "(Administrator) command prompt.\n\n");
 
-    if (!check_windows_version()) return 1;
+    print_os_info();
 
     if (!p_base()[0] || !p_exe()[0]) {
-        fprintf(stderr, "[install] could not resolve %%LOCALAPPDATA%% — aborting\n");
+        fprintf(stderr, "[install] could not resolve %%ProgramData%% — aborting\n");
         return 1;
     }
 
@@ -554,8 +623,8 @@ int installer_run_install(int image_prep)
         return 1;
     }
 
-    if (task_exists())
-        stop_task_if_running();
+    if (service_exists())
+        stop_service_wait();
 
     wchar_t sub[MAX_PATH];
     int dirs_ok =
@@ -576,44 +645,41 @@ int installer_run_install(int image_prep)
     if (env_setup_run(ex, ex_len) != 0)
         return 1;
 
-    fprintf(stdout, "[install] registering scheduled task '%ls'...\n", TASK_NAME);
-    if (register_task() != 0)
+    fprintf(stdout, "[install] registering service '%ls'...\n",
+            ASSESSMENT_AGENT_SERVICE_NAME);
+    if (register_service() != 0)
         return 1;
 
     if (image_prep) {
-        fprintf(stdout, "\n[install] --image-prep — task registered, NOT started.\n");
+        fprintf(stdout, "\n[install] --image-prep — service registered (auto-start), NOT started.\n");
         fprintf(stdout, "[install] before sealing the VM image, run:\n");
         fprintf(stdout, "[install]     assessment-agent.exe prep-image\n\n");
         return 0;
     }
 
-    fprintf(stdout, "[install] starting task...\n");
-    if (run_task() != 0) {
-        fprintf(stderr, "[install] schtasks /Run failed — start it manually with\n");
-        fprintf(stderr, "[install]   schtasks /Run /TN %ls\n", TASK_NAME);
+    fprintf(stdout, "[install] starting service...\n");
+    if (start_service() != 0)
         return 1;
-    }
 
-    fprintf(stdout, "\n[install] OK — assessment-agent scheduled task is running.\n");
-    fprintf(stdout, "[install] status:    schtasks /Query /TN %ls /V /FO LIST\n", TASK_NAME);
-    fprintf(stdout, "[install] stop:      schtasks /End /TN %ls\n", TASK_NAME);
+    fprintf(stdout, "\n[install] OK — assessment-agent service is running.\n");
+    fprintf(stdout, "[install] status:    sc query %ls\n", ASSESSMENT_AGENT_SERVICE_NAME);
+    fprintf(stdout, "[install] stop:      sc stop %ls\n", ASSESSMENT_AGENT_SERVICE_NAME);
     fprintf(stdout, "[install] uninstall: assessment-agent.exe uninstall\n");
     return 0;
 }
 
 int installer_run_uninstall(void)
 {
-    if (!task_exists()) {
-        fprintf(stdout, "[uninstall] scheduled task not registered — nothing to do\n");
+    if (!service_exists()) {
+        fprintf(stdout, "[uninstall] service not registered — nothing to do\n");
         return 0;
     }
-    stop_task_if_running();
-    if (run_process_w(L"schtasks /Delete /TN " TASK_NAME L" /F") != 0) {
-        fprintf(stderr, "[uninstall] schtasks /Delete failed — re-run from an\n");
-        fprintf(stderr, "[uninstall]   elevated (Administrator) shell.\n");
+    stop_service_wait();
+    if (delete_service() != 0) {
+        fprintf(stderr, "[uninstall] re-run from an elevated (Administrator) shell.\n");
         return 1;
     }
-    fprintf(stdout, "[uninstall] scheduled task removed. on-disk state preserved at:\n");
+    fprintf(stdout, "[uninstall] service removed. on-disk state preserved at:\n");
     fprintf(stdout, "[uninstall]   %ls\n", p_base());
     return 0;
 }
@@ -664,8 +730,8 @@ int installer_run_prep_image(int run_sysprep)
     fprintf(stdout, "\n=== Assessment Agent — image preparation ===\n");
     fprintf(stdout, "Run once on the GOLDEN TEMPLATE before snapshotting.\n\n");
 
-    if (task_exists())
-        stop_task_if_running();
+    if (service_exists())
+        stop_service_wait();
 
     if (!is_elevated()) {
         fprintf(stdout, "[prep-image] not elevated — SKIP MachineGuid reset.\n");

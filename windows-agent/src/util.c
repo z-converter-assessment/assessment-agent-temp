@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <objbase.h>
 #include <wincrypt.h>
+#include <shlobj.h>
 #include "nt52_compat.h"
 
 int compat_rand_bytes(unsigned char *buf, size_t len)
@@ -232,11 +233,15 @@ char *get_boot_time_iso8601(char *buf, size_t len)
 	return iso8601_utc(boot_sec, buf, len);
 }
 
+/* Machine-wide data root: CSIDL_COMMON_APPDATA resolves to %ProgramData%
+ * on Vista+ and to "All Users\Application Data" on NT 5.x (2003/XP). A
+ * LocalSystem service can always read/write it, so config + worker state
+ * live here regardless of which account the service runs as. */
 int agent_data_path_w(const wchar_t *suffix, wchar_t *out, size_t cap)
 {
 	wchar_t base[MAX_PATH];
-	DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
-	if (n == 0 || n >= MAX_PATH) return -1;
+	if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, 0, base) != S_OK)
+		return -1;
 	int w = (suffix && *suffix)
 		? _snwprintf(out, cap, L"%ls\\assessment-agent\\%ls", base, suffix)
 		: _snwprintf(out, cap, L"%ls\\assessment-agent", base);
@@ -246,8 +251,8 @@ int agent_data_path_w(const wchar_t *suffix, wchar_t *out, size_t cap)
 int agent_data_path_a(const char *suffix, char *out, size_t cap)
 {
 	char base[MAX_PATH];
-	DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-	if (n == 0 || n >= MAX_PATH) return -1;
+	if (SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA, NULL, 0, base) != S_OK)
+		return -1;
 	int w = (suffix && *suffix)
 		? _snprintf(out, cap, "%s\\assessment-agent\\%s", base, suffix)
 		: _snprintf(out, cap, "%s\\assessment-agent", base);

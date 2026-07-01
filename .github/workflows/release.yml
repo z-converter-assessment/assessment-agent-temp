@@ -139,7 +139,9 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          generate_release_notes: true
+          # 고정 body로 upsert마다 덮어쓴다. generate_release_notes(true)는 동일 태그
+          # 재릴리즈 시 기존 body에 changelog 줄을 누적시켜 중복되므로 쓰지 않는다.
+          body: "Full Changelog: https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}"
           fail_on_unmatched_files: false
           files: |
             dist/assessment-agent-linux-x86_64

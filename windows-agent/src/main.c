@@ -362,16 +362,17 @@ static void print_usage(void)
 	fprintf(stderr,
 	    "assessment-agent.exe — Resource assessment collector\n"
 	    "\n"
-	    "User-level install (no 24/7 admin; one-time admin only to register the\n"
-	    "boot-time scheduled task). Files live under %%LOCALAPPDATA%%\\assessment-agent.\n"
+	    "Registers a LocalSystem auto-start Windows service. Run install from an\n"
+	    "elevated (Administrator) prompt. Files live under\n"
+	    "%%ProgramData%%\\assessment-agent.\n"
 	    "\n"
 	    "Subcommands:\n"
-	    "  install [--image-prep]    install + register a per-user scheduled task\n"
+	    "  install [--image-prep]    install + register the Windows service\n"
 	    "                            (start unless --image-prep)\n"
-	    "  uninstall                 stop + remove the scheduled task\n"
+	    "  uninstall                 stop + remove the service\n"
 	    "  prep-image [--sysprep]    regenerate MachineGuid for image cloning\n"
 	    "                            (best-effort; needs admin, never fatal)\n"
-	    "  --console, -c, run        foreground run (used by the scheduled task)\n");
+	    "  --console, -c, run        foreground run (for manual testing)\n");
 }
 
 int main(int argc, char **argv)
