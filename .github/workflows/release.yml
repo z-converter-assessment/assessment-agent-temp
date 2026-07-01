@@ -46,10 +46,8 @@ jobs:
           path: dist/assessment-agent-linux-*
           if-no-files-found: error
 
-  # Windows 3종 — ubuntu에서 MinGW-w64 크로스컴파일.
-  # modern/win7는 x86_64 툴체인을 넘기고, legacy32(i686/NT5.2)는 Makefile 내부 값을 쓴다.
-  # legacy32는 NT 5.2 startup을 여전히 내는 구형 i686 MinGW가 필요 — ubuntu-latest의
-  # 최신 i686 툴체인은 빌드가 되어도 XP/2003 로드가 안 될 수 있어 experimental(best-effort).
+  # Windows modern/win7 (x64 2종) — ubuntu에서 MinGW-w64 x86_64 크로스컴파일.
+  # legacy32(win2003-x86)는 CRT 버전 제약으로 별도 job(build-windows-legacy32)에서 빌드.
   build-windows:
     name: Windows (${{ matrix.profile }})
     runs-on: ubuntu-latest
@@ -63,8 +61,6 @@ jobs:
             cross: "CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar WINDRES=x86_64-w64-mingw32-windres OPENSSL_TARGET=mingw64 OPENSSL_CROSS=--cross-compile-prefix=x86_64-w64-mingw32-"
           - profile: win7
             cross: "CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar WINDRES=x86_64-w64-mingw32-windres OPENSSL_TARGET=mingw64 OPENSSL_CROSS=--cross-compile-prefix=x86_64-w64-mingw32-"
-          - profile: legacy32
-            cross: ""
             experimental: true
     steps:
       - uses: actions/checkout@v4
@@ -72,8 +68,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
-            binutils-mingw-w64-x86-64 binutils-mingw-w64-i686 \
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
             cmake make git perl
       - name: build (${{ matrix.profile }})
         working-directory: windows-agent
@@ -86,10 +81,38 @@ jobs:
           path: windows-agent/dist/*.exe
           if-no-files-found: error
 
+  # legacy32(win2003-x86) — debian:bookworm 컨테이너에서 빌드.
+  # bookworm의 mingw-w64(gcc 12.2, CRT runtime 10.x)가 NT5.2(XP/2003) startup을 유지한다.
+  # CRT 12+(ubuntu 최신)로는 verify는 통과해도 실기 startup이 드롭되므로 반드시 bookworm.
+  # checkout은 runner(node20)에서, 빌드만 컨테이너 안에서(docker run).
+  build-windows-legacy32:
+    name: Windows (legacy32 / win2003-x86)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: build in debian:bookworm (CRT v10)
+        run: |
+          docker run --rm --network host -v "$PWD/windows-agent":/w -w /w debian:bookworm bash -c '
+            set -e
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+              gcc-mingw-w64-i686 binutils-mingw-w64-i686 cmake make git perl ca-certificates
+            echo "[toolchain] $(i686-w64-mingw32-gcc --version | head -1)"
+            make PROFILE=legacy32 JOBS=2 vendor-build
+            make PROFILE=legacy32 release
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-legacy32
+          path: windows-agent/dist/*.exe
+          if-no-files-found: error
+
   # 성공한 산출물을 모아 통합 SHA256SUMS 생성 후 태그 릴리즈에 upsert 게시.
-  # required 2종은 없으면 릴리즈 실패, best-effort 3종은 있으면 붙이고 없으면 skip.
+  # required 2종(linux-x86_64, win2016-x64)은 없으면 릴리즈 실패, 나머지는 있으면 붙이고 없으면 skip.
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-windows-legacy32]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
