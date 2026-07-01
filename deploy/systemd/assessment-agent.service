@@ -1,0 +1,74 @@
+[Unit]
+Description=Assessment Agent — collector + worker (task.install)
+# USER unit (systemctl --user). Installed under
+#   ${XDG_CONFIG_HOME:-~/.config}/systemd/user/assessment-agent.service
+# and run as the invoking unprivileged user — no root, no system service.
+# network-online.target is intentionally omitted: it is not reliably started
+# in the per-user manager, and the agent already retries the broker
+# connection, so network startup ordering is unnecessary.
+
+[Service]
+Type=simple
+
+# No User=/Group= — the per-user systemd manager already runs this as the
+# owning user. The whole point of the user-level model is that the vendor
+# agent never holds root.
+
+# State lives under the user's state dir (%S = $XDG_STATE_HOME, e.g.
+# ~/.local/state). StateDirectory= creates it 0700 and marks it writable.
+StateDirectory=assessment-agent
+StateDirectoryMode=0700
+RuntimeDirectory=assessment-agent
+RuntimeDirectoryMode=0700
+WorkingDirectory=%S/assessment-agent
+
+# Environment — point at the per-user config (%E = $XDG_CONFIG_HOME). Both
+# files are optional (leading '-'); secrets live in agent.env.local.
+EnvironmentFile=-%E/assessment-agent/agent.env
+EnvironmentFile=-%E/assessment-agent/agent.env.local
+
+# Force the worker paths into the user's tree. These come AFTER the
+# EnvironmentFile lines so they override the system-oriented defaults the
+# shipped agent.env.example carries (/var/lib/agent-worker, used only by the
+# SysV system install) — a user-level agent cannot write there.
+Environment=WORKER_STATE_DIR=%S/assessment-agent
+Environment=WORKER_TMP_DIR=%T
+
+ExecStart=%h/.local/bin/assessment-agent
+
+# C5: drain in-flight install on SIGTERM. install.timeout_sec is normally
+# <= 600s, so 15 min covers the maximum drain plus result publish + ack.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15min
+
+# Restart policy — survive transient broker outages and collector errors.
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Hardening — ONLY directives a per-user systemd manager can apply without
+# privilege. Primary containment is already that the process runs unprivileged;
+# install.sh children are sandboxed separately in exec.c (clearenv + setrlimit
+# + setsid).
+#
+# Deliberately NOT set (the user manager cannot enforce them → the unit would
+# fail to start with "Operation not permitted" / boolean parse errors):
+#   CapabilityBoundingSet=, PrivateDevices, ProtectKernelTunables/Modules/Logs,
+#   ProtectControlGroups, ProtectSystem, ProtectHome.
+# No inline '#' comments on directive lines — systemd folds them into the value.
+NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+# Logging — stderr captured by the user journal (journalctl --user).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=assessment-agent
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,237 @@
+#!/bin/sh
+#
+# assessment-agent   Assessment Agent — collector + worker (task.install)
+#
+# chkconfig: 2345 95 05
+# description: Assessment Agent collects /proc inventory + metrics and \
+#              publishes them to RabbitMQ (AMQPS). Also runs the task.install \
+#              worker. SysV-init variant for pre-systemd hosts (CentOS/RHEL 6).
+# processname: assessment-agent
+# pidfile: /var/run/assessment-agent.pid
+# config: /etc/assessment-agent/agent.env
+# config: /etc/assessment-agent/agent.env.local
+#
+### BEGIN INIT INFO
+# Provides:          assessment-agent
+# Required-Start:    $local_fs $network $remote_fs $syslog
+# Required-Stop:     $local_fs $network $remote_fs $syslog
+# Should-Start:      $time
+# Should-Stop:       $time
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Assessment Agent (collector + task.install worker)
+# Description:       Collects host inventory/metrics from /proc and /sys and
+#                    publishes to RabbitMQ over AMQPS; consumes task.install
+#                    messages and runs packaged install.sh as a non-privileged
+#                    user. This is the SysV-init unit for pre-systemd hosts
+#                    (CentOS / RHEL / Oracle Linux 6). systemd hosts use
+#                    deploy/systemd/assessment-agent.service instead.
+### END INIT INFO
+
+# This script mirrors the intent of deploy/systemd/assessment-agent.service:
+#   - runs /usr/local/bin/assessment-agent as the assessment-agent user
+#   - sources /etc/assessment-agent/agent.env and agent.env.local
+#   - graceful stop: SIGTERM, wait up to STOP_TIMEOUT (worker drain), then
+#     SIGKILL — matching the unit's TimeoutStopSec=15min (=900s) drain budget.
+
+PROG="assessment-agent"
+EXEC="/usr/local/bin/assessment-agent"
+RUNAS="assessment-agent"
+PIDFILE="/var/run/${PROG}.pid"
+LOCKFILE="/var/lock/subsys/${PROG}"
+LOGFILE="/var/log/${PROG}.log"
+
+ENV_FILE="/etc/assessment-agent/agent.env"
+ENV_LOCAL="/etc/assessment-agent/agent.env.local"
+
+# Graceful-stop budget. The systemd unit uses TimeoutStopSec=15min; mirror it
+# so an in-flight install.sh has the full worker-drain window before SIGKILL.
+STOP_TIMEOUT=900
+
+# Pull in RHEL-family init helpers when present (daemon, killproc, status,
+# success/failure, action). On Debian-family SysV hosts this file is absent;
+# we degrade to a portable su + start-stop-daemon style fallback below.
+if [ -f /etc/init.d/functions ]; then
+	. /etc/init.d/functions
+	HAVE_FUNCTIONS=1
+else
+	HAVE_FUNCTIONS=0
+fi
+
+# Source the env files so RABBITMQ_* / WORKER_* / AGENT_* reach the daemon.
+# The agent re-reads its own env-file too, but exporting here covers the
+# variables the binary expects from the process environment.
+load_env() {
+	for f in "$ENV_FILE" "$ENV_LOCAL"; do
+		if [ -r "$f" ]; then
+			set -a
+			# shellcheck disable=SC1090
+			. "$f"
+			set +a
+		fi
+	done
+}
+
+# is_running — 0 if a live process matches PIDFILE, else 1.
+is_running() {
+	[ -f "$PIDFILE" ] || return 1
+	pid=$(cat "$PIDFILE" 2>/dev/null)
+	[ -n "$pid" ] || return 1
+	kill -0 "$pid" >/dev/null 2>&1
+}
+
+start() {
+	if is_running; then
+		printf '%s already running (pid %s)\n' "$PROG" "$(cat "$PIDFILE")"
+		return 0
+	fi
+	if [ ! -x "$EXEC" ]; then
+		echo "$PROG: $EXEC not found or not executable" >&2
+		return 5
+	fi
+
+	printf 'Starting %s: ' "$PROG"
+	load_env
+
+	# /var/log is root-owned, so the unprivileged RUNAS shell cannot create the
+	# log file itself — the `>> $LOGFILE` redirection (run AS that user) would
+	# fail with EACCES and abort start. Create it as root and hand ownership to
+	# RUNAS so the append succeeds on every start.
+	touch "$LOGFILE" 2>/dev/null || true
+	chown "$RUNAS" "$LOGFILE" 2>/dev/null || true
+	chmod 0640 "$LOGFILE" 2>/dev/null || true
+
+	# Launch as the non-privileged RUNAS user, detached, stdout/stderr to the
+	# log file (no journald on SysV hosts). `su -s /bin/sh` overrides the
+	# account's nologin shell. NOTE: NO login dash (`-`) — a login shell resets
+	# the environment, which would discard the RABBITMQ_*/WORKER_* vars that
+	# load_env just exported (incl. the broker password from agent.env.local),
+	# leaving the daemon with an empty password → broker login refused.
+	su -s /bin/sh "$RUNAS" -c "exec $EXEC >> $LOGFILE 2>&1 &" >/dev/null 2>&1
+
+	# su backgrounds inside the subshell, so capture the new pid by name.
+	# Give it a moment to fork+exec, then resolve the pid.
+	sleep 1
+	pid=$(pgrep -f "$EXEC" 2>/dev/null | head -n 1)
+	if [ -z "$pid" ]; then
+		# pgrep may be unavailable on a minimal box — fall back to ps.
+		pid=$(ps -eo pid,args 2>/dev/null | awk -v e="$EXEC" '$0 ~ e && $0 !~ /awk/ {print $1; exit}')
+	fi
+
+	if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+		echo "$pid" > "$PIDFILE"
+		touch "$LOCKFILE" 2>/dev/null || true
+		if [ "$HAVE_FUNCTIONS" = "1" ]; then
+			success "$PROG startup"
+			echo
+		else
+			echo "OK"
+		fi
+		return 0
+	fi
+
+	if [ "$HAVE_FUNCTIONS" = "1" ]; then
+		failure "$PROG startup"
+		echo
+	else
+		echo "FAILED"
+	fi
+	return 1
+}
+
+stop() {
+	if ! is_running; then
+		printf '%s is not running\n' "$PROG"
+		rm -f "$PIDFILE" "$LOCKFILE"
+		return 0
+	fi
+
+	pid=$(cat "$PIDFILE" 2>/dev/null)
+	printf 'Stopping %s (graceful, up to %ss for worker drain): ' "$PROG" "$STOP_TIMEOUT"
+
+	# Graceful: SIGTERM, then poll up to STOP_TIMEOUT for the process to
+	# drain its in-flight install + publish the result (mirrors S2 / the
+	# systemd TimeoutStopSec window). Escalate to SIGKILL only on timeout.
+	kill -TERM "$pid" >/dev/null 2>&1
+
+	i=0
+	while [ "$i" -lt "$STOP_TIMEOUT" ]; do
+		kill -0 "$pid" >/dev/null 2>&1 || break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if kill -0 "$pid" >/dev/null 2>&1; then
+		# Drain budget exhausted — force kill.
+		kill -KILL "$pid" >/dev/null 2>&1
+		sleep 1
+	fi
+
+	if kill -0 "$pid" >/dev/null 2>&1; then
+		if [ "$HAVE_FUNCTIONS" = "1" ]; then
+			failure "$PROG shutdown"
+			echo
+		else
+			echo "FAILED"
+		fi
+		return 1
+	fi
+
+	rm -f "$PIDFILE" "$LOCKFILE"
+	if [ "$HAVE_FUNCTIONS" = "1" ]; then
+		success "$PROG shutdown"
+		echo
+	else
+		echo "OK"
+	fi
+	return 0
+}
+
+restart() {
+	stop
+	start
+}
+
+status_cmd() {
+	if [ "$HAVE_FUNCTIONS" = "1" ] && command -v status >/dev/null 2>&1; then
+		status -p "$PIDFILE" "$PROG"
+		return $?
+	fi
+	# Portable fallback (Debian-family or minimal hosts).
+	if is_running; then
+		printf '%s (pid %s) is running\n' "$PROG" "$(cat "$PIDFILE")"
+		return 0
+	fi
+	if [ -f "$PIDFILE" ]; then
+		printf '%s dead but pidfile exists\n' "$PROG"
+		return 1
+	fi
+	printf '%s is stopped\n' "$PROG"
+	return 3
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart|force-reload)
+		restart
+		;;
+	condrestart|try-restart)
+		if is_running; then
+			restart
+		fi
+		;;
+	status)
+		status_cmd
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|condrestart|status}" >&2
+		exit 2
+		;;
+esac
+
+exit $?
