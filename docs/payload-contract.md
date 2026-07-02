@@ -50,7 +50,7 @@ CI가 git 태그에서 주입한다(`v1.0.0` -> `1.0.0`, release.yml). 로컬/de
 | mac_addresses[] | MAC 목록(감사용) |
 | ip_external[] | 외부 IP |
 
-services.pid와 listen_ports.pid로 unit-포트 조인이 가능하다.
+services.pid와 listen_ports.pid로 unit-포트 조인이 가능하다. Linux services는 systemd unit(systemctl) 기반이고, systemd가 없는 SysV 호스트(CentOS/RHEL 6)는 /var/lock/subsys의 실행 중 서비스를 열거해 /var/run/<name>.pid로 pid/exe를 채운다. 표준 pid 파일이 있는 데몬만 pid/exe가 차고, 부팅 1회성 스크립트(iptables/network 등)·pid 파일이 표준 위치에 없는 데몬·systemd의 socket·MainPID 없는 unit은 pid/exe=null이다(추측 pid를 넣지 않는다). Windows는 SCM(EnumServicesStatusEx)에서 pid/exe를 채운다.
 interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 IP(없으면 null). Linux는 IPv4 default route(/proc/net/route), Windows modern/win7은 FirstGatewayAddress. IPv6 항목과 win2003(NT5.2)은 null.
 
 ## metrics 필드

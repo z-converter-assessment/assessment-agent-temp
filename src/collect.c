@@ -1251,6 +1251,72 @@ static cJSON *collect_external_ip(void)
 
 static int read_pid_comm(int pid, char *out, size_t out_len);
 
+/* SysV 서비스의 pid를 pid 파일에서 읽는다. 관례상 /var/run/<name>.pid, 일부는
+ * /var/run/<name>/<name>.pid. 죽은 pid 파일(프로세스 종료 후 잔존)은 /proc/<pid>
+ * 부재로 걸러 -1. 데몬이 아닌 서비스(iptables/network 등)는 pid 파일이 없어 -1. */
+static int read_sysv_pidfile(const char *name)
+{
+	char path[256];
+	snprintf(path, sizeof path, "/var/run/%s.pid", name);
+	char *c = read_file_all(path);
+	if (!c) {
+		snprintf(path, sizeof path, "/var/run/%s/%s.pid", name, name);
+		c = read_file_all(path);
+	}
+	if (!c)
+		return -1;
+	int pid = atoi(c);
+	free(c);
+	if (pid <= 0)
+		return -1;
+	char pp[64];
+	snprintf(pp, sizeof pp, "/proc/%d", pid);
+	struct stat st;
+	if (stat(pp, &st) != 0)
+		return -1;
+	return pid;
+}
+
+/* systemd 없는 SysV 호스트(EL6 등): systemctl 부재로 collect_services()가 진입하지
+ * 못하므로 여기로 폴백한다. RHEL init.d 스크립트가 start 시 touch 하는
+ * /var/lock/subsys/<name> 로 실행 중 서비스를 열거하고, /var/run/<name>.pid 로 pid,
+ * /proc/<pid>/comm 으로 exe 를 best-effort로 채운다. systemd 경로와 같은
+ * {unit, sub, pid, exe} 스키마를 유지한다(pid 파일 없는 서비스는 pid/exe=null,
+ * systemd의 MainPID 없는 unit과 동일). */
+static cJSON *collect_services_sysv(void)
+{
+	DIR *d = opendir("/var/lock/subsys");
+	if (!d)
+		return cJSON_CreateNull();
+
+	cJSON *arr = cJSON_CreateArray();
+	if (!arr) { closedir(d); return NULL; }
+
+	struct dirent *de;
+	while ((de = readdir(d))) {
+		if (de->d_name[0] == '.')
+			continue;
+		cJSON *item = cJSON_CreateObject();
+		cJSON_AddStringToObject(item, "unit", de->d_name);
+		cJSON_AddStringToObject(item, "sub",  "running");
+		int pid = read_sysv_pidfile(de->d_name);
+		if (pid > 0) {
+			cJSON_AddNumberToObject(item, "pid", (double)pid);
+			char comm[64];
+			if (read_pid_comm(pid, comm, sizeof comm))
+				cJSON_AddStringToObject(item, "exe", comm);
+			else
+				cJSON_AddNullToObject(item, "exe");
+		} else {
+			cJSON_AddNullToObject(item, "pid");
+			cJSON_AddNullToObject(item, "exe");
+		}
+		cJSON_AddItemToArray(arr, item);
+	}
+	closedir(d);
+	return arr;
+}
+
 /* services[]에 pid(MainPID)/exe(comm)를 붙여 listen_ports[].pid와 조인 가능하게 한다.
  * per-unit `systemctl show` 반복은 fork 비용이 커서, 실행 중 unit 전체를 한 번의
  * `systemctl show -p Id,MainPID <units...>`로 배치 조회해 unit명으로 매칭한다. */
@@ -1261,7 +1327,7 @@ static cJSON *collect_services(void)
 		"--state=running --state=listening "
 		"--no-pager --plain --no-legend 2>/dev/null");
 	if (!out)
-		return cJSON_CreateNull();
+		return collect_services_sysv();   /* systemd 부재(EL6 등) -> SysV 폴백 */
 
 	cJSON *arr = cJSON_CreateArray();
 	if (!arr) { free(out); return NULL; }
@@ -1287,9 +1353,14 @@ static cJSON *collect_services(void)
 		cJSON_AddStringToObject(item, "sub",  sub);
 		cJSON_AddItemToArray(arr, item);
 
-		/* unit명은 systemctl 규칙상 공백/쉘 메타문자가 없어 bare로 이어붙인다. */
+		/* pid/exe 배치 조회(systemctl show)는 .service unit에만 한다. socket unit은
+		 * MainPID property가 없어(프로세스가 아니라 커널 소켓) show 가 exit!=0 을 내고,
+		 * run_cmd 는 exit!=0 이면 유효한 stdout까지 폐기하므로 같은 배치에 섞인 service
+		 * pid 까지 전부 유실된다. socket 은 pid=null 이 정확한 값이라 애초에 제외한다.
+		 * unit명은 systemctl 규칙상 공백/쉘 메타문자가 없어 bare로 이어붙인다. */
 		size_t ul = strlen(unit);
-		if (units_len + ul + 2 < sizeof units_buf) {
+		int is_service = (ul > 8 && strcmp(unit + ul - 8, ".service") == 0);
+		if (is_service && units_len + ul + 2 < sizeof units_buf) {
 			if (units_len) units_buf[units_len++] = ' ';
 			memcpy(units_buf + units_len, unit, ul);
 			units_len += ul;
