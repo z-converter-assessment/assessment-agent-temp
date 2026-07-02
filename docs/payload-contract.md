@@ -22,7 +22,7 @@ agent_version, boot_time, collected_at, agent_started_at, os_family.
 ## 식별과 라우팅
 
 - agent_id: 첫 실행 시 생성해 영구 저장하는 UUID(Linux state dir, Windows `%ProgramData%\assessment-agent\agent-id`). MAC/machine_id 재발급과 무관하게 불변. 엔진 식별키이자 worker 큐 키.
-- composite_id, machine_id, mac_addresses: 감사·표시용. 식별·라우팅에는 쓰지 않는다.
+- composite_id, machine_id, mac_addresses: 감사·표시용. 식별·라우팅에는 쓰지 않는다. machine_id는 안정적 소스(/etc/machine-id, dbus, 클라우드 IMDS, Windows MachineGuid)가 없으면 억지로 채우지 않고 null이다(예: non-systemd+비클라우드 리눅스). composite_id는 machine_id가 없어도 mac 기반으로 유니크가 유지된다.
 - prep-image(양 OS) + Linux image-prep.sh가 agent-id를 삭제해 골든 이미지 클론마다 새 UUID를 받게 한다.
 
 ## agent_version
@@ -51,7 +51,7 @@ CI가 git 태그에서 주입한다(`v1.0.0` -> `1.0.0`, release.yml). 로컬/de
 | ip_external[] | 외부 IP |
 
 services.pid와 listen_ports.pid로 unit-포트 조인이 가능하다. Linux services는 systemd unit(systemctl) 기반이고, systemd가 없는 SysV 호스트(CentOS/RHEL 6)는 /var/lock/subsys의 실행 중 서비스를 열거해 /var/run/<name>.pid로 pid/exe를 채운다. 표준 pid 파일이 있는 데몬만 pid/exe가 차고, 부팅 1회성 스크립트(iptables/network 등)·pid 파일이 표준 위치에 없는 데몬·systemd의 socket·MainPID 없는 unit은 pid/exe=null이다(추측 pid를 넣지 않는다). Windows는 SCM(EnumServicesStatusEx)에서 pid/exe를 채운다.
-interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 IP(없으면 null). Linux는 IPv4 default route(/proc/net/route), Windows modern/win7은 FirstGatewayAddress. IPv6 항목과 win2003(NT5.2)은 null.
+interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 IP(없으면 null). Linux는 IPv4 default route(/proc/net/route), Windows modern/win7은 FirstGatewayAddress, win2003(NT5.2)은 GetIpForwardTable(IPv4 default route)로 얻는다. IPv6 항목은 null.
 
 ## metrics 필드
 
@@ -85,19 +85,42 @@ task_id로 매칭하므로 식별 큐와 무관하다.
 
 한 device를 여러 메시지가 다르게 태그하지 않는다. lo/loop/ram/sr 등만 pre-drop한다.
 
+## 값 의미론 (0 / null)
+
+모든 수치 필드는 아래 규칙으로 표현한다. 에이전트는 정석대로 표기하고, 엔진은 이 의미론으로 해석한다.
+
+- 값(0 포함) = 측정에 성공했고 그 값이다. 실측 0은 유효한 0이다(예: idle이라 cpu_run_queue=0, 스왑 미사용이라 swap_total=0).
+- null = 측정할 수 없다. 그 OS에 개념 자체가 없거나(미지원), 측정 인프라/권한이 없어 값을 모른다.
+- 추측/대체값은 넣지 않는다. 확실히 모르면 null (틀린 값이 조인·판정을 오염시키는 것보다 낫다).
+- 배열 지표는 측정된 축만 싣는다. 못 잰 축은 제외한다(빈 배열 = 미측정).
+
+즉 "0인데 왜 0인지"를 엔진이 되묻지 않아도 되게, 실측 0과 측정 불가를 표기 단계에서 가른다. 미지원 지표를 0으로 채우면 실측 0과 구분되지 않으므로 금지한다.
+
+적용:
+- Linux는 표준 지표를 전부 /proc·/sys로 실측하므로 값이고, 측정 불가한 것(os_codename, ip_external, pid 파일 없는 SysV 서비스의 pid/exe)만 null이다.
+- Windows cpu_stat: user/system/idle는 실측, nice/iowait/irq/softirq/steal은 Windows에 개념이 없어 null(GetSystemTimes 미제공).
+- Windows mem_free_kb: perflib "Free & Zero Page List Bytes"로 진짜 free를 실측(available과 별개). 이 카운터가 없는 NT5.2는 null.
+- Windows mem_buffers_kb/mem_cached_kb, load_1m/5m/15m: Windows 미지원 -> null.
+- saturation.disk_queue: IOCTL_DISK_PERFORMANCE로 실측하고, diskperf 미부착(측정 불가, OpenStack virtio 등)이면 빈 배열이다. cpu_run_queue/mem_paging_rate는 perflib 카운터를 못 읽으면 null이다.
+
 ## OS별 차이
 
 - Windows kind는 coarse(IfType/드라이브 종류 기반). Linux는 세분.
-- Windows os_version은 DisplayVersion(없으면 ReleaseId, 예: Server 2016 -> "1607"). 둘 다 없는 구버전(2012R2/2003 등)은 빈 문자열.
+- Windows os_version은 DisplayVersion(없으면 ReleaseId, 예: Server 2016 -> "1607"). 둘 다 없는 구버전은 RtlGetVersion의 NT major.minor로 채운다(2012R2 -> "6.3", 2003 -> "5.2").
 - Windows disk_io는 NtQuerySystemInformation(SystemPerformanceInformation)의 시스템 전역 누적 I/O로
   단일 엔트리(device=PhysicalDrive0)를 싣는다. I/O 매니저 카운터라 단조증가·provider 독립(NT5.2~NT10).
   perflib PhysicalDisk 디스크 카운터는 diskperf 성능 통계에 의존해 환경별로 죽거나(예: 2012R2+virtio raw=0)
   부팅 후 리셋(비단조)이라 1차 소스로 부적합 -> NtQuery 불가 시에만 perflib per-disk(PhysicalDriveN)로 폴백.
   전역 집계 특성상 파일 I/O(네트워크 리다이렉터 등)를 포함하며 물리 디스크별 분해는 하지 않는다.
-- Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}` — 모두 perflib(HKEY_PERFORMANCE_DATA) raw.
-  disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN, PhysicalDisk\Current Disk Queue Length). 빈 배열=미측정.
-  cpu_run_queue(System\Processor Queue Length)·mem_paging_rate(Memory\Pages/sec 누적)는 raw 값으로 채운다(실기 검증 완료).
-  단, disk_queue는 diskperf 미수집 환경(2012R2+virtio 등)에서 0으로 고정될 수 있다(카운터 provider 한계).
+- Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}`.
+  disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN)로 IOCTL_DISK_PERFORMANCE의
+  QueueDepth를 실측한다. diskperf 미부착(OpenStack virtio 등)이면 IOCTL이 ERROR_INVALID_FUNCTION이라 측정
+  불가 -> 해당 디스크를 배열에서 제외한다(빈 배열=미측정). perflib "Current Disk Queue Length"는 diskperf
+  미부착 시에도 raw 0을 내 측정 불가와 실측 0을 구분하지 못해 쓰지 않는다.
+  cpu_run_queue(System\Processor Queue Length)·mem_paging_rate(Memory\Pages/sec 누적)는 perflib raw이며
+  카운터를 못 읽으면 null이다.
+- Windows cpu_stat은 user/system/idle만 실측하고 nice/iowait/irq/softirq/steal은 미지원이라 null이다.
+  mem_free_kb는 perflib로 진짜 free를 실측(available과 별개, NT5.2는 null), mem_buffers/cached·load_1m/5m/15m은 미지원 null이다. (값 의미론 참고)
 - listen_ports.uid는 Windows에서 null(POSIX uid 없음).
 
 ## 빌드/릴리즈

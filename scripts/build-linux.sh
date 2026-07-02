@@ -62,6 +62,9 @@ docker run --rm \
         # 절대경로(/opt/rh/devtoolset-10/root/usr/bin/cc)를 잡는 문제 회피 —
         # PATH의 gcc/g++를 명시한다(modern 이미지에도 무해).
         export CC=gcc CXX=g++
+        # src/*.o 세대 오염 방지 — modern/legacy가 같은 트리를 공유하므로, 이전 세대의
+        # 오브젝트(다른 glibc 심볼)를 재사용하지 않도록 매 빌드 재컴파일한다.
+        make clean
         make vendor-fetch
         make vendor-build
         make USE_VENDORED=1 AGENT_VERSION='${AGENT_VERSION}' ${BUILD_TARGET}

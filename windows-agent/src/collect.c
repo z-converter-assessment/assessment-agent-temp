@@ -73,7 +73,12 @@ static void add_common_metadata(cJSON *root, const char *msg_type,
 	cache_process_times();
 
 	cJSON_AddStringToObject(root, "message_type", msg_type);
-	cJSON_AddStringToObject(root, "machine_id",   machine_id ? machine_id : "");
+	/* machine_id는 원시 머신 식별자다. 구할 수 없으면 억지로 채우지 않고 null(측정 불가).
+	 * 식별·라우팅은 agent_id로 하고, composite_id는 mac 기반으로 유니크가 유지된다. */
+	if (machine_id && *machine_id)
+		cJSON_AddStringToObject(root, "machine_id", machine_id);
+	else
+		cJSON_AddNullToObject(root, "machine_id");
 	cJSON_AddStringToObject(root, "composite_id", cached_composite_id(machine_id));
 	cJSON_AddStringToObject(root, "agent_id",     cached_agent_id());
 	cJSON_AddStringToObject(root, "os_family",    "windows");
@@ -176,6 +181,22 @@ static void os_version_info(char *display_out, size_t dsz, char *build_out, size
 			snprintf(build_out, bsz, "%s", cur_build);
 	}
 	RegCloseKey(hKey);
+
+	/* DisplayVersion/ReleaseId는 Windows 10/Server 2016+ 전용 레지스트리다. 없는 구버전
+	 * (2012R2=6.3, 2003=5.2 등)은 RtlGetVersion(ntdll)의 NT major.minor로 채운다 —
+	 * manifest 영향으로 부정확한 GetVersionEx와 달리 실제 버전을 준다. */
+	if (display_out[0] == '\0') {
+		HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+		typedef LONG (WINAPI *RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+		RtlGetVersionFn rgv = nt ? (RtlGetVersionFn)(void *)GetProcAddress(nt, "RtlGetVersion") : NULL;
+		if (rgv) {
+			RTL_OSVERSIONINFOW vi;
+			vi.dwOSVersionInfoSize = sizeof vi;
+			if (rgv(&vi) == 0)
+				snprintf(display_out, dsz, "%lu.%lu",
+				         (unsigned long)vi.dwMajorVersion, (unsigned long)vi.dwMinorVersion);
+		}
+	}
 }
 
 static void cpu_model_string(char *out, size_t len)
@@ -195,6 +216,10 @@ static void cpu_model_string(char *out, size_t len)
 	while (*p == ' ') p++;
 	snprintf(out, len, "%s", p);
 }
+
+/* 진짜 free(완전 미사용 물리메모리) kb를 perflib에서 실측. 정의는 perf 헬퍼 뒤.
+ * 실패/미지원(NT5.2 등)이면 -1 -> 호출측이 null 발행. */
+static long long query_free_kb(void);
 
 static void fill_memory_inventory(cJSON *out)
 {
@@ -240,9 +265,14 @@ static void fill_memory_metrics(cJSON *out)
 	if (swap_avail > swap_total) swap_avail = swap_total;
 
 	cJSON_AddNumberToObject(out, "mem_total_kb",     (double)mem_total);
-	cJSON_AddNumberToObject(out, "mem_free_kb",      (double)mem_avail);
+	/* 정석: mem_free=진짜 free(실측), mem_available=회수 가능분. Windows에서 둘은
+	 * 다른 값이다. free는 perflib로 실측하고(못 얻으면 null), available은 AvailPhys. */
+	long long free_kb = query_free_kb();
+	if (free_kb >= 0) cJSON_AddNumberToObject(out, "mem_free_kb", (double)free_kb);
+	else              cJSON_AddNullToObject  (out, "mem_free_kb");
 	cJSON_AddNumberToObject(out, "mem_available_kb", (double)mem_avail);
 
+	/* buffers/cached: Linux page cache 세분 개념. Windows에 등가 없음 -> null(측정 불가). */
 	cJSON_AddNullToObject(out, "mem_buffers_kb");
 	cJSON_AddNullToObject(out, "mem_cached_kb");
 	cJSON_AddNumberToObject(out, "swap_total_kb",    (double)swap_total);
@@ -253,16 +283,19 @@ static void fill_cpu_stat(cJSON *m)
 {
 	cJSON *cs = cJSON_AddObjectToObject(m, "cpu_stat");
 
+	/* 정석 의미론: 값=실측, null=측정 불가. Windows GetSystemTimes는 idle/kernel/user만
+	 * 준다. nice/iowait/irq/softirq/steal은 Windows에 개념 자체가 없어(측정 불가) null로
+	 * 둔다 — 0으로 채우면 "실측 0(예: iowait 없음)"과 구분되지 않는다. */
 	FILETIME idleTime, kernelTime, userTime;
 	if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
-		cJSON_AddNumberToObject(cs, "user",    0);
-		cJSON_AddNumberToObject(cs, "nice",    0);
-		cJSON_AddNumberToObject(cs, "system",  0);
-		cJSON_AddNumberToObject(cs, "idle",    0);
-		cJSON_AddNumberToObject(cs, "iowait",  0);
-		cJSON_AddNumberToObject(cs, "irq",     0);
-		cJSON_AddNumberToObject(cs, "softirq", 0);
-		cJSON_AddNumberToObject(cs, "steal",   0);
+		cJSON_AddNullToObject(cs, "user");
+		cJSON_AddNullToObject(cs, "nice");
+		cJSON_AddNullToObject(cs, "system");
+		cJSON_AddNullToObject(cs, "idle");
+		cJSON_AddNullToObject(cs, "iowait");
+		cJSON_AddNullToObject(cs, "irq");
+		cJSON_AddNullToObject(cs, "softirq");
+		cJSON_AddNullToObject(cs, "steal");
 		return;
 	}
 	ULARGE_INTEGER idle, kern, usr;
@@ -273,13 +306,13 @@ static void fill_cpu_stat(cJSON *m)
 	ULONGLONG sys_only = (kern.QuadPart > idle.QuadPart) ? (kern.QuadPart - idle.QuadPart) : 0;
 
 	cJSON_AddNumberToObject(cs, "user",    (double)(usr.QuadPart  / 100000ULL));
-	cJSON_AddNumberToObject(cs, "nice",    0);
+	cJSON_AddNullToObject  (cs, "nice");
 	cJSON_AddNumberToObject(cs, "system",  (double)(sys_only       / 100000ULL));
 	cJSON_AddNumberToObject(cs, "idle",    (double)(idle.QuadPart  / 100000ULL));
-	cJSON_AddNumberToObject(cs, "iowait",  0);
-	cJSON_AddNumberToObject(cs, "irq",     0);
-	cJSON_AddNumberToObject(cs, "softirq", 0);
-	cJSON_AddNumberToObject(cs, "steal",   0);
+	cJSON_AddNullToObject  (cs, "iowait");
+	cJSON_AddNullToObject  (cs, "irq");
+	cJSON_AddNullToObject  (cs, "softirq");
+	cJSON_AddNullToObject  (cs, "steal");
 }
 
 static cJSON *enumerate_physical_disks(void)
@@ -307,6 +340,36 @@ static cJSON *enumerate_physical_disks(void)
 			cJSON_AddNumberToObject(o, "size_bytes", (double)gli.Length.QuadPart);
 			cJSON_AddStringToObject(o, "type", "disk");
 			cJSON_AddStringToObject(o, "kind", "physical");
+			cJSON_AddItemToArray(arr, o);
+		}
+		CloseHandle(h);
+	}
+	return arr;
+}
+
+/* disk_queue: 물리 디스크별 순간 큐 깊이를 IOCTL_DISK_PERFORMANCE.QueueDepth로 실측한다.
+ * diskperf(디스크 성능 카운터)가 미부착이면(OpenStack virtio 등) IOCTL이
+ * ERROR_INVALID_FUNCTION을 반환하므로 그 디스크는 측정 불가로 보고 배열에서 제외한다.
+ * 빈 배열=미측정. 실측 idle은 queue=0. perflib "Current Disk Queue Length"는 diskperf
+ * 미부착 시에도 raw 0을 반환해 측정 불가와 실측 0을 구분하지 못하므로 IOCTL을 쓴다. */
+static cJSON *query_disk_queue(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	for (int i = 0; i < 32; i++) {
+		wchar_t path[64];
+		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
+		HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+		                       NULL, OPEN_EXISTING, 0, NULL);
+		if (h == INVALID_HANDLE_VALUE)
+			break;
+		DISK_PERFORMANCE dp;
+		DWORD ret = 0;
+		if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, NULL, 0, &dp, sizeof dp, &ret, NULL)) {
+			cJSON *o = cJSON_CreateObject();
+			char dev[32];
+			snprintf(dev, sizeof dev, "PhysicalDrive%d", i);
+			cJSON_AddStringToObject(o, "device", dev);
+			cJSON_AddNumberToObject(o, "queue", (double)dp.QueueDepth);
 			cJSON_AddItemToArray(arr, o);
 		}
 		CloseHandle(h);
@@ -472,6 +535,30 @@ static int perf_disk_num(const wchar_t *name)
 	return (int)wcstol(name, NULL, 10);
 }
 
+/* Memory\"Free & Zero Page List Bytes"(NT6.0+, 단일 인스턴스 오브젝트)로 진짜 free를
+ * 실측한다. GlobalMemoryStatusEx.ullAvailPhys(=available, 회수 가능분 포함)와 다르다.
+ * 이 카운터가 없는 NT5.2나 조회 실패 시 -1(호출측이 null 발행). */
+static long long query_free_kb(void)
+{
+	DWORD i_mem = perf_index("Memory");
+	if (!i_mem) return -1;
+	char vn[16];
+	snprintf(vn, sizeof vn, "%lu", (unsigned long)i_mem);
+	BYTE *buf = perf_query(vn);
+	RegCloseKey(HKEY_PERFORMANCE_DATA);
+	if (!buf) return -1;
+	long long free_kb = -1;
+	PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)buf;
+	PERF_OBJECT_TYPE *omem = perf_object(db, i_mem);
+	if (omem && omem->NumInstances == PERF_NO_INSTANCES) {
+		PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)omem + omem->DefinitionLength);
+		PERF_COUNTER_DEFINITION *c = perf_counter(omem, perf_index("Free & Zero Page List Bytes"));
+		if (c) free_kb = (long long)(perf_read(cb, c) / 1024ULL);
+	}
+	free(buf);
+	return free_kb;
+}
+
 /* NtQuerySystemInformation(SystemPerformanceInformation=2): I/O 매니저가 직접 유지하는
  * 시스템 전역 누적 I/O 카운터. PhysicalDisk/LogicalDisk perflib·IOCTL_DISK_PERFORMANCE가
  * diskperf 성능 통계에 의존하는 반면 이 카운터는 provider 독립이라, virtio 등에서 diskperf가
@@ -567,7 +654,7 @@ static cJSON *enumerate_disk_io(void)
 	return arr;
 }
 
-/* IfType -> kind (item 1). Windows는 세분 분류(bridge/veth/bond)가 안 나와
+/* IfType -> kind. Windows는 세분 분류(bridge/veth/bond)가 안 나와
  * coarse(physical/loopback/tunnel/virtual)로만 태그한다 — 엔진이 수용. */
 static const char *win_net_kind(ULONG if_type)
 {
@@ -655,13 +742,41 @@ static int mac_cmp(const void *a, const void *b)
 	return strcmp(*(const char **)a, *(const char **)b);
 }
 
+#if !AGENT_NT6
+/* NT5.2: GAA가 gateway를 안 줘, IfIndex의 IPv4 default route gateway를
+ * GetIpForwardTable(NT4+)에서 직접 찾는다. NT6+는 FirstGatewayAddress를 쓴다. */
+static int legacy_ipv4_gateway(DWORD if_index, char *out, size_t out_sz)
+{
+	ULONG sz = 0;
+	if (GetIpForwardTable(NULL, &sz, FALSE) != ERROR_INSUFFICIENT_BUFFER)
+		return 0;
+	MIB_IPFORWARDTABLE *t = malloc(sz);
+	if (!t)
+		return 0;
+	int found = 0;
+	if (GetIpForwardTable(t, &sz, FALSE) == NO_ERROR) {
+		for (DWORD i = 0; i < t->dwNumEntries; i++) {
+			MIB_IPFORWARDROW *r = &t->table[i];
+			if (r->dwForwardDest == 0 && r->dwForwardMask == 0 &&
+			    r->dwForwardIfIndex == if_index) {
+				struct in_addr a;
+				a.S_un.S_addr = r->dwForwardNextHop;
+				if (inet_ntop(AF_INET, &a, out, out_sz)) { found = 1; break; }
+			}
+		}
+	}
+	free(t);
+	return found;
+}
+#endif
+
 static void fill_network_info(cJSON *inv)
 {
 	cJSON *ifaces = cJSON_AddArrayToObject(inv, "interfaces");
 	cJSON *macs   = cJSON_AddArrayToObject(inv, "mac_addresses");
 
-	/* req4: FirstGatewayAddress는 GAA_FLAG_INCLUDE_GATEWAYS를 줘야만 OS가 채운다.
-	 * 이 플래그는 Vista+(NT6.0+) 전용이라 legacy32(NT5.2)에는 넣지 않는다(gateway는 null). */
+	/* gateway = 이 주소와 같은 family의 default route. NT6+는 GAA_FLAG_INCLUDE_GATEWAYS의
+	 * FirstGatewayAddress, NT5.2는 GetIpForwardTable(IPv4 default route)로 얻는다. */
 	ULONG gaa_flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
 #if AGENT_NT6
 	gaa_flags |= GAA_FLAG_INCLUDE_GATEWAYS;
@@ -707,7 +822,7 @@ static void fill_network_info(cJSON *inv)
 			prefix = (unsigned)u->OnLinkPrefixLength;
 #endif
 
-			/* item 3: 구조화 interfaces[] (name/address/prefix/family/kind).
+			/* 구조화 interfaces[] (name/address/prefix/family/kind).
 			 * cutover로 구형 ip_internal 대체(단독 발행). */
 			char ifname[256];
 			WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1,
@@ -719,8 +834,8 @@ static void fill_network_info(cJSON *inv)
 			cJSON_AddStringToObject(io, "family",  family ? family : "");
 			cJSON_AddStringToObject(io, "kind",    win_net_kind(p->IfType));
 
-			/* req4: gateway = 어댑터 default gateway 중 이 주소와 같은 family.
-			 * FirstGatewayAddress는 Vista+(NT6.0+)에서만 OS가 채운다 -> legacy32(NT5.2)는 null. */
+			/* gateway = 이 주소와 같은 family의 default route. NT6+는 FirstGatewayAddress,
+			 * NT5.2는 GetIpForwardTable(IPv4 default route). IPv6 항목은 null. */
 			cJSON *gw_item = NULL;
 #if AGENT_NT6
 			int ufam = u->Address.lpSockaddr->sa_family;
@@ -733,6 +848,12 @@ static void fill_network_info(cJSON *inv)
 				else if (ufam == AF_INET6)
 					inet_ntop(AF_INET6, &((struct sockaddr_in6 *)g->Address.lpSockaddr)->sin6_addr, gbuf, sizeof gbuf);
 				if (gbuf[0]) { gw_item = cJSON_CreateString(gbuf); break; }
+			}
+#else
+			if (u->Address.lpSockaddr->sa_family == AF_INET) {
+				char gbuf[INET_ADDRSTRLEN];
+				if (legacy_ipv4_gateway(p->IfIndex, gbuf, sizeof gbuf))
+					gw_item = cJSON_CreateString(gbuf);
 			}
 #endif
 			cJSON_AddItemToObject(io, "gateway", gw_item ? gw_item : cJSON_CreateNull());
@@ -859,7 +980,7 @@ const char *cached_composite_id(const char *machine_id)
 	return hex_buf;
 }
 
-/* item 4: 첫 실행 시 UUIDv4 생성 -> %ProgramData%\assessment-agent\agent-id에
+/* 첫 실행 시 UUIDv4 생성 -> %ProgramData%\assessment-agent\agent-id에
  * 영구 저장 -> 재사용. LocalSystem 서비스가 항상 읽고 쓸 수 있는 고정 경로다.
  * prep-image가 이 파일을 지워 클론마다 새로 생성되게 한다. */
 const char *cached_agent_id(void)
@@ -1091,28 +1212,12 @@ static cJSON *enumerate_running_services(void)
 	return arr;
 }
 
-static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
+/* Toolhelp32(kernel32)로 pid -> exe 베이스명. OpenProcess가 필요 없어 System(4) 등
+ * 보호 프로세스도 커버한다(커널이 스냅샷에 이름을 제공). */
+static void fill_comm_toolhelp(DWORD pid, char *out, size_t out_sz)
 {
-	out[0] = '\0';
-	if (pid == 0) return;
-#if AGENT_NT6
-	HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-	if (!hp) return;
-	wchar_t wname[1024];
-	DWORD wsz = 1024;
-	if (QueryFullProcessImageNameW(hp, 0, wname, &wsz)) {
-		wchar_t *base = wcsrchr(wname, L'\\');
-		base = base ? base + 1 : wname;
-		WideCharToMultiByte(CP_UTF8, 0, base, -1, out, (int)out_sz, NULL, NULL);
-		char *dot = strrchr(out, '.');
-		if (dot && _stricmp(dot, ".exe") == 0) *dot = '\0';
-	}
-	CloseHandle(hp);
-#else
-	/* NT5.2(2003/XP): PROCESS_QUERY_LIMITED_INFORMATION·QueryFullProcessImageName이 없다.
-	 * Toolhelp32(kernel32, OpenProcess 불요)로 pid->exe 베이스명 조회. */
 	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snap == INVALID_HANDLE_VALUE) { (void)out_sz; return; }
+	if (snap == INVALID_HANDLE_VALUE) return;
 	PROCESSENTRY32W pe;
 	pe.dwSize = sizeof pe;
 	if (Process32FirstW(snap, &pe)) {
@@ -1126,6 +1231,33 @@ static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
 		} while (Process32NextW(snap, &pe));
 	}
 	CloseHandle(snap);
+}
+
+static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
+{
+	out[0] = '\0';
+	if (pid == 0) return;
+#if AGENT_NT6
+	/* 1차: QueryFullProcessImageName(전체 경로 -> 베이스명). System(4) 등 보호 프로세스는
+	 * OpenProcess가 거부돼 결과가 비므로 2차로 Toolhelp32 폴백. */
+	HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (hp) {
+		wchar_t wname[1024];
+		DWORD wsz = 1024;
+		if (QueryFullProcessImageNameW(hp, 0, wname, &wsz)) {
+			wchar_t *base = wcsrchr(wname, L'\\');
+			base = base ? base + 1 : wname;
+			WideCharToMultiByte(CP_UTF8, 0, base, -1, out, (int)out_sz, NULL, NULL);
+			char *dot = strrchr(out, '.');
+			if (dot && _stricmp(dot, ".exe") == 0) *dot = '\0';
+		}
+		CloseHandle(hp);
+	}
+	if (!out[0])
+		fill_comm_toolhelp(pid, out, out_sz);
+#else
+	/* NT5.2(2003/XP): QueryFullProcessImageName이 없어 Toolhelp32만 쓴다. */
+	fill_comm_toolhelp(pid, out, out_sz);
 #endif
 }
 
@@ -1291,26 +1423,16 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	return m;
 }
 
-/* item 5 (saturation, raw-first): Linux loadavg/iowait 등가 신호.
- * disk_queue는 물리 디스크별 IOCTL_DISK_PERFORMANCE의 QueueDepth(순간 큐 깊이)를
- * [{device, queue}] 배열로 발행한다(추가 DLL/PDH 없음). device 키는 disks[].name과
- * 동일(PhysicalDriveN)이라 엔진이 물리 디스크에 귀속·per-device max로 병목 판정한다.
- * 빈 배열 [] = 신호 없음(unmeasured). cpu_run_queue(Processor Queue Length)와
- * mem_paging_rate(Pages/sec)는 perflib(HKEY_PERFORMANCE_DATA) 파싱이 필요해 실기
- * 검증 전까지 null(미측정)로 둔다 — 값 정합성 우선. */
-/* saturation: perflib raw. cpu_run_queue(System\Processor Queue Length, 순간),
- * mem_paging_rate(Memory\Pages/sec raw 누적), disk_queue[](PhysicalDisk\Current Disk Queue Length, 순간). */
 static void fill_saturation(cJSON *m)
 {
 	cJSON *s = cJSON_CreateObject();
-	cJSON *dq = cJSON_CreateArray();
 
+	/* cpu_run_queue(System\Processor Queue Length), mem_paging_rate(Memory\Pages/sec)는
+	 * perflib. 카운터를 못 읽으면(측정 불가) null, 읽으면 값(idle이면 실측 0). */
 	DWORD i_sys = perf_index("System");
 	DWORD i_mem = perf_index("Memory");
-	DWORD i_pd  = perf_index("PhysicalDisk");
-	char vn[48];
-	snprintf(vn, sizeof vn, "%lu %lu %lu",
-	         (unsigned long)i_sys, (unsigned long)i_mem, (unsigned long)i_pd);
+	char vn[32];
+	snprintf(vn, sizeof vn, "%lu %lu", (unsigned long)i_sys, (unsigned long)i_mem);
 	BYTE *buf = perf_query(vn);
 	RegCloseKey(HKEY_PERFORMANCE_DATA);
 
@@ -1333,30 +1455,12 @@ static void fill_saturation(cJSON *m)
 			PERF_COUNTER_DEFINITION *c = perf_counter(omem, perf_index("Pages/sec"));
 			if (c) { pages = perf_read(cb, c); have_mem = 1; }
 		}
-
-		PERF_OBJECT_TYPE *opd = perf_object(db, i_pd);
-		if (opd && opd->NumInstances > 0) {
-			PERF_COUNTER_DEFINITION *c_q = perf_counter(opd, perf_index("Current Disk Queue Length"));
-			PERF_INSTANCE_DEFINITION *inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)opd + opd->DefinitionLength);
-			for (LONG i = 0; i < opd->NumInstances; i++) {
-				wchar_t *wname = (wchar_t *)((BYTE *)inst + inst->NameOffset);
-				PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)inst + inst->ByteLength);
-				int drive = perf_disk_num(wname);
-				if (drive >= 0) {
-					char dev[32];
-					snprintf(dev, sizeof dev, "PhysicalDrive%d", drive);
-					cJSON *o = cJSON_CreateObject();
-					cJSON_AddStringToObject(o, "device", dev);
-					cJSON_AddNumberToObject(o, "queue", (double)perf_read(cb, c_q));
-					cJSON_AddItemToArray(dq, o);
-				}
-				inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)cb + cb->ByteLength);
-			}
-		}
 		free(buf);
 	}
 
-	cJSON_AddItemToObject(s, "disk_queue", dq);
+	/* disk_queue는 IOCTL_DISK_PERFORMANCE로 실측 — diskperf 미부착이면 측정 불가라
+	 * 빈 배열(perflib의 raw-0 오표기 회피). */
+	cJSON_AddItemToObject(s, "disk_queue", query_disk_queue());
 	if (have_cpu) cJSON_AddNumberToObject(s, "cpu_run_queue",   (double)cpu_q);
 	else          cJSON_AddNullToObject  (s, "cpu_run_queue");
 	if (have_mem) cJSON_AddNumberToObject(s, "mem_paging_rate", (double)pages);
@@ -1365,7 +1469,7 @@ static void fill_saturation(cJSON *m)
 	cJSON_AddItemToObject(m, "saturation", s);
 }
 
-/* req3: 설정된 수집 주기(초). main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60). */
+/* 설정된 수집 주기(초). main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60). */
 static int agent_interval_sec(void)
 {
 	const char *v = getenv("AGENT_INTERVAL_SEC");

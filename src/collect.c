@@ -81,8 +81,12 @@ static void add_common_metadata(cJSON *obj,
                                 const char *agent_version)
 {
 	cJSON_AddStringToObject(obj, "message_type", message_type);
-	cJSON_AddStringToObject(obj, "machine_id",
-	                        machine_id && *machine_id ? machine_id : "");
+	/* machine_id는 원시 머신 식별자다. 구할 수 없으면 억지로 채우지 않고 null(측정 불가).
+	 * 식별·라우팅은 agent_id로 하고, composite_id는 mac 기반으로 유니크가 유지된다. */
+	if (machine_id && *machine_id)
+		cJSON_AddStringToObject(obj, "machine_id", machine_id);
+	else
+		cJSON_AddNullToObject(obj, "machine_id");
 	cJSON_AddStringToObject(obj, "composite_id", cached_composite_id(machine_id));
 	cJSON_AddStringToObject(obj, "agent_id", cached_agent_id());
 	cJSON_AddStringToObject(obj, "os_family", "linux");
@@ -492,7 +496,7 @@ static int add_mem_total_swap_total(cJSON *root)
 	return 1;
 }
 
-/* ---- device kind 분류기 (item 1) — disk_io/net_io/mounts/interfaces 공용 ----
+/* ---- device kind 분류기 — disk_io/net_io/mounts/interfaces 공용 ----
  * "가상이냐" 판정을 한 곳으로 모아 엔진의 정규식/major 추론을 대체한다. */
 
 static const char *disk_kind(const char *dev)
@@ -896,7 +900,7 @@ static int ipv6_netmask_prefix(const struct sockaddr_in6 *mask)
 	return prefix;
 }
 
-/* req4: /proc/net/route의 default route(dest=0, mask=0) gateway를 iface->IP 문자열 맵으로.
+/* /proc/net/route의 default route(dest=0, mask=0) gateway를 iface->IP 문자열 맵으로.
  * 엔진 토폴로지 서브넷 disambiguation용. IPv4만 취득(엔진 용도는 사설 대역 중복 판별). */
 static cJSON *build_default_gw_v4(void)
 {
@@ -930,7 +934,7 @@ static cJSON *build_default_gw_v4(void)
 	return map;
 }
 
-/* item 3: 구조화 인터페이스 배열(name/address/prefix/family/kind/gateway, IPv6 포함).
+/* 구조화 인터페이스 배열(name/address/prefix/family/kind/gateway, IPv6 포함).
  * cutover로 구형 ip_internal(CIDR 문자열, IPv4-only) 대체(단독 발행). */
 static cJSON *collect_interfaces(void)
 {
@@ -977,7 +981,7 @@ static cJSON *collect_interfaces(void)
 		cJSON_AddNumberToObject(o, "prefix",  (double)prefix);
 		cJSON_AddStringToObject(o, "family",  family);
 		cJSON_AddStringToObject(o, "kind",    net_kind(name));
-		/* req4: gateway = 이 iface의 IPv4 default route(있으면). v6·미보유는 null. */
+		/* gateway = 이 iface의 IPv4 default route(있으면). v6·미보유는 null. */
 		cJSON *g = NULL;
 		if (fam == AF_INET) {
 			cJSON *hit = cJSON_GetObjectItem(gw4, name);
@@ -1126,7 +1130,7 @@ const char *cached_composite_id(const char *machine_id)
 	return hex_buf;
 }
 
-/* item 4: 첫 실행 시 UUIDv4 생성 -> state dir에 영구 저장 -> 재사용.
+/* 첫 실행 시 UUIDv4 생성 -> state dir에 영구 저장 -> 재사용.
  * 저장 경로는 install이 잡아주는 WORKER_STATE_DIR(없으면 XDG_STATE_HOME/HOME
  * 폴백)을 재사용해 user-level/SysV 어느 설치 모델에서도 쓰기 가능하게 한다.
  * prep-image(image-prep.sh)가 이 파일을 지워 클론마다 새로 생성되게 한다. */
@@ -1903,7 +1907,7 @@ static cJSON *collect_net_io(void)
 	return arr;
 }
 
-/* req3: 설정된 수집 주기(초). 엔진 sample_sufficiency 하드코딩(1440/day) 대체 기준값.
+/* 설정된 수집 주기(초). 엔진 sample_sufficiency 하드코딩(1440/day) 대체 기준값.
  * main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60)를 읽는다. */
 static int agent_interval_sec(void)
 {

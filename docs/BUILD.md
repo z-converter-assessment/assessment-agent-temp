@@ -13,6 +13,14 @@ BUILD_IMAGE=quay.io/pypa/manylinux2014_x86_64 BUILD_TARGET=release        sh scr
 BUILD_IMAGE=quay.io/pypa/manylinux2010_x86_64 BUILD_TARGET=release-legacy sh scripts/build-linux.sh
 ```
 
+modern과 legacy는 같은 트리를 공유한다. src/*.o는 build-linux.sh가 매 빌드 자동 clean하지만, vendor(.a)는 재활용되므로 세대를 전환할 때(modern <-> legacy)는 vendor를 먼저 정리한다 — 다른 glibc로 빌드된 .a가 섞이면 legacy verify(GLIBC 2.13+ 금지)가 실패한다.
+
+```bash
+docker run --rm -v "$PWD":/src -w /src <해당 이미지> rm -rf vendor
+```
+
+CI(release.yml)는 매번 깨끗한 러너라 이 문제가 없다.
+
 ### Windows modern / win7 (x64 2종)
 
 mingw-w64 x86_64 크로스툴체인으로 빌드한다.
