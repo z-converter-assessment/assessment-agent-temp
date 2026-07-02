@@ -89,9 +89,15 @@ task_id로 매칭하므로 식별 큐와 무관하다.
 
 - Windows kind는 coarse(IfType/드라이브 종류 기반). Linux는 세분.
 - Windows os_version은 DisplayVersion(없으면 ReleaseId, 예: Server 2016 -> "1607"). 둘 다 없는 구버전(2012R2/2003 등)은 빈 문자열.
-- Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}`.
-  disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN, IOCTL_DISK_PERFORMANCE.QueueDepth). 빈 배열=미측정.
-  cpu_run_queue/mem_paging_rate는 null(미측정). perflib(HKEY_PERFORMANCE_DATA) 실기 검증 후 raw 값으로 채운다.
+- Windows disk_io는 NtQuerySystemInformation(SystemPerformanceInformation)의 시스템 전역 누적 I/O로
+  단일 엔트리(device=PhysicalDrive0)를 싣는다. I/O 매니저 카운터라 단조증가·provider 독립(NT5.2~NT10).
+  perflib PhysicalDisk 디스크 카운터는 diskperf 성능 통계에 의존해 환경별로 죽거나(예: 2012R2+virtio raw=0)
+  부팅 후 리셋(비단조)이라 1차 소스로 부적합 -> NtQuery 불가 시에만 perflib per-disk(PhysicalDriveN)로 폴백.
+  전역 집계 특성상 파일 I/O(네트워크 리다이렉터 등)를 포함하며 물리 디스크별 분해는 하지 않는다.
+- Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}` — 모두 perflib(HKEY_PERFORMANCE_DATA) raw.
+  disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN, PhysicalDisk\Current Disk Queue Length). 빈 배열=미측정.
+  cpu_run_queue(System\Processor Queue Length)·mem_paging_rate(Memory\Pages/sec 누적)는 raw 값으로 채운다(실기 검증 완료).
+  단, disk_queue는 diskperf 미수집 환경(2012R2+virtio 등)에서 0으로 고정될 수 있다(카운터 provider 한계).
 - listen_ports.uid는 Windows에서 null(POSIX uid 없음).
 
 ## 빌드/릴리즈
