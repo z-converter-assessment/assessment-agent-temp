@@ -22,6 +22,8 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <ntddstor.h>
+#include <tlhelp32.h>
+#include <winperf.h>
 #include "nt52_compat.h"
 
 #if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
@@ -286,7 +288,9 @@ static cJSON *enumerate_physical_disks(void)
 	for (int i = 0; i < 32; i++) {
 		wchar_t path[64];
 		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
-		HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+		/* GENERIC_READ 필요: access=0 핸들엔 IOCTL_DISK_GET_LENGTH_INFO가 ACCESS_DENIED.
+		 * 에이전트는 LocalSystem이라 물리 드라이브 read 권한 있음. */
+		HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
 		                       NULL, OPEN_EXISTING, 0, NULL);
 		if (h == INVALID_HANDLE_VALUE)
 			break;
@@ -373,38 +377,193 @@ static cJSON *enumerate_mounts(int include_fstype)
 	return arr;
 }
 
+/* ---- perflib (HKEY_PERFORMANCE_DATA) — 언어독립 raw 카운터 ----
+ * OpenStack virtio 디스크는 IOCTL_DISK_PERFORMANCE 미지원(ERROR_INVALID_FUNCTION). perflib은
+ * 파티션/볼륨 매니저가 유지하는 카운터라 디스크 드라이버 IOCTL과 무관하게 동작한다.
+ * 카운터/객체 인덱스는 OS 버전별로 달라 하드코딩하지 않고 Perflib\009(항상 영어)에서 이름->인덱스 조회. */
+
+static DWORD perf_index(const char *want)
+{
+	static char *buf = NULL;
+	static int loaded = 0;
+	if (!loaded) {
+		loaded = 1;
+		HKEY k;
+		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+		        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Perflib\\009",
+		        0, KEY_READ, &k) == ERROR_SUCCESS) {
+			DWORD sz = 0;
+			if (RegQueryValueExA(k, "Counter", NULL, NULL, NULL, &sz) == ERROR_SUCCESS && sz) {
+				buf = malloc(sz);
+				if (buf && RegQueryValueExA(k, "Counter", NULL, NULL, (LPBYTE)buf, &sz) != ERROR_SUCCESS) {
+					free(buf); buf = NULL;
+				}
+			}
+			RegCloseKey(k);
+		}
+	}
+	if (!buf) return 0;
+	/* REG_MULTI_SZ: "<index>\0<name>\0<index>\0<name>\0...\0" (index 먼저) */
+	for (char *p = buf; *p; ) {
+		char *sidx = p; p += strlen(p) + 1;
+		if (!*p) break;
+		char *name = p; p += strlen(p) + 1;
+		if (_stricmp(name, want) == 0) return (DWORD)strtoul(sidx, NULL, 10);
+	}
+	return 0;
+}
+
+/* value_name = 공백구분 객체 인덱스("2 4 234"). 반환 버퍼는 free, HKEY_PERFORMANCE_DATA는 호출측이 RegCloseKey. */
+static BYTE *perf_query(const char *value_name)
+{
+	DWORD sz = 65536;
+	BYTE *buf = malloc(sz);
+	if (!buf) return NULL;
+	for (;;) {
+		DWORD type = 0, ret = sz;
+		LONG rc = RegQueryValueExA(HKEY_PERFORMANCE_DATA, value_name, NULL, &type, buf, &ret);
+		if (rc == ERROR_SUCCESS) return buf;
+		if (rc == ERROR_MORE_DATA) {
+			sz *= 2;
+			BYTE *nb = realloc(buf, sz);
+			if (!nb) { free(buf); return NULL; }
+			buf = nb;
+			continue;
+		}
+		free(buf);
+		return NULL;
+	}
+}
+
+static PERF_OBJECT_TYPE *perf_object(PERF_DATA_BLOCK *db, DWORD idx)
+{
+	if (!idx) return NULL;
+	PERF_OBJECT_TYPE *o = (PERF_OBJECT_TYPE *)((BYTE *)db + db->HeaderLength);
+	for (DWORD i = 0; i < db->NumObjectTypes; i++) {
+		if (o->ObjectNameTitleIndex == idx) return o;
+		o = (PERF_OBJECT_TYPE *)((BYTE *)o + o->TotalByteLength);
+	}
+	return NULL;
+}
+
+static PERF_COUNTER_DEFINITION *perf_counter(PERF_OBJECT_TYPE *o, DWORD idx)
+{
+	if (!o || !idx) return NULL;
+	PERF_COUNTER_DEFINITION *c = (PERF_COUNTER_DEFINITION *)((BYTE *)o + o->HeaderLength);
+	for (DWORD i = 0; i < o->NumCounters; i++) {
+		if (c->CounterNameTitleIndex == idx) return c;
+		c = (PERF_COUNTER_DEFINITION *)((BYTE *)c + c->ByteLength);
+	}
+	return NULL;
+}
+
+static unsigned long long perf_read(PERF_COUNTER_BLOCK *cb, PERF_COUNTER_DEFINITION *c)
+{
+	if (!cb || !c) return 0;
+	BYTE *p = (BYTE *)cb + c->CounterOffset;
+	if (c->CounterSize >= 8) return *(unsigned long long *)p;
+	return *(DWORD *)p;
+}
+
+/* PhysicalDisk 인스턴스명 "0 C:" -> 물리 드라이브 번호. 숫자 시작 아니면(-1) 스킵(_Total 등). */
+static int perf_disk_num(const wchar_t *name)
+{
+	if (name[0] < L'0' || name[0] > L'9') return -1;
+	return (int)wcstol(name, NULL, 10);
+}
+
+/* NtQuerySystemInformation(SystemPerformanceInformation=2): I/O 매니저가 직접 유지하는
+ * 시스템 전역 누적 I/O 카운터. PhysicalDisk/LogicalDisk perflib·IOCTL_DISK_PERFORMANCE가
+ * diskperf 성능 통계에 의존하는 반면 이 카운터는 provider 독립이라, virtio 등에서 diskperf가
+ * 미수집(카운터 raw=0)인 환경의 disk_io 폴백 소스로 쓴다. 성공 시 1, 실패 시 0. */
+static int query_system_io(unsigned long long *read_ops, unsigned long long *write_ops,
+                           unsigned long long *read_bytes, unsigned long long *write_bytes)
+{
+	typedef LONG (WINAPI *NQSI)(ULONG, PVOID, ULONG, PULONG);
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	NQSI f = nt ? (NQSI)(void *)GetProcAddress(nt, "NtQuerySystemInformation") : NULL;
+	if (!f) return 0;
+	BYTE buf[2048];
+	ULONG ret = 0;
+	LONG st = f(2, buf, sizeof buf, &ret);
+	if (st == (LONG)0xC0000004UL && ret > 0 && ret <= sizeof buf)  /* STATUS_INFO_LENGTH_MISMATCH */
+		st = f(2, buf, ret, &ret);
+	if (st != 0 || ret < 40) return 0;
+	/* SYSTEM_PERFORMANCE_INFORMATION 안정 prefix: +8 IoReadTransferCount(8),
+	 * +16 IoWriteTransferCount(8), +32 IoReadOperationCount(4), +36 IoWriteOperationCount(4). */
+	*read_bytes  = *(unsigned long long *)(buf + 8);
+	*write_bytes = *(unsigned long long *)(buf + 16);
+	*read_ops    = *(unsigned long *)(buf + 32);
+	*write_ops   = *(unsigned long *)(buf + 36);
+	return 1;
+}
+
+/* disk_io 폴백: perflib PhysicalDisk 객체(인스턴스=물리 드라이브)에서 누적 read/write count·bytes.
+ * NtQuerySystemInformation을 못 쓸 때만 사용. perflib 디스크 카운터는 diskperf 성능 통계 수집에
+ * 의존해 환경에 따라 죽거나(2012R2+virtio: raw=0) 비단조(win2003/win2016: 부팅후 리셋)라 2차 소스다. */
+static void disk_io_perflib(cJSON *arr)
+{
+	DWORD i_pd = perf_index("PhysicalDisk");
+	if (!i_pd) return;
+	char vn[16];
+	snprintf(vn, sizeof vn, "%lu", (unsigned long)i_pd);
+	BYTE *buf = perf_query(vn);
+	RegCloseKey(HKEY_PERFORMANCE_DATA);
+	if (!buf) return;
+	PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)buf;
+	PERF_OBJECT_TYPE *o = perf_object(db, i_pd);
+	if (o && o->NumInstances > 0) {
+		PERF_COUNTER_DEFINITION *c_r  = perf_counter(o, perf_index("Disk Reads/sec"));
+		PERF_COUNTER_DEFINITION *c_w  = perf_counter(o, perf_index("Disk Writes/sec"));
+		PERF_COUNTER_DEFINITION *c_rb = perf_counter(o, perf_index("Disk Read Bytes/sec"));
+		PERF_COUNTER_DEFINITION *c_wb = perf_counter(o, perf_index("Disk Write Bytes/sec"));
+		PERF_INSTANCE_DEFINITION *inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)o + o->DefinitionLength);
+		for (LONG i = 0; i < o->NumInstances; i++) {
+			wchar_t *wname = (wchar_t *)((BYTE *)inst + inst->NameOffset);
+			PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)inst + inst->ByteLength);
+			int drive = perf_disk_num(wname);
+			if (drive >= 0) {
+				char dev[32];
+				snprintf(dev, sizeof dev, "PhysicalDrive%d", drive);
+				cJSON *e = cJSON_CreateObject();
+				cJSON_AddStringToObject(e, "device", dev);
+				cJSON_AddNumberToObject(e, "major", 0);
+				cJSON_AddNumberToObject(e, "minor", drive);
+				cJSON_AddNumberToObject(e, "reads_completed",  (double)perf_read(cb, c_r));
+				cJSON_AddNumberToObject(e, "writes_completed", (double)perf_read(cb, c_w));
+				cJSON_AddNumberToObject(e, "sectors_read",     (double)(perf_read(cb, c_rb) / 512));
+				cJSON_AddNumberToObject(e, "sectors_written",  (double)(perf_read(cb, c_wb) / 512));
+				cJSON_AddStringToObject(e, "kind", "physical");
+				cJSON_AddItemToArray(arr, e);
+			}
+			inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)cb + cb->ByteLength);
+		}
+	}
+	free(buf);
+}
+
+/* disk_io: 1차 소스는 NtQuerySystemInformation(SystemPerformanceInformation)의 시스템 전역 누적 I/O.
+ * I/O 매니저가 직접 유지해 단조증가·provider 독립(NT5.2~NT10)이라 perflib 디스크 카운터의
+ * 환경별 불안정(2012R2 raw=0, win2003/win2016 부팅후 리셋)을 회피한다. 시스템 전역 집계라
+ * 단일 엔트리(PhysicalDrive0)로 보고한다. NtQuery 불가 시에만 perflib per-disk로 폴백. */
 static cJSON *enumerate_disk_io(void)
 {
 	cJSON *arr = cJSON_CreateArray();
-	for (int i = 0; i < 32; i++) {
-		wchar_t path[64];
-		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
-		HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-		                       NULL, OPEN_EXISTING, 0, NULL);
-		if (h == INVALID_HANDLE_VALUE) break;
-
-		DISK_PERFORMANCE dp;
-		DWORD ret = 0;
-		if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, NULL, 0,
-		                    &dp, sizeof dp, &ret, NULL)) {
-			cJSON *o = cJSON_CreateObject();
-			char name[32];
-			snprintf(name, sizeof name, "PhysicalDrive%d", i);
-			cJSON_AddStringToObject(o, "device", name);
-			cJSON_AddNumberToObject(o, "major", 0);
-			cJSON_AddNumberToObject(o, "minor", i);
-			cJSON_AddNumberToObject(o, "reads_completed",  (double)dp.ReadCount);
-			cJSON_AddNumberToObject(o, "writes_completed", (double)dp.WriteCount);
-
-			cJSON_AddNumberToObject(o, "sectors_read",
-			                        (double)(dp.BytesRead.QuadPart / 512));
-			cJSON_AddNumberToObject(o, "sectors_written",
-			                        (double)(dp.BytesWritten.QuadPart / 512));
-			cJSON_AddStringToObject(o, "kind", "physical");
-			cJSON_AddItemToArray(arr, o);
-		}
-		CloseHandle(h);
+	unsigned long long rop = 0, wop = 0, rby = 0, wby = 0;
+	if (query_system_io(&rop, &wop, &rby, &wby)) {
+		cJSON *e = cJSON_CreateObject();
+		cJSON_AddStringToObject(e, "device", "PhysicalDrive0");
+		cJSON_AddNumberToObject(e, "major", 0);
+		cJSON_AddNumberToObject(e, "minor", 0);
+		cJSON_AddNumberToObject(e, "reads_completed",  (double)rop);
+		cJSON_AddNumberToObject(e, "writes_completed", (double)wop);
+		cJSON_AddNumberToObject(e, "sectors_read",     (double)(rby / 512));
+		cJSON_AddNumberToObject(e, "sectors_written",  (double)(wby / 512));
+		cJSON_AddStringToObject(e, "kind", "physical");
+		cJSON_AddItemToArray(arr, e);
+		return arr;
 	}
+	disk_io_perflib(arr);
 	return arr;
 }
 
@@ -429,6 +588,8 @@ static cJSON *enumerate_net_io(void)
 		MIB_IF_ROW2 *r = &table->Table[i];
 		if (r->Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
 		if (r->OperStatus != IfOperStatusUp) continue;
+		/* WFP/QoS 필터 드라이버는 기반 NIC의 카운터를 그대로 복제한다 -> 스킵(중복 합산 방지). */
+		if (r->InterfaceAndOperStatusFlags.FilterInterface) continue;
 
 		char name[256];
 		WideCharToMultiByte(CP_UTF8, 0, r->Alias, -1, name, sizeof name, NULL, NULL);
@@ -441,7 +602,9 @@ static cJSON *enumerate_net_io(void)
 		cJSON_AddNumberToObject(o, "tx_packets", (double)(r->OutUcastPkts + r->OutNUcastPkts));
 		cJSON_AddNumberToObject(o, "rx_errors",  (double)r->InErrors);
 		cJSON_AddNumberToObject(o, "tx_errors",  (double)r->OutErrors);
-		cJSON_AddStringToObject(o, "kind", win_net_kind(r->Type));
+		/* 하드웨어 NIC만 win_net_kind(physical 가능). 비-하드웨어(가상/miniport)는 virtual. */
+		cJSON_AddStringToObject(o, "kind",
+		    r->InterfaceAndOperStatusFlags.HardwareInterface ? win_net_kind(r->Type) : "virtual");
 		cJSON_AddItemToArray(arr, o);
 	}
 	FreeMibTable(table);
@@ -946,8 +1109,23 @@ static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
 	}
 	CloseHandle(hp);
 #else
-
-	(void)pid; (void)out_sz;
+	/* NT5.2(2003/XP): PROCESS_QUERY_LIMITED_INFORMATION·QueryFullProcessImageName이 없다.
+	 * Toolhelp32(kernel32, OpenProcess 불요)로 pid->exe 베이스명 조회. */
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE) { (void)out_sz; return; }
+	PROCESSENTRY32W pe;
+	pe.dwSize = sizeof pe;
+	if (Process32FirstW(snap, &pe)) {
+		do {
+			if (pe.th32ProcessID == pid) {
+				WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, out, (int)out_sz, NULL, NULL);
+				char *dot = strrchr(out, '.');
+				if (dot && _stricmp(dot, ".exe") == 0) *dot = '\0';
+				break;
+			}
+		} while (Process32NextW(snap, &pe));
+	}
+	CloseHandle(snap);
 #endif
 }
 
@@ -1120,34 +1298,69 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
  * 빈 배열 [] = 신호 없음(unmeasured). cpu_run_queue(Processor Queue Length)와
  * mem_paging_rate(Pages/sec)는 perflib(HKEY_PERFORMANCE_DATA) 파싱이 필요해 실기
  * 검증 전까지 null(미측정)로 둔다 — 값 정합성 우선. */
+/* saturation: perflib raw. cpu_run_queue(System\Processor Queue Length, 순간),
+ * mem_paging_rate(Memory\Pages/sec raw 누적), disk_queue[](PhysicalDisk\Current Disk Queue Length, 순간). */
 static void fill_saturation(cJSON *m)
 {
 	cJSON *s = cJSON_CreateObject();
-
 	cJSON *dq = cJSON_CreateArray();
-	for (int i = 0; i < 32; i++) {
-		wchar_t path[64];
-		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
-		HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-		                       NULL, OPEN_EXISTING, 0, NULL);
-		if (h == INVALID_HANDLE_VALUE) break;
-		DISK_PERFORMANCE dp;
-		DWORD ret = 0;
-		if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, NULL, 0,
-		                    &dp, sizeof dp, &ret, NULL)) {
-			char name[32];
-			snprintf(name, sizeof name, "PhysicalDrive%d", i);
-			cJSON *o = cJSON_CreateObject();
-			cJSON_AddStringToObject(o, "device", name);
-			cJSON_AddNumberToObject(o, "queue",  (double)dp.QueueDepth);
-			cJSON_AddItemToArray(dq, o);
-		}
-		CloseHandle(h);
-	}
-	cJSON_AddItemToObject(s, "disk_queue", dq);
 
-	cJSON_AddNullToObject(s, "cpu_run_queue");
-	cJSON_AddNullToObject(s, "mem_paging_rate");
+	DWORD i_sys = perf_index("System");
+	DWORD i_mem = perf_index("Memory");
+	DWORD i_pd  = perf_index("PhysicalDisk");
+	char vn[48];
+	snprintf(vn, sizeof vn, "%lu %lu %lu",
+	         (unsigned long)i_sys, (unsigned long)i_mem, (unsigned long)i_pd);
+	BYTE *buf = perf_query(vn);
+	RegCloseKey(HKEY_PERFORMANCE_DATA);
+
+	int have_cpu = 0, have_mem = 0;
+	unsigned long long cpu_q = 0, pages = 0;
+
+	if (buf) {
+		PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)buf;
+
+		PERF_OBJECT_TYPE *osys = perf_object(db, i_sys);
+		if (osys && osys->NumInstances == PERF_NO_INSTANCES) {
+			PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)osys + osys->DefinitionLength);
+			PERF_COUNTER_DEFINITION *c = perf_counter(osys, perf_index("Processor Queue Length"));
+			if (c) { cpu_q = perf_read(cb, c); have_cpu = 1; }
+		}
+
+		PERF_OBJECT_TYPE *omem = perf_object(db, i_mem);
+		if (omem && omem->NumInstances == PERF_NO_INSTANCES) {
+			PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)omem + omem->DefinitionLength);
+			PERF_COUNTER_DEFINITION *c = perf_counter(omem, perf_index("Pages/sec"));
+			if (c) { pages = perf_read(cb, c); have_mem = 1; }
+		}
+
+		PERF_OBJECT_TYPE *opd = perf_object(db, i_pd);
+		if (opd && opd->NumInstances > 0) {
+			PERF_COUNTER_DEFINITION *c_q = perf_counter(opd, perf_index("Current Disk Queue Length"));
+			PERF_INSTANCE_DEFINITION *inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)opd + opd->DefinitionLength);
+			for (LONG i = 0; i < opd->NumInstances; i++) {
+				wchar_t *wname = (wchar_t *)((BYTE *)inst + inst->NameOffset);
+				PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)inst + inst->ByteLength);
+				int drive = perf_disk_num(wname);
+				if (drive >= 0) {
+					char dev[32];
+					snprintf(dev, sizeof dev, "PhysicalDrive%d", drive);
+					cJSON *o = cJSON_CreateObject();
+					cJSON_AddStringToObject(o, "device", dev);
+					cJSON_AddNumberToObject(o, "queue", (double)perf_read(cb, c_q));
+					cJSON_AddItemToArray(dq, o);
+				}
+				inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)cb + cb->ByteLength);
+			}
+		}
+		free(buf);
+	}
+
+	cJSON_AddItemToObject(s, "disk_queue", dq);
+	if (have_cpu) cJSON_AddNumberToObject(s, "cpu_run_queue",   (double)cpu_q);
+	else          cJSON_AddNullToObject  (s, "cpu_run_queue");
+	if (have_mem) cJSON_AddNumberToObject(s, "mem_paging_rate", (double)pages);
+	else          cJSON_AddNullToObject  (s, "mem_paging_rate");
 
 	cJSON_AddItemToObject(m, "saturation", s);
 }
