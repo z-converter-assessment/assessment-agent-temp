@@ -168,12 +168,10 @@ while IFS= read -r line || [ -n "$line" ]; do
 	fi
 done < "$EXAMPLE"
 
-# Atomic install + mode. Ownership: only the root (SysV system) path can/should
-# chown to root:assessment-agent so the service user can read /etc config. The
-# user-level path runs unprivileged — the file is simply owned by the invoking
-# user (no chown, which would fail as non-root anyway).
-if [ "$(id -u)" -eq 0 ] && id assessment-agent >/dev/null 2>&1; then
-	install -o root -g assessment-agent -m 0640 "$TMP" "$TARGET"
+# Atomic install + mode. The agent runs as root, so config is owned root:root.
+# 0640 (not world-readable): non-secret config, but no reason to expose it.
+if [ "$(id -u)" -eq 0 ]; then
+	install -o root -g root -m 0640 "$TMP" "$TARGET"
 else
 	install -m 0640 "$TMP" "$TARGET"
 fi
@@ -195,16 +193,12 @@ for key in $SECRET_KEYS; do
 	fi
 done
 if [ "$wrote_secrets" = "1" ]; then
-	if [ "$(id -u)" -eq 0 ] && id assessment-agent >/dev/null 2>&1; then
-		# 0640 group-read (NOT 0600): the SysV system install runs the agent as
-		# the unprivileged assessment-agent user, which must read these secrets
-		# (RABBITMQ_PASS/…). Owner root:rw, group assessment-agent:r. With 0600
-		# the daemon user got an empty password → broker login refused.
-		install -o root -g assessment-agent -m 0640 "$TMP_LOCAL" "$LOCAL"
-		printf '[env-setup] wrote %s (mode 0640, group assessment-agent)\n' "$LOCAL" >&2
+	# Secrets (RABBITMQ_PASS/…) — the agent runs as root and reads them directly,
+	# so 0600 root:root is enough and tightest.
+	if [ "$(id -u)" -eq 0 ]; then
+		install -o root -g root -m 0600 "$TMP_LOCAL" "$LOCAL"
 	else
-		# User-level install: owner IS the agent user, so 0600 owner-read is enough.
 		install -m 0600 "$TMP_LOCAL" "$LOCAL"
-		printf '[env-setup] wrote %s (mode 0600)\n' "$LOCAL" >&2
 	fi
+	printf '[env-setup] wrote %s (mode 0600)\n' "$LOCAL" >&2
 fi

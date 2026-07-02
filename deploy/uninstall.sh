@@ -1,14 +1,13 @@
 #!/bin/sh
 # Assessment Agent (Linux) — uninstaller.
 #
-# Invoked by the self-installer subcommand:
-#     assessment-agent uninstall            # systemd host: no root needed
-#     assessment-agent uninstall --purge    # also wipe config + worker state
-#     sudo assessment-agent uninstall       # SysV/EL6 host: root (mirrors install)
+# Invoked by the self-installer subcommand (root required, mirrors install):
+#     sudo assessment-agent uninstall            # stop + remove service
+#     sudo assessment-agent uninstall --purge    # also wipe config + worker state
 #
-# Mirrors install.sh's privilege model:
-#   - systemd host → USER-LEVEL teardown (systemctl --user, no root)
-#   - SysV/EL6 host → SYSTEM teardown, root (the service lives in /etc/init.d)
+# Mirrors install.sh's privilege model — root on both init systems:
+#   - systemd host → remove /etc/systemd/system/assessment-agent.service
+#   - SysV/EL6 host → remove /etc/init.d/assessment-agent
 #
 # By default config + worker state are preserved so a re-install keeps
 # configuration. Set PURGE=1 to wipe them.
@@ -23,29 +22,31 @@ if command -v systemctl >/dev/null 2>&1; then
 	fi
 fi
 
-uninstall_user_systemd() {
-	uid=$(id -u)
-	: "${XDG_RUNTIME_DIR:=/run/user/$uid}"
-	export XDG_RUNTIME_DIR
+uninstall_system_systemd() {
+	CFG_DIR=/etc/assessment-agent
+	STATE_DIR=/var/lib/agent-worker
+	BIN_TARGET=/usr/local/bin/assessment-agent
+	UNIT_TARGET=/etc/systemd/system/assessment-agent.service
 
-	CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/assessment-agent"
-	STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/assessment-agent"
-	BIN_TARGET="$HOME/.local/bin/assessment-agent"
-	UNIT_TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/assessment-agent.service"
-
-	if systemctl --user is-active --quiet assessment-agent.service 2>/dev/null; then
-		echo "[uninstall] stopping user service..."
-		systemctl --user stop assessment-agent.service || true
+	if [ "$(id -u)" -ne 0 ]; then
+		echo "[uninstall] systemd host: removing the system service needs root." >&2
+		echo "[uninstall]   Re-run with sudo." >&2
+		exit 1
 	fi
-	if systemctl --user is-enabled --quiet assessment-agent.service 2>/dev/null; then
-		systemctl --user disable assessment-agent.service >/dev/null 2>&1 || true
+
+	if systemctl is-active --quiet assessment-agent.service 2>/dev/null; then
+		echo "[uninstall] stopping service..."
+		systemctl stop assessment-agent.service || true
+	fi
+	if systemctl is-enabled --quiet assessment-agent.service 2>/dev/null; then
+		systemctl disable assessment-agent.service >/dev/null 2>&1 || true
 	fi
 
 	if [ -f "$UNIT_TARGET" ]; then
 		rm -f "$UNIT_TARGET"
 		echo "[uninstall] removed $UNIT_TARGET"
 	fi
-	systemctl --user daemon-reload 2>/dev/null || true
+	systemctl daemon-reload 2>/dev/null || true
 
 	if [ -f "$BIN_TARGET" ]; then
 		rm -f "$BIN_TARGET"
@@ -55,10 +56,6 @@ uninstall_user_systemd() {
 	if [ "${PURGE:-0}" = "1" ]; then
 		rm -rf "$CFG_DIR" "$STATE_DIR"
 		echo "[uninstall] purged $CFG_DIR and $STATE_DIR"
-		# Drop lingering so we leave no trace of a boot-time agent.
-		if command -v loginctl >/dev/null 2>&1; then
-			loginctl disable-linger "$(id -un)" 2>/dev/null || true
-		fi
 	else
 		echo "[uninstall] preserved $CFG_DIR and $STATE_DIR (PURGE=1 to wipe)"
 	fi
@@ -101,13 +98,6 @@ uninstall_sysv_root() {
 	if [ "${PURGE:-0}" = "1" ]; then
 		rm -rf "$CFG_DIR" "$STATE_DIR"
 		echo "[uninstall] purged $CFG_DIR and $STATE_DIR"
-		if id assessment-agent >/dev/null 2>&1; then
-			userdel assessment-agent 2>/dev/null || true
-		fi
-		if getent group assessment-agent >/dev/null 2>&1; then
-			groupdel assessment-agent 2>/dev/null || true
-		fi
-		echo "[uninstall] removed assessment-agent user/group"
 	else
 		echo "[uninstall] preserved $CFG_DIR and $STATE_DIR (PURGE=1 to wipe)"
 	fi
@@ -116,7 +106,7 @@ uninstall_sysv_root() {
 }
 
 if [ "$INIT_SYSTEM" = "systemd" ]; then
-	uninstall_user_systemd
+	uninstall_system_systemd
 else
 	uninstall_sysv_root
 fi

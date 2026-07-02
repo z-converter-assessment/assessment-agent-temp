@@ -10,12 +10,11 @@
 # without this script. It remains useful belt-and-suspenders for the rare
 # identical-MAC clone (virtual-NIC-only hosts) and general image hygiene.
 #
-# USER-LEVEL by design: this runs as the unprivileged agent user. The system
-# hygiene steps below (/etc/machine-id, random-seed, cloud-init cache) require
-# root; each is attempted best-effort and SKIPPED with a note when not
-# writable — never fatal. If you want the full generalize, run the image build
-# as root (image builders normally have root) or use cloud-init's standard
-# image-cleanup.
+# ROOT by design: install runs the agent as root, so run this as root too
+# (image builders normally have root). The system hygiene steps below
+# (/etc/machine-id, random-seed, cloud-init cache) require root; each is
+# attempted best-effort and SKIPPED with a note when not writable — never
+# fatal, so running it unprivileged still clears the agent-id.
 
 set -eu
 
@@ -25,19 +24,15 @@ printf 'Run this once on the GOLDEN TEMPLATE before snapshotting.\n\n'
 am_root=0
 [ "$(id -u)" -eq 0 ] && am_root=1
 
-# --- 1. Stop the agent if running (user service; best-effort).
-uid=$(id -u)
-: "${XDG_RUNTIME_DIR:=/run/user/$uid}"
-export XDG_RUNTIME_DIR
+# --- 1. Stop the agent if running (system service; best-effort).
 if command -v systemctl >/dev/null 2>&1; then
-	if systemctl --user is-active --quiet assessment-agent.service 2>/dev/null; then
-		echo "[image-prep] stopping user assessment-agent.service..."
-		systemctl --user stop assessment-agent.service || true
-	fi
-	# SysV/root install variant.
-	if [ "$am_root" -eq 1 ] && systemctl is-active --quiet assessment-agent.service 2>/dev/null; then
+	if systemctl is-active --quiet assessment-agent.service 2>/dev/null; then
+		echo "[image-prep] stopping assessment-agent.service..."
 		systemctl stop assessment-agent.service || true
 	fi
+elif [ -x /etc/init.d/assessment-agent ]; then
+	# SysV host (pre-systemd).
+	/etc/init.d/assessment-agent stop >/dev/null 2>&1 || true
 fi
 
 # --- 2. Clear /etc/machine-id (root only — best-effort).
@@ -79,13 +74,8 @@ echo "[image-prep] keeping agent.env{,.local} (per-tenant secrets)"
 #        first start. Without this, clones would share one agent_id — a worse
 #        duplicate source than MAC-derived ids. Paired with the agent_id feature.
 : "${WORKER_STATE_DIR:=}"
-: "${XDG_STATE_HOME:=}"
-: "${HOME:=}"
-for d in "$WORKER_STATE_DIR" \
-         "$XDG_STATE_HOME/assessment-agent" \
-         "$HOME/.local/state/assessment-agent" \
-         /var/lib/agent-worker /var/lib/assessment-agent; do
-	case "$d" in ""|"/assessment-agent"|"/.local/state/assessment-agent") continue ;; esac
+for d in "$WORKER_STATE_DIR" /var/lib/agent-worker /var/lib/assessment-agent; do
+	case "$d" in "") continue ;; esac
 	if [ -e "$d/agent-id" ]; then
 		rm -f "$d/agent-id" && echo "[image-prep] removed $d/agent-id"
 	fi

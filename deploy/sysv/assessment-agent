@@ -5,7 +5,8 @@
 # chkconfig: 2345 95 05
 # description: Assessment Agent collects /proc inventory + metrics and \
 #              publishes them to RabbitMQ (AMQPS). Also runs the task.install \
-#              worker. SysV-init variant for pre-systemd hosts (CentOS/RHEL 6).
+#              worker. Runs as root. SysV-init variant for pre-systemd hosts \
+#              (CentOS/RHEL 6).
 # processname: assessment-agent
 # pidfile: /var/run/assessment-agent.pid
 # config: /etc/assessment-agent/agent.env
@@ -22,21 +23,20 @@
 # Short-Description: Assessment Agent (collector + task.install worker)
 # Description:       Collects host inventory/metrics from /proc and /sys and
 #                    publishes to RabbitMQ over AMQPS; consumes task.install
-#                    messages and runs packaged install.sh as a non-privileged
-#                    user. This is the SysV-init unit for pre-systemd hosts
-#                    (CentOS / RHEL / Oracle Linux 6). systemd hosts use
+#                    messages and runs packaged install.sh. Runs as root. This
+#                    is the SysV-init unit for pre-systemd hosts (CentOS / RHEL
+#                    / Oracle Linux 6). systemd hosts use
 #                    deploy/systemd/assessment-agent.service instead.
 ### END INIT INFO
 
 # This script mirrors the intent of deploy/systemd/assessment-agent.service:
-#   - runs /usr/local/bin/assessment-agent as the assessment-agent user
+#   - runs /usr/local/bin/assessment-agent as root
 #   - sources /etc/assessment-agent/agent.env and agent.env.local
 #   - graceful stop: SIGTERM, wait up to STOP_TIMEOUT (worker drain), then
 #     SIGKILL — matching the unit's TimeoutStopSec=15min (=900s) drain budget.
 
 PROG="assessment-agent"
 EXEC="/usr/local/bin/assessment-agent"
-RUNAS="assessment-agent"
 PIDFILE="/var/run/${PROG}.pid"
 LOCKFILE="/var/lock/subsys/${PROG}"
 LOGFILE="/var/log/${PROG}.log"
@@ -93,29 +93,23 @@ start() {
 	printf 'Starting %s: ' "$PROG"
 	load_env
 
-	# /var/log is root-owned, so the unprivileged RUNAS shell cannot create the
-	# log file itself — the `>> $LOGFILE` redirection (run AS that user) would
-	# fail with EACCES and abort start. Create it as root and hand ownership to
-	# RUNAS so the append succeeds on every start.
+	# Create the log file (0640, root) — no journald on SysV hosts.
 	touch "$LOGFILE" 2>/dev/null || true
-	chown "$RUNAS" "$LOGFILE" 2>/dev/null || true
 	chmod 0640 "$LOGFILE" 2>/dev/null || true
 
-	# Launch as the non-privileged RUNAS user, detached, stdout/stderr to the
-	# log file (no journald on SysV hosts). `su -s /bin/sh` overrides the
-	# account's nologin shell. NOTE: NO login dash (`-`) — a login shell resets
-	# the environment, which would discard the RABBITMQ_*/WORKER_* vars that
-	# load_env just exported (incl. the broker password from agent.env.local),
-	# leaving the daemon with an empty password → broker login refused.
-	su -s /bin/sh "$RUNAS" -c "exec $EXEC >> $LOGFILE 2>&1 &" >/dev/null 2>&1
+	# Launch as root, detached, stdout/stderr to the log file. load_env exported
+	# RABBITMQ_*/WORKER_* (incl. the broker password from agent.env.local) into
+	# this shell's environment, which the child inherits directly — no su/login
+	# shell to reset it.
+	"$EXEC" >> "$LOGFILE" 2>&1 &
+	pid=$!
 
-	# su backgrounds inside the subshell, so capture the new pid by name.
-	# Give it a moment to fork+exec, then resolve the pid.
+	# Give it a moment to fork+exec, then confirm it is alive.
 	sleep 1
-	pid=$(pgrep -f "$EXEC" 2>/dev/null | head -n 1)
-	if [ -z "$pid" ]; then
-		# pgrep may be unavailable on a minimal box — fall back to ps.
-		pid=$(ps -eo pid,args 2>/dev/null | awk -v e="$EXEC" '$0 ~ e && $0 !~ /awk/ {print $1; exit}')
+	if ! kill -0 "$pid" >/dev/null 2>&1; then
+		# Fall back to resolving by name (e.g. if the shell reaped a wrapper).
+		pid=$(pgrep -f "$EXEC" 2>/dev/null | head -n 1)
+		[ -z "$pid" ] && pid=$(ps -eo pid,args 2>/dev/null | awk -v e="$EXEC" '$0 ~ e && $0 !~ /awk/ {print $1; exit}')
 	fi
 
 	if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then

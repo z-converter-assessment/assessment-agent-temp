@@ -1,26 +1,23 @@
 #!/bin/sh
 # Assessment Agent (Linux) — installer.
 #
-# Single entry point. Privilege model differs by init system:
+# Single entry point. Root is required and the agent runs AS root by design:
+# the collector reads every process' /proc/<pid>/exe, /proc/<pid>/fd and comm,
+# which is only possible as root. Running unprivileged leaves listen_ports[].pid
+# /comm and services[].exe null for daemons owned by other users (sshd/nginx/
+# mysql/…) — i.e. most of the interesting inventory. So both the install and the
+# 24/7 runtime are root. The layout is the same on both init systems:
+#
+#   /usr/local/bin/assessment-agent
+#   /etc/assessment-agent/agent.env{,.local}
+#   /var/lib/agent-worker/                       (worker state)
 #
 #   - systemd hosts (CentOS/RHEL 7+, Ubuntu, Debian, SLES, Amazon Linux):
-#       USER-LEVEL install. Run as a normal user, NO root/sudo:
-#           ./deploy/install.sh
-#       Everything lands under the invoking user's home:
-#           ~/.local/bin/assessment-agent
-#           ${XDG_CONFIG_HOME:-~/.config}/assessment-agent/agent.env{,.local}
-#           ${XDG_STATE_HOME:-~/.local/state}/assessment-agent/
-#           ${XDG_CONFIG_HOME:-~/.config}/systemd/user/assessment-agent.service
-#       Managed via `systemctl --user`. Boot-without-login needs lingering
-#       (loginctl enable-linger) — attempted best-effort, never fatal.
-#
+#       /etc/systemd/system/assessment-agent.service, managed via `systemctl`
+#       (User=root, WantedBy=multi-user.target — starts at boot).
 #   - SysV hosts (CentOS/RHEL/Oracle Linux 6 — no systemd):
-#       SYSTEM install, requires root ONCE (no user-session supervisor exists
-#       on pre-systemd hosts). Registers /etc/init.d/assessment-agent which
-#       runs the binary as the non-privileged `assessment-agent` user — so the
-#       24/7 runtime is still unprivileged; only the one-time registration
-#       needs root. CentOS 6 needs the LEGACY glibc-2.12 binary
-#       (make release-legacy).
+#       /etc/init.d/assessment-agent, runs the binary as root. CentOS 6 needs
+#       the LEGACY glibc-2.12 binary (make release-legacy).
 #
 # Re-runnable (idempotent). Each step short-circuits when already done.
 #
@@ -30,9 +27,8 @@
 #   SKIP_SHA256=1    skip dist/SHA256SUMS verification (only when intentional).
 #
 # Server-side dependencies (sh + coreutils are guaranteed on every supported
-# OS). systemctl is required ONLY on systemd hosts; useradd/groupadd/chown
-# are required ONLY on the SysV (root) path — both are checked inside their
-# own branch, not up front.
+# OS). systemctl is required ONLY on systemd hosts; chkconfig/update-rc.d ONLY
+# on the SysV path — checked inside their own branch, not up front.
 
 set -eu
 
@@ -128,93 +124,58 @@ require_cmds() {
 }
 
 # ======================================================================
-#  systemd path — USER-LEVEL (no root)
+#  systemd path — SYSTEM install, root (agent runs as root)
 # ======================================================================
-install_user_systemd() {
+install_system_systemd() {
 	require_cmds systemctl install chmod awk grep sed tr mktemp sha256sum
 
-	# `systemctl --user` needs a running user manager reachable over the
-	# user D-Bus. Over a bare SSH exec (no login session) XDG_RUNTIME_DIR is
-	# often unset and the call fails with "Failed to connect to bus". Wire a
-	# sane default so the common high-latency-SSH deploy path works.
-	uid=$(id -u)
-	if [ "$uid" = "0" ]; then
-		echo "[install] running as root on a systemd host — this installer is" >&2
-		echo "[install]   user-level by design. Re-run as the unprivileged user" >&2
-		echo "[install]   that should own the agent (no sudo)." >&2
+	if [ "$(id -u)" -ne 0 ]; then
+		echo "[install] systemd host: installing a system service that runs the" >&2
+		echo "[install]   agent as root needs root. Re-run with sudo." >&2
 		exit 1
 	fi
-	: "${XDG_RUNTIME_DIR:=/run/user/$uid}"
-	export XDG_RUNTIME_DIR
 
-	CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/assessment-agent"
-	STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/assessment-agent"
-	BIN_DIR="$HOME/.local/bin"
-	UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-	BIN_TARGET="$BIN_DIR/assessment-agent"
-	UNIT_TARGET="$UNIT_DIR/assessment-agent.service"
+	CFG_DIR=/etc/assessment-agent
+	STATE_DIR=/var/lib/agent-worker
+	BIN_TARGET=/usr/local/bin/assessment-agent
+	UNIT_TARGET=/etc/systemd/system/assessment-agent.service
 	ENV_FILE="$CFG_DIR/agent.env"
 	ENV_LOCAL="$CFG_DIR/agent.env.local"
 
 	verify_sha256
 
-	# Directories (0700 for config/state — they hold broker secrets + worker
-	# results; 0755 for ~/.local/bin which is conventionally on PATH).
-	install -d -m 0700 "$CFG_DIR" "$STATE_DIR"
-	install -d -m 0755 "$BIN_DIR" "$UNIT_DIR"
+	# Directories. Config 0755 (world-readable dir, secrets are in the 0600
+	# agent.env.local); worker state 0700 root-only.
+	install -d -o root -g root -m 0755 "$CFG_DIR"
+	install -d -o root -g root -m 0700 "$STATE_DIR"
 
 	# Stop a running instance so the binary can be replaced (upgrade path).
-	if systemctl --user is-active --quiet assessment-agent.service 2>/dev/null; then
-		echo "[install] stopping running user service for upgrade..."
-		systemctl --user stop assessment-agent.service || true
+	if systemctl is-active --quiet assessment-agent.service 2>/dev/null; then
+		echo "[install] stopping running service for upgrade..."
+		systemctl stop assessment-agent.service || true
 	fi
 
-	# Binary
-	install -m 0755 "$DIST_BIN" "$BIN_TARGET"
+	install -o root -g root -m 0755 "$DIST_BIN" "$BIN_TARGET"
 	echo "[install] binary     : $BIN_TARGET"
 
-	# User unit — %h/%E/%S specifiers inside the unit resolve to this user's
-	# home / config / state, so no path substitution is needed here.
-	install -m 0644 "$SERVICE_FILE" "$UNIT_TARGET"
+	# System unit — absolute paths inside the unit (/etc, /var/lib), no path
+	# substitution needed here.
+	install -o root -g root -m 0644 "$SERVICE_FILE" "$UNIT_TARGET"
 
-	# env file (seed from example on first run, then env-setup fills empties)
+	# env file (seed from example on first run, then env-setup fills empties).
+	# agent.env.example ships WORKER_STATE_DIR=/var/lib/agent-worker, which is
+	# exactly where the system service writes — no rewrite needed.
 	if [ ! -f "$ENV_FILE" ]; then
-		install -m 0640 "$ENV_EXAMPLE" "$ENV_FILE"
+		install -o root -g root -m 0640 "$ENV_EXAMPLE" "$ENV_FILE"
 		echo "[install] seeded env : $ENV_FILE (from agent.env.example)"
 	fi
 	sh "$SCRIPT_DIR/lib/env-setup.sh" "$ENV_EXAMPLE" "$ENV_FILE" "$ENV_LOCAL"
 
-	# agent.env.example ships WORKER_STATE_DIR=/var/lib/agent-worker — the SysV
-	# system path. A user-level agent cannot write there, so worker_init() fails
-	# and the worker silently stays off (collector-only). Rewrite it to this
-	# user's own writable state dir so the value the installer lays down is
-	# correct on its own, not only when the unit's %S override happens to apply.
-	# (WORKER_TMP_DIR stays /tmp — every user can write there.)
-	tmp_env=$(mktemp)
-	sed "s|^[[:space:]]*WORKER_STATE_DIR=.*|WORKER_STATE_DIR=$STATE_DIR|" "$ENV_FILE" > "$tmp_env"
-	install -m 0640 "$tmp_env" "$ENV_FILE"
-	rm -f "$tmp_env"
-	echo "[install] worker state: $STATE_DIR"
-
-	systemctl --user daemon-reload
-
-	# Boot-without-login: enable lingering. On most distros a user may enable
-	# their own linger without root (polkit org.freedesktop.login1.set-self-
-	# linger defaults to allow); where policy denies it, warn but continue —
-	# the agent still starts on the next interactive login.
-	if command -v loginctl >/dev/null 2>&1; then
-		if loginctl enable-linger "$(id -un)" 2>/dev/null; then
-			echo "[install] lingering enabled — agent will start at boot"
-		else
-			echo "[install] WARNING: could not enable lingering (no root / polkit denied)." >&2
-			echo "[install]   The agent starts on your next login. For boot-without-login," >&2
-			echo "[install]   ask an admin to run: loginctl enable-linger $(id -un)" >&2
-		fi
-	fi
+	systemctl daemon-reload
 
 	# image-prep mode: enable but do not start.
 	if [ "${IMAGE_PREP:-0}" = "1" ]; then
-		systemctl --user enable assessment-agent.service >/dev/null 2>&1 || true
+		systemctl enable assessment-agent.service >/dev/null 2>&1 || true
 		printf '\n'
 		printf '[install] IMAGE_PREP=1 — service enabled but NOT started.\n'
 		printf '[install] before sealing this VM into an image, run:\n'
@@ -223,29 +184,24 @@ install_user_systemd() {
 		exit 0
 	fi
 
-	systemctl --user enable --now assessment-agent.service
+	systemctl enable --now assessment-agent.service
 
 	sleep 5
-	if systemctl --user is-active --quiet assessment-agent.service; then
+	if systemctl is-active --quiet assessment-agent.service; then
 		printf '\n'
-		echo "[install] OK — assessment-agent is active (user service)"
-		echo "[install] logs:       journalctl --user -u assessment-agent -f"
-		echo "[install] stop:       systemctl --user stop assessment-agent"
+		echo "[install] OK — assessment-agent is active (system service, root)"
+		echo "[install] logs:       journalctl -u assessment-agent -f"
+		echo "[install] stop:       systemctl stop assessment-agent"
 		echo "[install] uninstall:  assessment-agent uninstall"
-		case ":$PATH:" in
-			*":$BIN_DIR:"*) : ;;
-			*) echo "[install] NOTE: $BIN_DIR is not on your PATH — add it to run 'assessment-agent' directly" ;;
-		esac
 	else
-		echo "[install] WARNING: user service is not active. Last 30 log lines:" >&2
-		journalctl --user -u assessment-agent.service -n 30 --no-pager 2>/dev/null || true
+		echo "[install] WARNING: service is not active. Last 30 log lines:" >&2
+		journalctl -u assessment-agent.service -n 30 --no-pager 2>/dev/null || true
 		exit 1
 	fi
 }
 
 # ======================================================================
-#  SysV path — SYSTEM install, root required ONCE (runtime stays
-#  unprivileged via the init script's RUNAS=assessment-agent user)
+#  SysV path — SYSTEM install, root (agent runs as root)
 # ======================================================================
 install_sysv_root() {
 	CFG_DIR=/etc/assessment-agent
@@ -254,28 +210,16 @@ install_sysv_root() {
 	ENV_LOCAL="$CFG_DIR/agent.env.local"
 
 	if [ "$(id -u)" -ne 0 ]; then
-		echo "[install] SysV/EL6 host: registering an /etc/init.d service needs" >&2
-		echo "[install]   root ONCE. The agent itself then runs as the" >&2
-		echo "[install]   unprivileged 'assessment-agent' user. Re-run with sudo." >&2
+		echo "[install] SysV/EL6 host: installing an /etc/init.d service that runs" >&2
+		echo "[install]   the agent as root needs root. Re-run with sudo." >&2
 		exit 1
 	fi
 
-	require_cmds sha256sum useradd groupadd id install chmod chown awk grep sed tr getent mktemp
+	require_cmds sha256sum id install chmod awk grep sed tr mktemp
 	verify_sha256
 
-	# User/group (system, non-login) — the init script runs the agent as this.
-	if ! getent group assessment-agent >/dev/null 2>&1; then
-		groupadd --system assessment-agent
-		echo "[install] created group assessment-agent"
-	fi
-	if ! id assessment-agent >/dev/null 2>&1; then
-		useradd --system --gid assessment-agent --home "$STATE_DIR" \
-		        --shell /sbin/nologin assessment-agent
-		echo "[install] created user assessment-agent"
-	fi
-
-	install -d -o root             -g root             -m 0755 "$CFG_DIR"
-	install -d -o assessment-agent -g assessment-agent -m 0700 "$STATE_DIR"
+	install -d -o root -g root -m 0755 "$CFG_DIR"
+	install -d -o root -g root -m 0700 "$STATE_DIR"
 
 	# Stop running service (upgrade path).
 	if [ -x "$SYSV_TARGET" ] && "$SYSV_TARGET" status >/dev/null 2>&1; then
@@ -294,7 +238,7 @@ install_sysv_root() {
 	echo "[install] init script: $SYSV_TARGET"
 
 	if [ ! -f "$ENV_FILE" ]; then
-		install -o root -g assessment-agent -m 0640 "$ENV_EXAMPLE" "$ENV_FILE"
+		install -o root -g root -m 0640 "$ENV_EXAMPLE" "$ENV_FILE"
 		echo "[install] seeded env : $ENV_FILE (from agent.env.example)"
 	fi
 	sh "$SCRIPT_DIR/lib/env-setup.sh" "$ENV_EXAMPLE" "$ENV_FILE" "$ENV_LOCAL"
@@ -343,7 +287,7 @@ install_sysv_root() {
 
 # --- 6. Dispatch
 if [ "$INIT_SYSTEM" = "systemd" ]; then
-	install_user_systemd
+	install_system_systemd
 else
 	install_sysv_root
 fi

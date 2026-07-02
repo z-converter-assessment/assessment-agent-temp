@@ -1,40 +1,32 @@
 [Unit]
 Description=Assessment Agent — collector + worker (task.install)
-# USER unit (systemctl --user). Installed under
-#   ${XDG_CONFIG_HOME:-~/.config}/systemd/user/assessment-agent.service
-# and run as the invoking unprivileged user — no root, no system service.
-# network-online.target is intentionally omitted: it is not reliably started
-# in the per-user manager, and the agent already retries the broker
-# connection, so network startup ordering is unnecessary.
+# SYSTEM unit (systemctl, root). Installed under
+#   /etc/systemd/system/assessment-agent.service
+# and run as root so the collector can read every process' /proc/<pid>/exe,
+# /proc/<pid>/fd and comm — otherwise listen_ports[].pid/comm and services[].exe
+# for daemons owned by other users (sshd/nginx/mysql/…) come back null.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
 
-# No User=/Group= — the per-user systemd manager already runs this as the
-# owning user. The whole point of the user-level model is that the vendor
-# agent never holds root.
-
-# State lives under the user's state dir (%S = $XDG_STATE_HOME, e.g.
-# ~/.local/state). StateDirectory= creates it 0700 and marks it writable.
-StateDirectory=assessment-agent
+# State under /var/lib (system). StateDirectory= creates /var/lib/agent-worker
+# 0700 — this matches WORKER_STATE_DIR in agent.env.example so the worker writes
+# where the unit provisions. RuntimeDirectory= creates /run/assessment-agent.
+StateDirectory=agent-worker
 StateDirectoryMode=0700
 RuntimeDirectory=assessment-agent
 RuntimeDirectoryMode=0700
-WorkingDirectory=%S/assessment-agent
+WorkingDirectory=/var/lib/agent-worker
 
-# Environment — point at the per-user config (%E = $XDG_CONFIG_HOME). Both
-# files are optional (leading '-'); secrets live in agent.env.local.
-EnvironmentFile=-%E/assessment-agent/agent.env
-EnvironmentFile=-%E/assessment-agent/agent.env.local
+# Environment — system config under /etc. Both files are optional (leading '-');
+# secrets live in agent.env.local.
+EnvironmentFile=-/etc/assessment-agent/agent.env
+EnvironmentFile=-/etc/assessment-agent/agent.env.local
 
-# Force the worker paths into the user's tree. These come AFTER the
-# EnvironmentFile lines so they override the system-oriented defaults the
-# shipped agent.env.example carries (/var/lib/agent-worker, used only by the
-# SysV system install) — a user-level agent cannot write there.
-Environment=WORKER_STATE_DIR=%S/assessment-agent
-Environment=WORKER_TMP_DIR=%T
-
-ExecStart=%h/.local/bin/assessment-agent
+ExecStart=/usr/local/bin/assessment-agent
 
 # C5: drain in-flight install on SIGTERM. install.timeout_sec is normally
 # <= 600s, so 15 min covers the maximum drain plus result publish + ack.
@@ -48,27 +40,17 @@ RestartSec=10s
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
-# Hardening — ONLY directives a per-user systemd manager can apply without
-# privilege. Primary containment is already that the process runs unprivileged;
-# install.sh children are sandboxed separately in exec.c (clearenv + setrlimit
-# + setsid).
-#
-# Deliberately NOT set (the user manager cannot enforce them → the unit would
-# fail to start with "Operation not permitted" / boolean parse errors):
-#   CapabilityBoundingSet=, PrivateDevices, ProtectKernelTunables/Modules/Logs,
-#   ProtectControlGroups, ProtectSystem, ProtectHome.
-# No inline '#' comments on directive lines — systemd folds them into the value.
-NoNewPrivileges=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-RestrictNamespaces=yes
-SystemCallArchitectures=native
+# NOTE: sandbox hardening (ProtectProc, ProtectSystem, PrivateDevices,
+# ProtectKernelTunables, RestrictNamespaces, …) is deliberately NOT set. The
+# agent's whole job is to read other processes' /proc entries and host /sys —
+# those directives would hide exactly the data the collector must gather. The
+# agent runs as root by design; containment is out of scope for this unit.
+NoNewPrivileges=no
 
-# Logging — stderr captured by the user journal (journalctl --user).
+# Logging — stderr captured by the system journal (journalctl -u).
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=assessment-agent
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
