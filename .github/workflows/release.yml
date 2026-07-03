@@ -30,6 +30,13 @@ jobs:
       - name: build (musl fully-static)
         # payload agent_version = 릴리즈 태그(v1.0.0 -> 1.0.0). 별도 스키마 버전 안 매김.
         run: AGENT_VERSION="${GITHUB_REF_NAME#v}" sh scripts/build-linux.sh
+      - name: wire 계약 conformance (native)
+        # musl static 은 러너에서 바로 돈다. emit dry-run 출력을 wire 스키마로 강제 —
+        # Linux 트리가 계약을 어기면 릴리즈 전에 실패시킨다. 비root 라 일부 pid/exe 는
+        # null 이지만 검증 대상은 구조(필드/타입/null)라 무관하다.
+        run: |
+          python3 -m pip install --quiet 'jsonschema>=4.18'
+          bash scripts/check-contract.sh dist/assessment-agent-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: linux
@@ -65,10 +72,32 @@ jobs:
           path: windows-agent/dist/*.exe
           if-no-files-found: error
 
+  # Windows wire 계약 conformance — 실제 Windows 러너(windows-latest)에서 exe 를 WoW64 로
+  # 직접 실행한다. NT5.2 타깃 i686 이라 하위호환으로 최신 Windows 에서 구동된다. emit dry-run
+  # 출력을 리눅스와 동일한 wire 스키마로 강제해, 윈도우 트리가 계약을 어기면 릴리즈를 막는다.
+  # (wine 대신 실기 러너 — 에뮬레이션 불확실성 없음.)
+  contract-windows:
+    name: Windows contract conformance
+    needs: build-windows
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: win
+          path: dist
+      - name: wire 계약 conformance (native WoW64)
+        shell: bash
+        run: |
+          python -m pip install --quiet 'jsonschema>=4.18'
+          bash scripts/check-contract.sh dist/assessment-agent-windows-x86.exe
+
   # 성공한 산출물을 모아 통합 SHA256SUMS 생성 후 태그 릴리즈에 upsert 게시.
   # 2종(linux-x86_64, windows-x86) 모두 required — 없으면 릴리즈 실패.
+  # 양 트리 contract conformance(build-linux 인라인 + contract-windows) 통과가 릴리즈 전제.
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, contract-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

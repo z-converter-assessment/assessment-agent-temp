@@ -1,7 +1,15 @@
 # payload 계약 (에이전트 -> 엔진)
 
-에이전트가 RabbitMQ 브로커로 발행하는 wire 계약. 2종 바이너리 모두 동일 스키마다.
-Linux/Windows 차이는 아래 "OS별 차이"에만 있다.
+에이전트가 RabbitMQ 브로커로 발행하는 wire 계약. 이 문서는 산문 설명이고,
+기계검증 가능한 정본(source of truth)은 `schema/wire.schema.json`(JSON Schema)이다.
+CI가 두 바이너리의 `emit` dry-run 출력을 이 스키마로 강제해(`scripts/check-contract.sh`),
+리눅스-윈도우 트리 간 드리프트와 자기계약 위반을 릴리즈 전에 잡는다. 로컬 검증:
+`scripts/check-contract.sh dist/assessment-agent-linux-x86_64` /
+`... dist/assessment-agent-windows-x86.exe wine`.
+
+공통 스키마이되, 아래 "OS별 차이"에 명시된 분기(예: metrics.saturation은 Windows 전용)는
+`os_family`로 갈리며 스키마의 조건부(if/then)로 강제된다. 값 의미론(값=실측, null=측정불가)도
+스키마가 nullable 여부로 인코딩한다.
 
 ## 메시지 종류와 라우팅 키
 
@@ -114,6 +122,9 @@ task_id로 매칭하므로 식별 큐와 무관하다.
   perflib PhysicalDisk 디스크 카운터는 diskperf 성능 통계에 의존해 환경별로 죽거나(예: 2012R2+virtio raw=0)
   부팅 후 리셋(비단조)이라 1차 소스로 부적합 -> NtQuery 불가 시에만 perflib per-disk(PhysicalDriveN)로 폴백.
   전역 집계 특성상 파일 I/O(네트워크 리다이렉터 등)를 포함하며 물리 디스크별 분해는 하지 않는다.
+- saturation은 Windows metrics 전용이다. Linux는 이 객체를 싣지 않고 loadavg·cpu_stat.iowait로
+  포화를 표현하며, 엔진이 os_family로 정규화한다(load<->cpu_run_queue, iowait<->disk_queue). 스키마는
+  os_family=windows일 때만 saturation을 요구하고 linux일 때는 금지한다.
 - Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}`.
   disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN)로 IOCTL_DISK_PERFORMANCE의
   QueueDepth를 실측한다. diskperf 미부착(OpenStack virtio 등)이면 IOCTL이 ERROR_INVALID_FUNCTION이라 측정

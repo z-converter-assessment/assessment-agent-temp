@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://z-converter-assessment/agent/wire.schema.json",
+  "title": "assessment-agent wire payload contract",
+  "description": "에이전트(Linux musl / Windows i686) -> 엔진 RabbitMQ 발행 계약의 단일 진실. 2종 바이너리와 엔진이 모두 이 스키마에 conform 해야 한다. 산문 설명은 docs/payload-contract.md. 값 의미론: 값(0 포함)=실측, null=측정불가. additionalProperties:false 로 미선언 필드(오타/드리프트)를 거부한다.",
+
+  "oneOf": [
+    { "$ref": "#/$defs/inventory" },
+    { "$ref": "#/$defs/metrics" }
+  ],
+
+  "$defs": {
+    "iso8601": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "os_family": { "enum": ["linux", "windows"] },
+    "disk_kind": { "enum": ["physical", "partition", "lvm", "raid", "virtual"] },
+    "iface_kind": {
+      "enum": ["physical", "loopback", "bridge", "veth",
+               "bond_master", "bond_member", "vlan", "tunnel", "virtual"]
+    },
+    "mount_kind": { "enum": ["data", "virtual_fs", "boot", "image"] },
+    "proto": { "enum": ["tcp", "tcp6", "udp", "udp6"] },
+    "int_or_null": { "type": ["integer", "null"] },
+    "num_or_null": { "type": ["number", "null"] },
+    "str_or_null": { "type": ["string", "null"] },
+
+    "common_metadata": {
+      "type": "object",
+      "properties": {
+        "message_type": { "enum": ["inventory", "metrics", "error", "task.result"] },
+        "message_id":   { "type": "string", "minLength": 1 },
+        "hostname":     { "type": "string" },
+        "machine_id":   { "$ref": "#/$defs/str_or_null" },
+        "composite_id": { "type": "string" },
+        "agent_id":     { "type": "string", "minLength": 1 },
+        "agent_version":{ "type": "string", "minLength": 1 },
+        "boot_time":       { "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
+        "collected_at":    { "$ref": "#/$defs/iso8601" },
+        "agent_started_at":{ "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
+        "os_family":    { "$ref": "#/$defs/os_family" }
+      },
+      "required": ["message_type", "message_id", "hostname", "machine_id",
+                   "composite_id", "agent_id", "agent_version",
+                   "boot_time", "collected_at", "agent_started_at", "os_family"]
+    },
+
+    "interface": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name":    { "type": "string" },
+        "address": { "type": "string", "minLength": 1 },
+        "prefix":  { "type": ["integer", "null"], "minimum": 0, "maximum": 128 },
+        "family":  { "enum": ["ipv4", "ipv6"] },
+        "kind":    { "$ref": "#/$defs/iface_kind" },
+        "gateway": { "$ref": "#/$defs/str_or_null" }
+      },
+      "required": ["name", "address", "prefix", "family", "kind", "gateway"]
+    },
+
+    "disk": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name":       { "type": "string", "minLength": 1 },
+        "kind":       { "$ref": "#/$defs/disk_kind" },
+        "major":      { "$ref": "#/$defs/int_or_null" },
+        "minor":      { "$ref": "#/$defs/int_or_null" },
+        "size_bytes": { "$ref": "#/$defs/int_or_null" },
+        "type":       { "$ref": "#/$defs/str_or_null" }
+      },
+      "required": ["name", "kind", "major", "minor", "size_bytes", "type"]
+    },
+
+    "mount_struct": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mount":       { "type": "string", "minLength": 1 },
+        "kind":        { "$ref": "#/$defs/mount_kind" },
+        "fstype":      { "type": "string" },
+        "major":       { "$ref": "#/$defs/int_or_null" },
+        "minor":       { "$ref": "#/$defs/int_or_null" },
+        "total_bytes": { "$ref": "#/$defs/int_or_null" }
+      },
+      "required": ["mount", "kind", "fstype", "major", "minor", "total_bytes"]
+    },
+
+    "mount_usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mount":       { "type": "string", "minLength": 1 },
+        "kind":        { "$ref": "#/$defs/mount_kind" },
+        "fstype":      { "type": "string" },
+        "total_bytes": { "$ref": "#/$defs/int_or_null" },
+        "free_bytes":  { "$ref": "#/$defs/int_or_null" },
+        "avail_bytes": { "$ref": "#/$defs/int_or_null" }
+      },
+      "required": ["mount", "kind", "fstype", "total_bytes", "free_bytes", "avail_bytes"]
+    },
+
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unit": { "type": "string", "minLength": 1 },
+        "sub":  { "type": "string" },
+        "pid":  { "$ref": "#/$defs/int_or_null" },
+        "exe":  { "$ref": "#/$defs/str_or_null" }
+      },
+      "required": ["unit", "sub", "pid", "exe"]
+    },
+
+    "listen_port": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "proto": { "$ref": "#/$defs/proto" },
+        "addr":  { "type": "string" },
+        "port":  { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "uid":   { "$ref": "#/$defs/int_or_null" },
+        "pid":   { "$ref": "#/$defs/int_or_null" },
+        "comm":  { "$ref": "#/$defs/str_or_null" }
+      },
+      "required": ["proto", "addr", "port", "uid", "pid", "comm"]
+    },
+
+    "cpu_stat": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "user":    { "$ref": "#/$defs/int_or_null" },
+        "nice":    { "$ref": "#/$defs/int_or_null" },
+        "system":  { "$ref": "#/$defs/int_or_null" },
+        "idle":    { "$ref": "#/$defs/int_or_null" },
+        "iowait":  { "$ref": "#/$defs/int_or_null" },
+        "irq":     { "$ref": "#/$defs/int_or_null" },
+        "softirq": { "$ref": "#/$defs/int_or_null" },
+        "steal":   { "$ref": "#/$defs/int_or_null" }
+      },
+      "required": ["user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"]
+    },
+
+    "disk_queue_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": { "type": "string", "minLength": 1 },
+        "queue":  { "type": "integer", "minimum": 0 }
+      },
+      "required": ["device", "queue"]
+    },
+
+    "saturation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "disk_queue":     { "type": "array", "items": { "$ref": "#/$defs/disk_queue_entry" } },
+        "cpu_run_queue":  { "$ref": "#/$defs/int_or_null" },
+        "mem_paging_rate":{ "$ref": "#/$defs/int_or_null" }
+      },
+      "required": ["disk_queue", "cpu_run_queue", "mem_paging_rate"]
+    },
+
+    "disk_io": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device":          { "type": "string", "minLength": 1 },
+        "kind":            { "$ref": "#/$defs/disk_kind" },
+        "major":           { "$ref": "#/$defs/int_or_null" },
+        "minor":           { "$ref": "#/$defs/int_or_null" },
+        "reads_completed": { "$ref": "#/$defs/int_or_null" },
+        "writes_completed":{ "$ref": "#/$defs/int_or_null" },
+        "sectors_read":    { "$ref": "#/$defs/int_or_null" },
+        "sectors_written": { "$ref": "#/$defs/int_or_null" }
+      },
+      "required": ["device", "kind", "major", "minor",
+                   "reads_completed", "writes_completed", "sectors_read", "sectors_written"]
+    },
+
+    "net_io": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interface":  { "type": "string", "minLength": 1 },
+        "kind":       { "$ref": "#/$defs/iface_kind" },
+        "rx_bytes":   { "$ref": "#/$defs/int_or_null" },
+        "tx_bytes":   { "$ref": "#/$defs/int_or_null" },
+        "rx_packets": { "$ref": "#/$defs/int_or_null" },
+        "tx_packets": { "$ref": "#/$defs/int_or_null" },
+        "rx_errors":  { "$ref": "#/$defs/int_or_null" },
+        "tx_errors":  { "$ref": "#/$defs/int_or_null" }
+      },
+      "required": ["interface", "kind", "rx_bytes", "tx_bytes",
+                   "rx_packets", "tx_packets", "rx_errors", "tx_errors"]
+    },
+
+    "inventory": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "allOf": [ { "$ref": "#/$defs/common_metadata" } ],
+      "properties": {
+        "message_type": { "const": "inventory" },
+        "os_id":         { "$ref": "#/$defs/str_or_null" },
+        "os_version":    { "$ref": "#/$defs/str_or_null" },
+        "os_codename":   { "$ref": "#/$defs/str_or_null" },
+        "kernel_version":{ "$ref": "#/$defs/str_or_null" },
+        "cpu_cores":     { "$ref": "#/$defs/int_or_null" },
+        "cpu_model":     { "$ref": "#/$defs/str_or_null" },
+        "mem_total_kb":  { "$ref": "#/$defs/int_or_null" },
+        "swap_total_kb": { "$ref": "#/$defs/int_or_null" },
+        "ip_external":   { "type": ["array", "null"], "items": { "type": "string" } },
+        "interfaces":    { "type": "array", "items": { "$ref": "#/$defs/interface" } },
+        "mac_addresses": { "type": "array", "items": { "type": "string" } },
+        "disks":         { "type": "array", "items": { "$ref": "#/$defs/disk" } },
+        "mounts":        { "type": "array", "items": { "$ref": "#/$defs/mount_struct" } },
+        "services":      { "type": "array", "items": { "$ref": "#/$defs/service" } },
+        "listen_ports":  { "type": "array", "items": { "$ref": "#/$defs/listen_port" } }
+      },
+      "required": ["os_id", "os_version", "os_codename", "kernel_version",
+                   "cpu_cores", "cpu_model", "mem_total_kb", "swap_total_kb",
+                   "ip_external", "interfaces", "mac_addresses",
+                   "disks", "mounts", "services", "listen_ports"]
+    },
+
+    "metrics": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/common_metadata" },
+        {
+          "$comment": "saturation 은 Windows 전용 실측 객체다. Linux 는 load/cpu_stat.iowait 를 쓰고 saturation 을 싣지 않는다(엔진이 os_family 로 정규화). 이 조건부가 그 분기를 계약으로 강제한다.",
+          "if":   { "properties": { "os_family": { "const": "windows" } } },
+          "then": { "required": ["saturation"] },
+          "else": { "not": { "required": ["saturation"] } }
+        }
+      ],
+      "properties": {
+        "message_type": { "const": "metrics" },
+        "collection_interval_sec": { "type": "integer", "minimum": 0 },
+        "load_1m":  { "$ref": "#/$defs/num_or_null" },
+        "load_5m":  { "$ref": "#/$defs/num_or_null" },
+        "load_15m": { "$ref": "#/$defs/num_or_null" },
+        "cpu_stat":         { "$ref": "#/$defs/cpu_stat" },
+        "mem_total_kb":     { "$ref": "#/$defs/int_or_null" },
+        "mem_free_kb":      { "$ref": "#/$defs/int_or_null" },
+        "mem_available_kb": { "$ref": "#/$defs/int_or_null" },
+        "mem_buffers_kb":   { "$ref": "#/$defs/int_or_null" },
+        "mem_cached_kb":    { "$ref": "#/$defs/int_or_null" },
+        "swap_total_kb":    { "$ref": "#/$defs/int_or_null" },
+        "swap_free_kb":     { "$ref": "#/$defs/int_or_null" },
+        "disk_io": { "type": "array", "items": { "$ref": "#/$defs/disk_io" } },
+        "net_io":  { "type": "array", "items": { "$ref": "#/$defs/net_io" } },
+        "mounts":  { "type": "array", "items": { "$ref": "#/$defs/mount_usage" } },
+        "saturation": { "$ref": "#/$defs/saturation" }
+      },
+      "required": ["collection_interval_sec", "load_1m", "load_5m", "load_15m",
+                   "cpu_stat", "mem_total_kb", "mem_free_kb", "mem_available_kb",
+                   "mem_buffers_kb", "mem_cached_kb", "swap_total_kb", "swap_free_kb",
+                   "disk_io", "net_io", "mounts"]
+    }
+  }
+}

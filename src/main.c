@@ -184,6 +184,35 @@ static void print_usage(void)
 	    "  (no args)                run the collector + worker (used by systemd)\n");
 }
 
+/* dry-run: 한 페이로드를 수집해 stdout 으로 pretty-print 하고 종료한다(발행/MQ/TLS 없음).
+ * wire 계약 conformance(schema/wire.schema.json) 검증의 입력원 — 실제 직렬화 코드를 태워
+ * 필드/타입/null 의미론이 스키마와 일치하는지 CI 가 두 바이너리 모두에 강제한다. */
+static int emit_payload(const char *which)
+{
+	load_env_file(".env");
+	char *machine_id = resolve_machine_id();
+	if (!machine_id) machine_id = strdup("");
+	if (!machine_id) return 2;
+	cJSON *p = NULL;
+	if (strcmp(which, "inventory") == 0)
+		p = collect_inventory_payload(machine_id, AGENT_VERSION);
+	else if (strcmp(which, "metrics") == 0)
+		p = collect_metrics_payload(machine_id, AGENT_VERSION);
+	else {
+		fprintf(stderr, "[agent] emit: expected 'inventory' or 'metrics', got '%s'\n", which);
+		free(machine_id);
+		return 2;
+	}
+	free(machine_id);
+	if (!p) { fprintf(stderr, "[agent] emit: collect returned null\n"); return 1; }
+	char *s = cJSON_Print(p);
+	cJSON_Delete(p);
+	if (!s) return 1;
+	printf("%s\n", s);
+	free(s);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc >= 2) {
@@ -200,6 +229,8 @@ int main(int argc, char **argv)
 			return installer_run_uninstall(flag);
 		if (strcmp(cmd, "prep-image") == 0)
 			return installer_run_prep_image();
+		if (strcmp(cmd, "emit") == 0)
+			return emit_payload(argc >= 3 ? argv[2] : "");
 		if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
 			print_usage();
 			return 0;

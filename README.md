@@ -1,6 +1,6 @@
 # assessment-agent-temp
 
-Assessment 수집 에이전트(C)의 릴리즈 빌드 전용 트리. 단일 소스에서 OS별 2종 바이너리를 산출한다(Linux 1종 + Windows 1종). 전송 wire 스키마는 2종 동일하다.
+Assessment 수집 에이전트(C)의 릴리즈 빌드 전용 트리. 단일 소스에서 OS별 2종 바이너리를 산출한다(Linux 1종 + Windows 1종). 두 바이너리는 하나의 wire 계약을 공유하고(OS별 차이는 명시적), CI가 두 산출물의 발행 출력을 계약 스키마로 강제한다.
 
 ## 릴리즈 산출물 (2종)
 
