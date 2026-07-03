@@ -751,6 +751,13 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	int rc = publish_conn_get(ctx->conn, ctx->cfg.queue_name,
 	                          &body, &blen, &tag);
 	if (rc == 1) return 0;
+	if (rc == 2) {
+		/* task 큐가 아직 없음(engine 이 첫 task 때 생성) — 정상 대기 상태다. 404 가 채널을
+		 * 닫았으니 채널만 조용히 재오픈하고, 실패하면 전체 reconnect 로 폴백한다. 경고 없음. */
+		if (publish_conn_recover_channel(ctx->conn) != 0)
+			ctx->conn_dead = 1;
+		return 0;
+	}
 	if (rc < 0)  return -1;
 
 	cJSON *task = cJSON_Parse(body);
@@ -878,7 +885,7 @@ static int reconnect_if_dead(worker_ctx_t *ctx)
 		if (next < 1) next = 1;
 		if (next > WORKER_RECONNECT_BACKOFF_MAX) next = WORKER_RECONNECT_BACKOFF_MAX;
 		ctx->reconnect_backoff_sec = next;
-		fprintf(stderr, "[worker] reconnect failed — next attempt in ≥%ds\n", next);
+		fprintf(stderr, "[worker] reconnect failed — next attempt in >=%ds\n", next);
 		return -1;
 	}
 	ctx->conn_dead = 0;

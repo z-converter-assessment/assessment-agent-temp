@@ -215,7 +215,10 @@ static void os_display_version(char *out, size_t out_sz)
 	RegCloseKey(hKey);
 }
 
-static char *build_result_json(const worker_ctx_t *ctx,
+/* task.result 페이로드 구성의 단일 소스. task 처리 경로(build_result_json 래퍼, ctx 보유)와
+ * install 스레드(install_thread_arg_t 보유)가 모두 이걸 호출해, 정상 완료 result 와 synth/복구
+ * result 의 필드 셋이 갈리는 드리프트를 막는다. machine_id/agent_version 만 호출자별로 다르다. */
+static char *build_result_json_raw(const char *machine_id, const char *agent_version,
                                const char *task_id,
                                const char *status,
                                const char *failure_reason,
@@ -227,7 +230,7 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	cJSON *root = cJSON_CreateObject();
 	if (!root) return NULL;
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
-	cJSON_AddStringToObject(root, "machine_id",       ctx->cfg.machine_id ? ctx->cfg.machine_id : "");
+	cJSON_AddStringToObject(root, "machine_id",       machine_id ? machine_id : "");
 	cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
 	cJSON_AddStringToObject(root, "os_family",        "windows");
 	cJSON_AddStringToObject(root, "os_id",            "windows");
@@ -237,7 +240,7 @@ static char *build_result_json(const worker_ctx_t *ctx,
 		cJSON_AddStringToObject(root, "os_version", os_build_b);
 	else
 		cJSON_AddNullToObject  (root, "os_version");
-	cJSON_AddStringToObject(root, "agent_version",    ctx->cfg.agent_version ? ctx->cfg.agent_version : AGENT_VERSION);
+	cJSON_AddStringToObject(root, "agent_version",    agent_version ? agent_version : AGENT_VERSION);
 	cJSON_AddStringToObject(root, "collected_at",     iso8601_now());
 
 	char hostname[256] = "unknown";
@@ -271,6 +274,22 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	char *s = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
 	return s;
+}
+
+/* ctx 편의 래퍼 — task 처리 경로(child_run_task 등)가 쓴다. 필드 구성은 _raw 단일 소스. */
+static char *build_result_json(const worker_ctx_t *ctx,
+                               const char *task_id,
+                               const char *status,
+                               const char *failure_reason,
+                               int has_exit_code, int exit_code,
+                               long duration_ms,
+                               const char *stdout_tail,
+                               const char *stderr_tail)
+{
+	return build_result_json_raw(ctx->cfg.machine_id, ctx->cfg.agent_version,
+	                             task_id, status, failure_reason,
+	                             has_exit_code, exit_code, duration_ms,
+	                             stdout_tail, stderr_tail);
 }
 
 static int replay_filename_to_task_id(const char *fname, char *out, size_t out_sz)
@@ -517,56 +536,13 @@ static unsigned __stdcall install_thread_main(void *arg)
 	int has_exit = (ds == DOWNLOAD_OK && xs != EXEC_ERR_SCRIPT_NOT_FOUND &&
 	                xs != EXEC_ERR_SCRIPT_TIMEOUT && xs != EXEC_ERR_INTERNAL);
 
-	cJSON *root = cJSON_CreateObject();
-	if (root) {
-		cJSON_AddStringToObject(root, "message_type",     "task.result");
-		cJSON_AddStringToObject(root, "machine_id",       a->machine_id ? a->machine_id : "");
-		cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
-		cJSON_AddStringToObject(root, "os_family",        "windows");
-		cJSON_AddStringToObject(root, "os_id",            "windows");
-		char os_build_b[32];
-		os_display_version(os_build_b, sizeof os_build_b);
-		if (os_build_b[0])
-			cJSON_AddStringToObject(root, "os_version", os_build_b);
-		else
-			cJSON_AddNullToObject  (root, "os_version");
-		cJSON_AddStringToObject(root, "agent_version",    a->agent_version ? a->agent_version : AGENT_VERSION);
-		cJSON_AddStringToObject(root, "collected_at",     iso8601_now());
-
-		char hostname[256] = "unknown";
-		DWORD sz = (DWORD)sizeof hostname;
-		GetComputerNameA(hostname, &sz);
-		cJSON_AddStringToObject(root, "hostname", hostname);
-
-		char msg_id[64];
-		uuid_v4(msg_id, sizeof msg_id);
-		cJSON_AddStringToObject(root, "message_id",       msg_id);
-		cJSON_AddNullToObject  (root, "boot_time");
-		cJSON_AddNullToObject  (root, "agent_started_at");
-
-		cJSON_AddStringToObject(root, "task_id",          a->task_id ? a->task_id : "");
-		cJSON_AddStringToObject(root, "status",           success ? "success" : "failure");
-		if (success)
-			cJSON_AddNullToObject(root, "failure_reason");
-		else
-			cJSON_AddStringToObject(root, "failure_reason", reason);
-
-		if (has_exit)
-			cJSON_AddNumberToObject(root, "exit_code", er.exit_code);
-		else
-			cJSON_AddNullToObject  (root, "exit_code");
-
-		cJSON_AddNumberToObject(root, "duration_ms", duration_ms);
-		cJSON_AddStringToObject(root, "stdout_tail", er.stdout_tail);
-		cJSON_AddStringToObject(root, "stderr_tail", er.stderr_tail);
-		cJSON_AddStringToObject(root, "completed_at", iso8601_now());
-
-		char *json = cJSON_PrintUnformatted(root);
-		if (json) {
-			write_file_atomic(a->result_path, json);
-			free(json);
-		}
-		cJSON_Delete(root);
+	char *json = build_result_json_raw(a->machine_id, a->agent_version,
+	                                   a->task_id, success ? "success" : "failure",
+	                                   reason, has_exit, er.exit_code, duration_ms,
+	                                   er.stdout_tail, er.stderr_tail);
+	if (json) {
+		write_file_atomic(a->result_path, json);
+		free(json);
 	}
 
 	rmrf_recursive(a->work_dir);
@@ -925,6 +901,13 @@ int worker_tick(worker_ctx_t *ctx)
 	uint64_t tag = 0;
 	int gr = publish_conn_get(ctx->conn, ctx->cfg.queue_name, &body, &body_len, &tag);
 	if (gr == 1) return 0;
+	if (gr == 2) {
+		/* task 큐가 아직 없음(engine 이 첫 task 때 생성) — 정상 대기. 404 가 채널을 닫았으니
+		 * 채널만 조용히 재오픈하고, 실패하면 전체 reconnect 로 폴백한다. 경고 없음. */
+		if (publish_conn_recover_channel(ctx->conn) != 0)
+			ctx->conn_dead = 1;
+		return 0;
+	}
 	if (gr < 0) { ctx->conn_dead = 1; return 0; }
 
 	cJSON *task = cJSON_ParseWithLength(body, body_len);
@@ -951,6 +934,16 @@ int worker_tick(worker_ctx_t *ctx)
 					res, strlen(res));
 				free(res);
 			}
+			publish_conn_ack(ctx->conn, tag);
+			cJSON_Delete(task);
+			return 0;
+		}
+
+		/* /running 마커가 있으면 이미 in-flight 인 task 의 redelivery다 — 이중 실행을 막고
+		 * ack 후 drop 한다(Linux try_pick_new_task 와 동일 가드). 정상 신규 task 는 마커가
+		 * 없어 그대로 진행한다. */
+		if (running_marker_present(ctx, tid)) {
+			fprintf(stderr, "[worker] task %s already in-flight — redelivery dropped\n", tid);
 			publish_conn_ack(ctx->conn, tag);
 			cJSON_Delete(task);
 			return 0;

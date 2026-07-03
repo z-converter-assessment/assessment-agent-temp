@@ -45,6 +45,8 @@ int publish_conn_get(publish_conn_t *c,
                      uint64_t   *out_delivery_tag);
 
 int publish_conn_ack(publish_conn_t *c, uint64_t delivery_tag);
+/* 채널 레벨 예외(task 큐 404 등) 후 채널만 재오픈해 연결을 살린다. 0=복구, -1=실패(전체 reconnect 폴백). */
+int publish_conn_recover_channel(publish_conn_t *c);
 int publish_conn_pump(publish_conn_t *c);
 
 #endif

@@ -73,12 +73,14 @@ static int wait_confirm(amqp_connection_state_t conn)
 	}
 }
 
-int publish_message(const publish_config_t *cfg,
-                    const char *routing_key,
-                    const char *body,
-                    size_t body_len)
+/* AMQP 연결 + (TLS)소켓 + open + login + 채널 1 open + confirm.select.
+ * oneshot 발행(publish_message)과 worker 상시 연결(open_amqp_connection)이 이 하나를 공유해
+ * TLS verify/cacert/cert 설정이 두 경로에서 동일함을 보장한다 — 한쪽에만 하드닝 옵션을 더해
+ * 보안 스탠스가 갈리는 드리프트를 막는다. who 는 로그 접두사. 성공 시 *out_conn, 실패 시 -1. */
+static int amqp_connect_open(const publish_config_t *cfg, const char *who,
+                            amqp_connection_state_t *out_conn)
 {
-	int rc = -1;
+	char ctx[64];
 	amqp_connection_state_t conn = amqp_new_connection();
 	if (!conn) {
 		fprintf(stderr, "[publish] amqp_new_connection failed\n");
@@ -90,36 +92,34 @@ int publish_message(const publish_config_t *cfg,
 		socket = amqp_ssl_socket_new(conn);
 		if (!socket) {
 			fprintf(stderr, "[publish] amqp_ssl_socket_new failed\n");
-			goto out_destroy;
+			goto fail;
 		}
-		if (cfg->tls_ca_path && *cfg->tls_ca_path) {
-			if (amqp_ssl_socket_set_cacert(socket, cfg->tls_ca_path) != AMQP_STATUS_OK) {
-				fprintf(stderr, "[publish] set_cacert(%s) failed\n", cfg->tls_ca_path);
-				goto out_destroy;
-			}
+		if (cfg->tls_ca_path && *cfg->tls_ca_path &&
+		    amqp_ssl_socket_set_cacert(socket, cfg->tls_ca_path) != AMQP_STATUS_OK) {
+			fprintf(stderr, "[publish] set_cacert(%s) failed\n", cfg->tls_ca_path);
+			goto fail;
 		}
 		amqp_ssl_socket_set_verify_peer(socket, cfg->tls_verify_peer ? 1 : 0);
 		amqp_ssl_socket_set_verify_hostname(socket, cfg->tls_verify_hostname ? 1 : 0);
 		if (cfg->tls_cert_path && *cfg->tls_cert_path &&
-		    cfg->tls_key_path  && *cfg->tls_key_path) {
-			if (amqp_ssl_socket_set_key(socket, cfg->tls_cert_path,
-			                            cfg->tls_key_path) != AMQP_STATUS_OK) {
-				fprintf(stderr, "[publish] set_key(%s) failed\n", cfg->tls_cert_path);
-				goto out_destroy;
-			}
+		    cfg->tls_key_path  && *cfg->tls_key_path &&
+		    amqp_ssl_socket_set_key(socket, cfg->tls_cert_path,
+		                            cfg->tls_key_path) != AMQP_STATUS_OK) {
+			fprintf(stderr, "[publish] set_key(%s) failed\n", cfg->tls_cert_path);
+			goto fail;
 		}
 	} else {
 		socket = amqp_tcp_socket_new(conn);
 		if (!socket) {
 			fprintf(stderr, "[publish] amqp_tcp_socket_new failed\n");
-			goto out_destroy;
+			goto fail;
 		}
 	}
 
 	if (amqp_socket_open(socket, cfg->host, cfg->port) != AMQP_STATUS_OK) {
 		fprintf(stderr, "[publish] amqp_socket_open(%s:%d) failed\n",
 		        cfg->host, cfg->port);
-		goto out_destroy;
+		goto fail;
 	}
 
 	const char *vhost = (cfg->vhost && *cfg->vhost) ? cfg->vhost : "/";
@@ -127,16 +127,41 @@ int publish_message(const publish_config_t *cfg,
 	amqp_rpc_reply_t login = amqp_login(
 		conn, vhost, 0, 131072, heartbeat, AMQP_SASL_METHOD_PLAIN,
 		cfg->user, cfg->password);
-	if (check_rpc(login, "login") != 0)
-		goto out_destroy;
+	snprintf(ctx, sizeof ctx, "%slogin", who);
+	if (check_rpc(login, ctx) != 0)
+		goto fail;
 
 	amqp_channel_open(conn, 1);
-	if (check_rpc(amqp_get_rpc_reply(conn), "channel.open") != 0)
-		goto out_close_conn;
+	snprintf(ctx, sizeof ctx, "%schannel.open", who);
+	if (check_rpc(amqp_get_rpc_reply(conn), ctx) != 0)
+		goto fail_close_conn;
 
 	amqp_confirm_select(conn, 1);
-	if (check_rpc(amqp_get_rpc_reply(conn), "confirm.select") != 0)
-		goto out_close_channel;
+	snprintf(ctx, sizeof ctx, "%sconfirm.select", who);
+	if (check_rpc(amqp_get_rpc_reply(conn), ctx) != 0)
+		goto fail_close_channel;
+
+	*out_conn = conn;
+	return 0;
+
+fail_close_channel:
+	amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
+fail_close_conn:
+	amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
+fail:
+	amqp_destroy_connection(conn);
+	return -1;
+}
+
+int publish_message(const publish_config_t *cfg,
+                    const char *routing_key,
+                    const char *body,
+                    size_t body_len)
+{
+	int rc = -1;
+	amqp_connection_state_t conn;
+	if (amqp_connect_open(cfg, "", &conn) != 0)
+		return -1;
 
 	amqp_exchange_declare(conn, 1,
 		amqp_cstring_bytes(cfg->exchange),
@@ -179,9 +204,7 @@ int publish_message(const publish_config_t *cfg,
 
 out_close_channel:
 	amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
-out_close_conn:
 	amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
-out_destroy:
 	amqp_destroy_connection(conn);
 	return rc;
 }
@@ -193,57 +216,7 @@ struct publish_conn_s {
 static int open_amqp_connection(const publish_config_t *cfg,
                                 amqp_connection_state_t *out_conn)
 {
-	amqp_connection_state_t conn = amqp_new_connection();
-	if (!conn) return -1;
-
-	amqp_socket_t *socket = NULL;
-	if (cfg->tls_enabled) {
-		socket = amqp_ssl_socket_new(conn);
-		if (!socket) { amqp_destroy_connection(conn); return -1; }
-		if (cfg->tls_ca_path && *cfg->tls_ca_path &&
-		    amqp_ssl_socket_set_cacert(socket, cfg->tls_ca_path) != AMQP_STATUS_OK) {
-			amqp_destroy_connection(conn); return -1;
-		}
-		amqp_ssl_socket_set_verify_peer(socket, cfg->tls_verify_peer ? 1 : 0);
-		amqp_ssl_socket_set_verify_hostname(socket, cfg->tls_verify_hostname ? 1 : 0);
-		if (cfg->tls_cert_path && *cfg->tls_cert_path &&
-		    cfg->tls_key_path  && *cfg->tls_key_path &&
-		    amqp_ssl_socket_set_key(socket, cfg->tls_cert_path, cfg->tls_key_path) != AMQP_STATUS_OK) {
-			amqp_destroy_connection(conn); return -1;
-		}
-	} else {
-		socket = amqp_tcp_socket_new(conn);
-		if (!socket) { amqp_destroy_connection(conn); return -1; }
-	}
-
-	if (amqp_socket_open(socket, cfg->host, cfg->port) != AMQP_STATUS_OK) {
-		amqp_destroy_connection(conn); return -1;
-	}
-
-	const char *vhost = (cfg->vhost && *cfg->vhost) ? cfg->vhost : "/";
-	int heartbeat = cfg->heartbeat_sec > 0 ? cfg->heartbeat_sec : 60;
-	amqp_rpc_reply_t login = amqp_login(
-		conn, vhost, 0, 131072, heartbeat, AMQP_SASL_METHOD_PLAIN,
-		cfg->user, cfg->password);
-	if (check_rpc(login, "worker login") != 0) {
-		amqp_destroy_connection(conn); return -1;
-	}
-
-	amqp_channel_open(conn, 1);
-	if (check_rpc(amqp_get_rpc_reply(conn), "worker channel.open") != 0) {
-		amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
-		amqp_destroy_connection(conn); return -1;
-	}
-
-	amqp_confirm_select(conn, 1);
-	if (check_rpc(amqp_get_rpc_reply(conn), "worker confirm.select") != 0) {
-		amqp_channel_close(conn, 1, AMQP_REPLY_SUCCESS);
-		amqp_connection_close(conn, AMQP_REPLY_SUCCESS);
-		amqp_destroy_connection(conn); return -1;
-	}
-
-	*out_conn = conn;
-	return 0;
+	return amqp_connect_open(cfg, "worker ", out_conn);
 }
 
 publish_conn_t *publish_conn_open(const publish_config_t *cfg)
@@ -301,6 +274,18 @@ int publish_conn_publish(publish_conn_t *c,
 	return wait_confirm(c->conn);
 }
 
+/* basic.get 이 존재하지 않는 큐를 폴링하면 브로커가 404 NOT_FOUND 로 채널을 닫는다. task 큐
+ * (agent.tasks.{agent_id})는 engine 이 첫 task 발행 시점에 lazy 생성하고 worker 는 declare 권한이
+ * 없어, 그 전까지는 이 404 가 정상적으로 뜬다 — 에러가 아니라 "큐 아직 없음(대기)" 상태다.
+ * 이 특정 채널 예외만 가려내 조용히 처리한다(다른 서버 예외는 그대로 에러). */
+static int is_queue_not_found(amqp_rpc_reply_t r)
+{
+	if (r.reply_type != AMQP_RESPONSE_SERVER_EXCEPTION) return 0;
+	if (r.reply.id != AMQP_CHANNEL_CLOSE_METHOD)        return 0;
+	amqp_channel_close_t *m = (amqp_channel_close_t *)r.reply.decoded;
+	return m && m->reply_code == 404;  /* AMQP NOT_FOUND */
+}
+
 int publish_conn_get(publish_conn_t *c,
                      const char *queue,
                      char      **out_body,
@@ -316,6 +301,8 @@ int publish_conn_get(publish_conn_t *c,
 	amqp_rpc_reply_t r = amqp_basic_get(c->conn, 1,
 		amqp_cstring_bytes(queue), 0 );
 	if (r.reply_type != AMQP_RESPONSE_NORMAL) {
+		if (is_queue_not_found(r))
+			return 2;  /* 큐 아직 없음 — 경고 없이, 호출자가 채널만 복구 */
 		check_rpc(r, "basic.get");
 		return -1;
 	}
@@ -343,6 +330,21 @@ int publish_conn_get(publish_conn_t *c,
 	*out_len  = msg.body.len;
 	*out_delivery_tag = tag;
 	amqp_destroy_message(&msg);
+	return 0;
+}
+
+int publish_conn_recover_channel(publish_conn_t *c)
+{
+	if (!c || !c->conn) return -1;
+	/* 채널 레벨 예외(큐 404 등) 후 채널 1 을 다시 연다. 연결은 살아있으므로 전체 reconnect
+	 * 없이 폴링을 이어간다. worker result 발행이 confirm 모드라 confirm.select 재적용.
+	 * 조용히(로그 없이) 판정 — 실패하면 호출자가 전체 reconnect 로 폴백한다. */
+	amqp_channel_open(c->conn, 1);
+	if (amqp_get_rpc_reply(c->conn).reply_type != AMQP_RESPONSE_NORMAL)
+		return -1;
+	amqp_confirm_select(c->conn, 1);
+	if (amqp_get_rpc_reply(c->conn).reply_type != AMQP_RESPONSE_NORMAL)
+		return -1;
 	return 0;
 }
 

@@ -4,6 +4,7 @@
 #include "util.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,24 @@ static void tail_finalize(tail_buf_t *t, char *out, size_t out_sz)
 	out[kept] = '\0';
 }
 
+/* env 블록에 "NAME=VAL\0" 한 엔트리를 경계 안전하게 덧붙인다. 먼저 필요 길이를 재고
+ * NUL 구분자까지 들어갈 때만 쓴다 — pos 가 cap 을 넘어 (cap - pos) 가 size_t 언더플로로
+ * 버퍼 밖 쓰기가 되는 것을 막고, 부분 엔트리도 남기지 않는다. 정상(env 합계 < cap) 경로는
+ * 기존과 동일하게 전 엔트리가 다 들어간다. */
+static void env_append(char *blk, size_t cap, int *pos, const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int need = vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	if (need < 0 || (size_t)*pos + (size_t)need + 1 >= cap)
+		return;  /* 안 들어가면 스킵(부분 쓰기 금지) */
+	va_start(ap, fmt);
+	vsnprintf(blk + *pos, cap - (size_t)*pos, fmt, ap);
+	va_end(ap);
+	*pos += need + 1;  /* +1 = NUL 구분자 (calloc 로 이미 0) */
+}
+
 static char *build_env_block(const char *task_id, const char *machine_id)
 {
 
@@ -72,19 +91,16 @@ static char *build_env_block(const char *task_id, const char *machine_id)
 	if (!blk) return NULL;
 
 	int pos = 0;
-	pos += snprintf(blk + pos, cap - pos, "PATH=%s",       path_env);    pos++;
-	pos += snprintf(blk + pos, cap - pos, "TEMP=%s",       temp_env);    pos++;
-	pos += snprintf(blk + pos, cap - pos, "TMP=%s",        temp_env);    pos++;
-	pos += snprintf(blk + pos, cap - pos, "USERPROFILE=%s", userprofile); pos++;
-	pos += snprintf(blk + pos, cap - pos, "SystemRoot=%s", systemroot);  pos++;
-	if (task_id    && *task_id) {
-		pos += snprintf(blk + pos, cap - pos, "TASK_ID=%s", task_id); pos++;
-	}
-	if (machine_id && *machine_id) {
-		pos += snprintf(blk + pos, cap - pos, "MACHINE_ID=%s", machine_id); pos++;
-	}
+	env_append(blk, cap, &pos, "PATH=%s",        path_env);
+	env_append(blk, cap, &pos, "TEMP=%s",        temp_env);
+	env_append(blk, cap, &pos, "TMP=%s",         temp_env);
+	env_append(blk, cap, &pos, "USERPROFILE=%s", userprofile);
+	env_append(blk, cap, &pos, "SystemRoot=%s",  systemroot);
+	if (task_id    && *task_id)
+		env_append(blk, cap, &pos, "TASK_ID=%s", task_id);
+	if (machine_id && *machine_id)
+		env_append(blk, cap, &pos, "MACHINE_ID=%s", machine_id);
 
-	(void)pos;
 	return blk;
 }
 
