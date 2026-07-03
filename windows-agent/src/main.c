@@ -195,6 +195,14 @@ int agent_run(void)
 	if (g_dbg) {
 		freopen(dbg_path, "w", stderr);
 		setvbuf(stderr, NULL, _IONBF, 0);
+	} else {
+		/* As a service there is no console, so stderr's underlying handle is
+		 * invalid. The many unconditional fprintf(stderr, ...) diagnostics then
+		 * FAULT on NT5.2 (2003/XP) msvcrt — NT6+ msvcrt tolerates it — killing the
+		 * agent right after machine_id resolution, before it ever collects. Point
+		 * stderr at NUL so those writes are safe no-ops. The service is the real
+		 * deployment; a console operator who wants output sets AGENT_DEBUG_LOG. */
+		freopen("NUL", "w", stderr);
 	}
 #define DBG(...) do { if (g_dbg) fprintf(stderr, __VA_ARGS__); } while (0)
 

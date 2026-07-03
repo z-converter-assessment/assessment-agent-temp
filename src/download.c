@@ -197,7 +197,6 @@ download_status_t download_package(const char *url,
 	CURL *c = curl_easy_init();
 	if (!c) { EVP_MD_CTX_free(md); fclose(fp); unlink(out_path); return DOWNLOAD_ERR_INTERNAL; }
 
-	download_status_t rc = DOWNLOAD_OK;
 	long http_code = 0;
 
 	int is_https = download_url_is_https(url);

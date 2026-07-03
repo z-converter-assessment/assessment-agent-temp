@@ -1,9 +1,10 @@
 name: release
 
-# v* 태그가 push되면 5종을 빌드해 그 태그의 GitHub Release에 에셋으로 올린다.
+# v* 태그가 push되면 2종을 빌드해 그 태그의 GitHub Release에 에셋으로 올린다.
 #   git tag v1.2.3 && git push origin v1.2.3
-# required(항상 있어야 함): linux-x86_64, win2016-x64
-# best-effort(빌드 깨져도 릴리즈 진행): linux-x86_64-glibc2.12, win2008r2-x64, win2003-x86
+# Linux는 musl fully-static 단일 바이너리(linux-x86_64)로 전 x86_64 리눅스(kernel >= 2.6.32)를,
+# Windows는 단일 i686 바이너리(windows-x86)로 NT5.2(2003/XP)부터 NT10(2016+/Win10-11)까지
+# 하나로 커버한다. 둘 다 required — 없으면 릴리즈 실패.
 on:
   push:
     tags:
@@ -17,80 +18,34 @@ permissions:
   contents: write
 
 jobs:
-  # Linux 2종 — glibc ABI 하한을 manylinux 컨테이너 glibc로 고정.
-  # checkout은 host(node20)에서, 빌드만 컨테이너 안에서 (scripts/build-linux.sh가 docker run).
-  # legacy(manylinux2010)는 upstream EOL/archived라 pull이 막힐 수 있어 best-effort.
+  # Linux — musl fully-static 단일 바이너리(linux-x86_64). glibc 버전 독립이라
+  # 전 x86_64 리눅스(kernel >= 2.6.32)를 하나로 커버한다. checkout은 host에서,
+  # 빌드만 Alpine 컨테이너 안에서(scripts/build-linux.sh가 docker run).
   build-linux:
-    name: Linux (${{ matrix.name }})
+    name: Linux (musl-static)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    continue-on-error: ${{ matrix.experimental || false }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: modern
-            image: quay.io/pypa/manylinux2014_x86_64
-            target: release
-          - name: legacy
-            image: quay.io/pypa/manylinux2010_x86_64
-            target: release-legacy
-            experimental: true
     steps:
       - uses: actions/checkout@v4
-      - name: build (${{ matrix.name }})
+      - name: build (musl fully-static)
         # payload agent_version = 릴리즈 태그(v1.0.0 -> 1.0.0). 별도 스키마 버전 안 매김.
-        run: AGENT_VERSION="${GITHUB_REF_NAME#v}" BUILD_IMAGE=${{ matrix.image }} BUILD_TARGET=${{ matrix.target }} sh scripts/build-linux.sh
+        run: AGENT_VERSION="${GITHUB_REF_NAME#v}" sh scripts/build-linux.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.name }}
-          path: dist/assessment-agent-linux-*
+          name: linux
+          path: dist/assessment-agent-linux-x86_64
           if-no-files-found: error
 
-  # Windows modern/win7 (x64 2종) — ubuntu에서 MinGW-w64 x86_64 크로스컴파일.
-  # legacy32(win2003-x86)는 CRT 버전 제약으로 별도 job(build-windows-legacy32)에서 빌드.
+  # Windows — 단일 i686 바이너리(assessment-agent-windows-x86.exe). NT5.2(2003/XP)부터
+  # NT10(2016+/Win10-11)까지 하나로 커버한다. 세대 분기는 컴파일 타임이 아니라 런타임
+  # (collect.c agent_is_nt6 + GetProcAddress). debian:bookworm(gcc 12.2, CRT runtime 10.x)로만
+  # 빌드 — CRT v10이 NT5.2 startup을 유지한다. CRT 12+(ubuntu 최신)로는 verify는 통과해도
+  # 실기 startup이 드롭된다. verify가 NT6+ 심볼 하드임포트를 차단해 2003 로드 실패를 빌드
+  # 단계에서 막는다. checkout은 runner(node20)에서, 빌드만 컨테이너 안에서(docker run).
   build-windows:
-    name: Windows (${{ matrix.profile }})
+    name: Windows (windows-x86 / single i686)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    continue-on-error: ${{ matrix.experimental || false }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - profile: modern
-            cross: "CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar WINDRES=x86_64-w64-mingw32-windres OPENSSL_TARGET=mingw64 OPENSSL_CROSS=--cross-compile-prefix=x86_64-w64-mingw32-"
-          - profile: win7
-            cross: "CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar WINDRES=x86_64-w64-mingw32-windres OPENSSL_TARGET=mingw64 OPENSSL_CROSS=--cross-compile-prefix=x86_64-w64-mingw32-"
-            experimental: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: install mingw-w64 toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
-            cmake make git perl
-      - name: build (${{ matrix.profile }})
-        working-directory: windows-agent
-        run: |
-          make PROFILE=${{ matrix.profile }} ${{ matrix.cross }} vendor-build
-          make PROFILE=${{ matrix.profile }} ${{ matrix.cross }} AGENT_VERSION="${GITHUB_REF_NAME#v}" release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: win-${{ matrix.profile }}
-          path: windows-agent/dist/*.exe
-          if-no-files-found: error
-
-  # legacy32(win2003-x86) — debian:bookworm 컨테이너에서 빌드.
-  # bookworm의 mingw-w64(gcc 12.2, CRT runtime 10.x)가 NT5.2(XP/2003) startup을 유지한다.
-  # CRT 12+(ubuntu 최신)로는 verify는 통과해도 실기 startup이 드롭되므로 반드시 bookworm.
-  # checkout은 runner(node20)에서, 빌드만 컨테이너 안에서(docker run).
-  build-windows-legacy32:
-    name: Windows (legacy32 / win2003-x86)
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: build in debian:bookworm (CRT v10)
@@ -101,19 +56,19 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
               gcc-mingw-w64-i686 binutils-mingw-w64-i686 cmake make git perl ca-certificates
             echo "[toolchain] $(i686-w64-mingw32-gcc --version | head -1)"
-            make PROFILE=legacy32 JOBS=2 vendor-build
-            make PROFILE=legacy32 AGENT_VERSION="$AGENT_VERSION" release
+            make JOBS=2 vendor-build
+            make AGENT_VERSION="$AGENT_VERSION" release
           '
       - uses: actions/upload-artifact@v4
         with:
-          name: win-legacy32
+          name: win
           path: windows-agent/dist/*.exe
           if-no-files-found: error
 
   # 성공한 산출물을 모아 통합 SHA256SUMS 생성 후 태그 릴리즈에 upsert 게시.
-  # required 2종(linux-x86_64, win2016-x64)은 없으면 릴리즈 실패, 나머지는 있으면 붙이고 없으면 skip.
+  # 2종(linux-x86_64, windows-x86) 모두 required — 없으면 릴리즈 실패.
   release:
-    needs: [build-linux, build-windows, build-windows-legacy32]
+    needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -125,13 +80,9 @@ jobs:
       - name: verify required + checksums
         working-directory: dist
         run: |
-          # required — 없으면 릴리즈 실패 (loud fail)
+          # required 2종 — 없으면 릴리즈 실패 (loud fail)
           test -f assessment-agent-linux-x86_64 || { echo "MISSING required: linux-x86_64"; exit 1; }
-          test -f assessment-agent-win2016-x64.exe || { echo "MISSING required: win2016-x64"; exit 1; }
-          # best-effort 결측은 경고만
-          for f in assessment-agent-linux-x86_64-glibc2.12 assessment-agent-win2008r2-x64.exe assessment-agent-win2003-x86.exe; do
-            test -f "$f" || echo "[release] best-effort 결측 — skip: $f"
-          done
+          test -f assessment-agent-windows-x86.exe || { echo "MISSING required: windows-x86"; exit 1; }
           sha256sum assessment-agent-* > SHA256SUMS
           ls -la
           cat SHA256SUMS
@@ -146,8 +97,5 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             dist/assessment-agent-linux-x86_64
-            dist/assessment-agent-linux-x86_64-glibc2.12
-            dist/assessment-agent-win2016-x64.exe
-            dist/assessment-agent-win2008r2-x64.exe
-            dist/assessment-agent-win2003-x86.exe
+            dist/assessment-agent-windows-x86.exe
             dist/SHA256SUMS

@@ -16,8 +16,8 @@
 #       /etc/systemd/system/assessment-agent.service, managed via `systemctl`
 #       (User=root, WantedBy=multi-user.target — starts at boot).
 #   - SysV hosts (CentOS/RHEL/Oracle Linux 6 — no systemd):
-#       /etc/init.d/assessment-agent, runs the binary as root. CentOS 6 needs
-#       the LEGACY glibc-2.12 binary (make release-legacy).
+#       /etc/init.d/assessment-agent, runs the binary as root. The same musl
+#       static binary covers EL6 (kernel 2.6.32) — no separate legacy build.
 #
 # Re-runnable (idempotent). Each step short-circuits when already done.
 #
@@ -86,13 +86,8 @@ fi
 # --- 4. Binary present (shared).
 if [ ! -f "$DIST_BIN" ]; then
 	echo "[install] binary missing: $DIST_BIN" >&2
-	if [ "$INIT_SYSTEM" = "sysv" ]; then
-		echo "[install] SysV/EL6 host detected — run 'make release-legacy' on a" >&2
-		echo "[install]   manylinux2010 build host (glibc 2.12) and point DIST_BIN" >&2
-		echo "[install]   at the legacy artifact (see docs/centos6-bringup.md)" >&2
-	else
-		echo "[install] run 'make release' on a manylinux2014 build host first" >&2
-	fi
+	echo "[install] build it first: scripts/build-linux.sh (musl static, single" >&2
+	echo "[install]   binary covering all supported x86_64 Linux incl. EL6)" >&2
 	exit 1
 fi
 

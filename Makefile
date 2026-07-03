@@ -32,8 +32,7 @@ OPENSSL_CRYPTO     := $(OPENSSL_DIR)/install/lib/libcrypto.a
 ZLIB_LIB           := $(ZLIB_DIR)/libz.a
 
 ifeq ($(USE_VENDORED),1)
-  CFLAGS  += -fPIE \
-             -I$(CJSON_DIR) \
+  CFLAGS  += -I$(CJSON_DIR) \
              -I$(RABBITMQ_C_DIR)/include \
              -I$(RABBITMQ_C_DIR)/build/include \
              -I$(CURL_DIR)/include \
@@ -43,14 +42,26 @@ ifeq ($(USE_VENDORED),1)
   LDLIBS  := $(RABBITMQ_C_LIB) $(CJSON_LIB) $(CURL_LIB) $(LIBARCHIVE_LIB) \
              $(OPENSSL_SSL) $(OPENSSL_CRYPTO) $(ZLIB_LIB) \
              -lpthread -ldl -lrt
-  # -lrt: clock_gettime on glibc < 2.17 (EL6). --as-needed drops it on modern.
-  LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,--as-needed -static-libgcc
+  # musl fully-static release link. musl absorbs libpthread/libdl/librt into
+  # libc.a, so those -l flags resolve to stubs. -static links musl itself into
+  # the binary — no dynamic libc, glibc-version independent. Runs on any x86_64
+  # Linux with kernel >= 2.6.32 (verified on EL6/2.6.32 and SLES11/3.0.13),
+  # which covers every Glance image in one binary.
+  LDFLAGS += -static -static-libgcc -Wl,-z,relro,-z,now
 else
   CFLAGS += $(shell pkg-config --cflags $(PKGS))
   LDLIBS := $(shell pkg-config --libs $(PKGS))
 endif
 
 CFLAGS  += -Iinclude -DAGENT_VERSION=\"$(AGENT_VERSION)\"
+
+# Incremental-build correctness. -MMD -MP emit a per-object .d file recording the
+# headers each object includes, so a header edit recompiles its dependents. The
+# .cflags sentinel (below) forces a recompile when the compile command itself
+# changes — e.g. AGENT_VERSION. A plain `src/%.o: src/%.c` rule tracks neither,
+# so a stale object silently ships old headers/flags (a class of "phantom" bugs).
+CFLAGS  += -MMD -MP
+CFLAGS_SENTINEL := build/.cflags
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
@@ -100,8 +111,17 @@ all: $(BIN)
 $(BIN): $(OBJ) $(EMBED_OBJ)
 	$(CC) $(OBJ) $(EMBED_OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
-src/%.o: src/%.c
+src/%.o: src/%.c $(CFLAGS_SENTINEL)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# Rewrite the sentinel only when the effective compile command changed, so a
+# changed AGENT_VERSION/CFLAGS invalidates every object without a manual clean.
+$(CFLAGS_SENTINEL): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(CC) $(CFLAGS)' | cmp -s - $@ 2>/dev/null || printf '%s\n' '$(CC) $(CFLAGS)' > $@
+FORCE:
+
+-include $(OBJ:.o=.d)
 
 # Vendoring — fetch deps into vendor/, build static libs.
 #   ./scripts/build-linux.sh                        # containerized, one shot
@@ -184,50 +204,29 @@ vendor-clean:
 	rm -rf $(VENDOR_DIR)
 
 clean:
-	rm -f $(OBJ) $(BIN) $(LEGACY_BIN)
+	rm -f $(OBJ) $(OBJ:.o=.d) $(BIN) $(CFLAGS_SENTINEL)
 	rm -rf $(EMBED_DIR)
 
-# verify — GLIBC / dyn-dep / forbidden-API ABI compliance.
-#   modern (default): manylinux2014 / glibc 2.17 / CentOS 7. Forbids GLIBC_2.18+.
-#   legacy          : manylinux2010 / glibc 2.12 / CentOS 6. Forbids GLIBC_2.13+.
-ALLOWED_DLLS := linux-vdso libc libpthread libdl libm libresolv librt ld-linux-x86-64
-
-VERIFY_BIN        ?= $(BIN)
-VERIFY_PROFILE    ?= manylinux2014
-GLIBC_FORBID_RE   ?= GLIBC_2\.(1[89]|[2-9][0-9])
-GLIBC_CEILING_MSG ?= GLIBC 2.18+
-FORBID_API_RE     ?=  U (getrandom|statx|memfd_create|renameat2|copy_file_range|pidfd_)
-
-define verify_body
-	@echo "[verify] $(VERIFY_BIN) — $(VERIFY_PROFILE) ABI compliance"
-	@bad=$$(objdump -T $(VERIFY_BIN) 2>/dev/null | awk '/GLIBC_/ {print $$5}' \
-	         | grep -E '$(GLIBC_FORBID_RE)' || true); \
-	 if [ -n "$$bad" ]; then echo "[verify] FAIL: $(GLIBC_CEILING_MSG) symbols found (breaks $(VERIFY_PROFILE) ABI):"; echo "$$bad"; exit 1; fi
-	@deps=$$(ldd $(VERIFY_BIN) | awk '/=>/ {print $$1} /linux-vdso/ {print $$1}' \
-	         | sed -E 's/\.so.*$$//' | sort -u); \
-	 for d in $$deps; do \
-	   case " $(ALLOWED_DLLS) " in *" $$d "*) ;; \
-	     *) echo "[verify] FAIL: unexpected dynamic dep '$$d.so'"; \
-	        echo "[verify]   allowed: $(ALLOWED_DLLS)"; exit 1 ;; \
-	   esac; \
-	 done
-	@bad=$$(nm -D $(VERIFY_BIN) 2>/dev/null | grep -E '$(FORBID_API_RE)' || true); \
-	 if [ -n "$$bad" ]; then echo "[verify] FAIL: forbidden APIs ($(VERIFY_PROFILE) ceiling):"; echo "$$bad"; exit 1; fi
-	@echo "[verify] OK: $(VERIFY_PROFILE) clean, dyn-dep whitelist matches, no forbidden APIs"
-endef
-
+# verify — musl fully-static compliance. There is no glibc ABI ceiling to
+# enforce (musl is linked in statically); instead assert the binary is truly
+# static, carries no dynamic interpreter, and pulls in zero GLIBC-versioned
+# symbols. A binary that passes this runs on any x86_64 Linux kernel >= 2.6.32
+# regardless of the host libc.
 verify: $(BIN)
-	$(verify_body)
+	@echo "[verify] $(BIN) — musl fully-static"
+	@file $(BIN) | grep -q "statically linked" \
+	  || { echo "[verify] FAIL: not statically linked"; file $(BIN); exit 1; }
+	@if readelf -l $(BIN) 2>/dev/null | grep -q INTERP; then \
+	  echo "[verify] FAIL: has PT_INTERP (dynamic executable)"; exit 1; fi
+	@n=$$(objdump -T $(BIN) 2>/dev/null | grep -c GLIBC || true); \
+	 if [ "$$n" != "0" ]; then \
+	   echo "[verify] FAIL: $$n GLIBC-versioned symbol(s) — not glibc-free"; \
+	   objdump -T $(BIN) | grep GLIBC | head; exit 1; fi
+	@echo "[verify] OK: fully-static, no interpreter, zero GLIBC symbols"
 
-verify-legacy: $(LEGACY_BIN)
-	$(MAKE) verify \
-	  VERIFY_BIN=$(LEGACY_BIN) \
-	  VERIFY_PROFILE=manylinux2010 \
-	  GLIBC_CEILING_MSG="GLIBC 2.13+" \
-	  GLIBC_FORBID_RE='GLIBC_2\.(1[3-9]|[2-9][0-9])' \
-	  FORBID_API_RE=' U (getrandom|statx|memfd_create|renameat2|copy_file_range|pidfd_|secure_getenv|getauxval)'
-
-# release — dist/assessment-agent-linux-x86_64 + SHA256SUMS (manylinux2014 host).
+# release — dist/assessment-agent-linux-x86_64 (musl fully-static, single
+# binary covering all supported x86_64 Linux). Built in an Alpine/musl
+# container by scripts/build-linux.sh.
 DIST_DIR := dist
 DIST_BIN := $(DIST_DIR)/assessment-agent-linux-x86_64
 
@@ -238,24 +237,8 @@ release: $(BIN) verify
 	@echo "[release] packaged $(DIST_BIN)"
 	@cat $(DIST_DIR)/SHA256SUMS
 
-# release-legacy — dist/assessment-agent-linux-x86_64-glibc2.12 (manylinux2010 host).
-# Same sources/CFLAGS/static-link set as release; only the build HOST glibc (2.12)
-# and the verify ceiling differ. Bytes are identical to $(BIN) on a 2.12 host.
-LEGACY_BIN      := assessment-agent-legacy
-LEGACY_DIST_BIN := $(DIST_DIR)/assessment-agent-linux-x86_64-glibc2.12
-
-$(LEGACY_BIN): $(BIN)
-	cp $(BIN) $(LEGACY_BIN)
-
-release-legacy: $(LEGACY_BIN) verify-legacy
-	@mkdir -p $(DIST_DIR)
-	cp $(LEGACY_BIN) $(LEGACY_DIST_BIN)
-	cd $(DIST_DIR) && sha256sum $(notdir $(LEGACY_DIST_BIN)) >> SHA256SUMS
-	@echo "[release-legacy] packaged $(LEGACY_DIST_BIN)"
-	@cat $(DIST_DIR)/SHA256SUMS
-
 .PHONY: all clean \
         vendor-fetch vendor-build vendor-clean \
         vendor-build-openssl vendor-build-zlib vendor-build-cjson \
         vendor-build-rabbitmq vendor-build-curl vendor-build-libarchive \
-        verify verify-legacy release release-legacy
+        verify release

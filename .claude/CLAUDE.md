@@ -5,36 +5,36 @@
 - 도구 호출 직전에는 설명 텍스트를 최소화하고, 호출 구문 형식을 먼저 확인한 뒤 전송한다.
 
 ## 목적
-Assessment 수집 에이전트(C)의 릴리즈 빌드 전용 트리. 단일 소스에서 OS 세대별 5종 바이너리를 산출한다. 빌드 방법 상세는 README.md.
+Assessment 수집 에이전트(C)의 릴리즈 빌드 전용 트리. 단일 소스에서 OS별 2종 바이너리를 산출한다(Linux 1종 + Windows 1종). 빌드 방법 상세는 README.md.
 
-## 릴리즈 산출물 (5종)
+## 릴리즈 산출물 (2종)
 | 파일 | 타깃 | 프로파일 | 툴체인 |
 | --- | --- | --- | --- |
-| assessment-agent-linux-x86_64 | EL7+/Ubuntu18+/SUSE12+ (glibc 2.17) | modern | manylinux2014 |
-| assessment-agent-linux-x86_64-glibc2.12 | EL6 (glibc 2.12) | legacy | manylinux2010 |
-| assessment-agent-win2016-x64.exe | Server 2016+/Win10+ (NT 10.0) | modern | mingw-w64 x86_64 |
-| assessment-agent-win2008r2-x64.exe | Server 2008R2+/Win7+ (NT 6.1) | win7 | mingw-w64 x86_64 |
-| assessment-agent-win2003-x86.exe | Server 2003/XP (NT 5.2 i686) | legacy32 | debian:bookworm (gcc 12.2, CRT v10) |
+| assessment-agent-linux-x86_64 | 전 x86_64 Linux (kernel >= 2.6.32, glibc 무관): EL6-9/Ubuntu18+/Debian10+/SUSE11-15/Amazon/Oracle/Tencent | musl-static | alpine musl |
+| assessment-agent-windows-x86.exe | Server 2003/XP ~ 2016+/Win7~11 (NT 5.2 ~ NT 10.0, 전 세대) | single i686 | debian:bookworm (gcc 12.2, CRT v10) |
 
 ## 빌드 제약 (반드시 준수)
-- legacy32(win2003-x86)는 debian:bookworm 컨테이너로만 빌드한다. bookworm의 mingw-w64 CRT runtime 10.x가 NT5.2(XP/2003) startup을 유지한다. ubuntu 최신 등 CRT 12+ 툴체인으로 빌드하면 verify는 통과해도 XP/2003 실기 로드가 안 된다.
-- legacy32 빌드 시 Makefile이 rabbitmq-c win32/threads를 NT5.2 패치(`windows-agent/patches/nt52-threads/`, SRWLock -> CRITICAL_SECTION)로 자동 교체한다.
-- Linux release는 manylinux 컨테이너(native amd64)에서 빌드한다. glibc ABI 하한 = 빌드 호스트/컨테이너 glibc.
+- Windows는 단일 i686 바이너리(assessment-agent-windows-x86.exe)로 NT5.2(2003/XP)부터 NT10(2016+/Win10-11)까지 커버한다. 세대 분기는 컴파일 타임이 아니라 런타임(`windows-agent/src/collect.c`의 `agent_is_nt6` + GetProcAddress)에서 한다. NT6+ 전용 API(GetIfTable2/FreeMibTable/QueryFullProcessImageNameW/inet_ntop 등)는 하드임포트 금지 — 하나라도 import 테이블에 링크되면 2003/XP 로드가 실패한다. 전부 GetProcAddress로 해소한다.
+- Windows는 debian:bookworm 컨테이너로만 빌드한다. bookworm의 mingw-w64(i686, CRT runtime 10.x)가 NT5.2 startup을 유지한다. ubuntu 최신 등 CRT 12+ 툴체인으로 빌드하면 verify는 통과해도 XP/2003 실기 로드가 안 된다.
+- agent 소스는 `_WIN32_WINNT=0x0600`으로 컴파일해 NT6 구조체(MIB_IF_ROW2, GAA gateway/prefix)를 선언하되, 벤더 라이브러리(OpenSSL 1.0.2u/curl/rabbitmq-c)는 `0x0502`로 빌드한다(SRWLock 등 NT6 API 회피). Makefile이 rabbitmq-c win32/threads를 NT5.2 패치(`windows-agent/patches/nt52-threads/`, SRWLock -> CRITICAL_SECTION)로 자동 교체한다.
+- Windows verify는 (1) import DLL이 시스템 DLL뿐인지, (2) NT6+ 심볼이 하드임포트되지 않았는지(NT5.2 로드 가드)를 검사한다. (2) 위반이면 빌드를 실패시킨다.
+- OpenSSL 1.0.2u(EOL)를 Windows 전 세대에 쓴다 — XP/2003 TLS 호환을 위해 감수한다. TLS 1.3 없음, 엔드포인트 TLS 하드닝 시 전 Windows가 동시에 끊긴다.
+- Linux release는 Alpine 컨테이너에서 musl 완전 static으로 빌드한다(`scripts/build-linux.sh`). musl을 정적 링크해 glibc 버전에 독립적이고, 커널 2.6.32 이상 전 x86_64 리눅스를 단일 바이너리로 커버한다(EL6 2.6.32·SLES11 3.0.13 실기 확인). glibc 세대 분기가 없어 vendor 세대 오염 이슈도 없다. verify는 완전 static(PT_INTERP 없음, GLIBC 심볼 0)을 확인한다.
 - win2003 실기 배포는 hive ComputerName + Tcpip MTU=1280 운영 설정을 사용한다.
-- C 소스(src/, windows-agent/src/, include/)는 로직 변경 없이 유지가 기본. 빌드가 깨질 때만 최소 수정하고 5종 전부 재검증한다.
+- C 소스(src/, windows-agent/src/, include/) 로직은 리눅스/윈도우 2트리로 관리한다. 스키마·로직 변경은 양쪽에 반영해야 해 비용이 2배지만 감수한다. 단, wire 스키마와 null 의미론(값=실측, null=측정불가)은 계약으로 유지한다 — OS에 개념이 없는 필드를 가짜값으로 채우지 않고 null로 둔다. 윈도우 소스 변경의 정당한 용처는 런타임 dispatch로 그 OS가 실측 가능한 값을 세대 무관하게 뽑는 것이지, 리눅스 필드를 흉내내는 값 위조가 아니다.
 
 ## 권한 모델 (root 전제 통일)
 - install과 런타임 실행 계정을 전부 최고 권한으로 통일한다. 비특권 실행 모델은 두지 않는다. 근거: 수집기가 다른 유저 소유 프로세스의 `/proc/<pid>/exe`·`fd`·`comm`을 읽어야 `listen_ports[].pid`/`comm`과 `services[].exe`가 채워지는데, 이 접근이 root/LocalSystem에서만 가능하다. 비특권이면 sshd/nginx/mysql 등 대부분 데몬의 포트->PID 매핑이 null이 된다.
 - Linux systemd: `/etc/systemd/system/assessment-agent.service`(User=root, WantedBy=multi-user.target), `systemctl`로 관리. install은 root 아니면 거부.
 - Linux SysV(EL6): `/etc/init.d/assessment-agent`가 바이너리를 root로 직접 실행. 전용 유저(assessment-agent)·su 래핑 없음.
-- Windows 3종: Administrator(elevated)로 install, LocalSystem 자동시작 서비스로 실행.
+- Windows(단일 i686): Administrator(elevated)로 install, LocalSystem 자동시작 서비스로 실행.
 - 배포 스크립트/유닛(deploy/, scripts/image-prep.sh)은 이 모델을 전제로 유지한다. `systemctl --user`/lingering/XDG/`~/.local` 경로를 되살리지 않는다.
-- 이 스크립트/유닛은 objcopy로 바이너리에 embed되므로, deploy/·scripts/image-prep.sh를 고치면 Linux 2종을 재빌드해야 반영된다.
+- 이 스크립트/유닛은 objcopy로 바이너리에 embed되므로, deploy/·scripts/image-prep.sh를 고치면 Linux 바이너리를 재빌드해야 반영된다.
 
 ## 릴리즈 (CI)
-- `.github/workflows/release.yml`: `v*` 태그 push -> 5종 빌드 -> 해당 태그 GitHub Release 게시(softprops upsert).
+- `.github/workflows/release.yml`: `v*` 태그 push -> 2종 빌드 -> 해당 태그 GitHub Release 게시(softprops upsert).
 - 릴리즈는 v1.0.0 하나로 유지한다. 재릴리즈는 `git tag -f v1.0.0 && git push -f origin v1.0.0`으로 덮어쓴다. 버전을 올릴 때만 새 태그를 쓴다.
-- required: linux-x86_64, win2016-x64 (없으면 릴리즈 실패). 나머지 3종은 best-effort(있으면 붙이고 없으면 skip).
+- required: linux-x86_64, windows-x86 둘 다 (없으면 릴리즈 실패). best-effort 항목 없음.
 - 재릴리즈 전 이전에 실행 중인 GitHub Actions의 성공/실패를 확인하고 대기한다.
 
 ## 저장소

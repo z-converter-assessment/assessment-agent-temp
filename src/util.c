@@ -1,3 +1,4 @@
+#define _GNU_SOURCE            /* syscall() prototype for close_inherited_fds */
 #define _POSIX_C_SOURCE 200809L
 
 #include "util.h"
@@ -247,8 +248,10 @@ char *uuid_v4(char *buf, size_t len)
 		fclose(f);
 	}
 
-	char hostname[64] = "unknown";
-	gethostname(hostname, sizeof hostname);
+	char hostname[64];
+	if (gethostname(hostname, sizeof hostname) != 0)
+		snprintf(hostname, sizeof hostname, "unknown");
+	hostname[sizeof hostname - 1] = '\0';   /* gethostname truncation may not NUL-terminate */
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	snprintf(buf, len, "%s-%d-%ld%06ld",

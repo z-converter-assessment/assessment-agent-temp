@@ -1,29 +1,25 @@
 #!/bin/sh
-# build-linux.sh — release-grade Linux build inside manylinux2014 container.
+# build-linux.sh — musl fully-static release build inside an Alpine container.
 #
-# Host requirement: **Docker only**. No yum/apt install on the host. The
-# container is self-contained: build-prep.sh installs perl/cmake inside,
-# then vendor-fetch + vendor-build + USE_VENDORED=1 release builds everything,
-# then chown's the outputs (vendor/, dist/) back to the invoking user.
+# Produces a SINGLE binary — dist/assessment-agent-linux-x86_64 — that is
+# statically linked against musl libc (and all vendored deps). It carries no
+# dynamic libc, so it is glibc-version independent and runs on ANY x86_64 Linux
+# with kernel >= 2.6.32. That covers every supported image in one artifact
+# (verified on EL6 / kernel 2.6.32 and SLES 11 / kernel 3.0.13), replacing the
+# former glibc modern+legacy split.
+#
+# Host requirement: **Docker only**. Everything (toolchain, vendor build, link)
+# happens inside the Alpine container; outputs are chown'd back to the caller.
 #
 # Usage (from repo root):
-#   ./scripts/build-linux.sh                 # modern: manylinux2014 / glibc 2.17
-#   BUILD_IMAGE=quay.io/pypa/manylinux2010_x86_64 BUILD_TARGET=release-legacy \
-#       ./scripts/build-linux.sh             # legacy: glibc 2.12 / CentOS 6
+#   ./scripts/build-linux.sh
 #
 # Knobs (env):
-#   BUILD_IMAGE   manylinux container (default manylinux2014_x86_64)
-#   BUILD_TARGET  make target: `release` (modern) or `release-legacy` (CentOS 6)
+#   BUILD_IMAGE    musl build container (default alpine:3.19)
+#   AGENT_VERSION  payload agent_version (CI injects the release tag)
 #
-# Output:
-#   release         → dist/assessment-agent-linux-x86_64
-#   release-legacy  → dist/assessment-agent-linux-x86_64-glibc2.12
-#   both verify (modern → GLIBC 2.17 ceiling, legacy → GLIBC 2.12) automatically.
-#
-# NOTE on Apple Silicon: this image is linux/amd64. ARM hosts run it under
-# Rosetta/QEMU emulation — works but slow (10x), and the binary is amd64
-# emulated. Prefer running on a native amd64 build host (CI / EC2 / VM)
-# for release artifacts that go to production.
+# NOTE on Apple Silicon: the image runs linux/amd64. ARM hosts emulate it
+# (slow); prefer a native amd64 build host for release artifacts.
 
 set -eu
 
@@ -41,34 +37,29 @@ fi
 UID_HOST=$(id -u)
 GID_HOST=$(id -g)
 
-# Build profile knobs — default to the modern manylinux2014 / glibc 2.17 build.
-# The legacy CentOS 6 build overrides both: manylinux2010 image + release-legacy.
-BUILD_IMAGE="${BUILD_IMAGE:-quay.io/pypa/manylinux2014_x86_64}"
-BUILD_TARGET="${BUILD_TARGET:-release}"
-# payload agent_version — CI가 git 태그에서 주입(release.yml). 로컬은 dev fallback.
+BUILD_IMAGE="${BUILD_IMAGE:-alpine:3.19}"
+# payload agent_version — CI injects from the git tag (release.yml). Local dev
+# falls back to this.
 AGENT_VERSION="${AGENT_VERSION:-0.0.0-dev}"
 
-echo "[build-linux] image=$BUILD_IMAGE target=$BUILD_TARGET agent_version=$AGENT_VERSION"
+echo "[build-linux] image=$BUILD_IMAGE musl fully-static agent_version=$AGENT_VERSION"
 
 docker run --rm \
     --network host \
     --platform linux/amd64 \
     -v "$(pwd)":/src -w /src \
     "$BUILD_IMAGE" \
-    bash -lc "
+    sh -c "
         set -e
-        bash scripts/build-prep.sh
-        # cmake 컴파일러 자동감지가 manylinux2010에서 실행 불가한 devtoolset cc
-        # 절대경로(/opt/rh/devtoolset-10/root/usr/bin/cc)를 잡는 문제 회피 —
-        # PATH의 gcc/g++를 명시한다(modern 이미지에도 무해).
-        export CC=gcc CXX=g++
-        # src/*.o 세대 오염 방지 — modern/legacy가 같은 트리를 공유하므로, 이전 세대의
-        # 오브젝트(다른 glibc 심볼)를 재사용하지 않도록 매 빌드 재컴파일한다.
+        apk add --no-cache build-base cmake perl linux-headers git curl bash file pkgconf autoconf automake libtool >/dev/null
+        echo '[build-linux] toolchain:' \$(gcc --version | head -1)
+        # src/*.o generation-safety — reuse of glibc-built objects breaks the
+        # musl link (undefined __strdup etc.), so always recompile.
         make clean
         make vendor-fetch
         make vendor-build
-        make USE_VENDORED=1 AGENT_VERSION='${AGENT_VERSION}' ${BUILD_TARGET}
-        chown -R ${UID_HOST}:${GID_HOST} vendor dist 2>/dev/null || true
+        make USE_VENDORED=1 AGENT_VERSION='${AGENT_VERSION}' release
+        chown -R ${UID_HOST}:${GID_HOST} vendor dist build 2>/dev/null || true
     "
 
 echo

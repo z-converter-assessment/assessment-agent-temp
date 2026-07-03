@@ -128,6 +128,14 @@ static cJSON *or_empty_array(cJSON *arr)
 	return arr ? arr : cJSON_CreateArray();
 }
 
+/* For fields with a legitimate "unmeasurable" state (services: no systemd and
+ * no /var/lock/subsys), keep the key present as null instead of dropping it on
+ * a C-NULL (e.g. alloc failure). cJSON silently ignores a NULL item add. */
+static cJSON *or_json_null(cJSON *v)
+{
+	return v ? v : cJSON_CreateNull();
+}
+
 static void add_kb_or_null(cJSON *root, const char *key, long val)
 {
 	if (val < 0) cJSON_AddNullToObject(root, key);
@@ -526,12 +534,28 @@ static const char *net_kind(const char *ifname)
 	if (access(p, F_OK) == 0) return "bond_member";
 	snprintf(p, sizeof p, "/sys/class/net/%s/tun_flags", ifname);
 	if (access(p, F_OK) == 0) return "tunnel";
+	/* uevent DEVTYPE is the kernel's own name for the virtual device type —
+	 * authoritative and general, so map every taxonomy-relevant type from it
+	 * rather than only vlan. Overlay/tunnel encaps all fold to "tunnel";
+	 * macvlan/ipvlan/macvtap have no dedicated kind and fall through to
+	 * "virtual" below. */
 	snprintf(p, sizeof p, "/sys/class/net/%s/uevent", ifname);
 	char *ue = read_file_all(p);
 	if (ue) {
-		int is_vlan = strstr(ue, "DEVTYPE=vlan") != NULL;
+		const char *dt = strstr(ue, "DEVTYPE=");
+		char devtype[32] = { 0 };
+		if (dt) sscanf(dt + 8, "%31[^\n]", devtype);
 		free(ue);
-		if (is_vlan) return "vlan";
+		if (strcmp(devtype, "vlan")   == 0) return "vlan";
+		if (strcmp(devtype, "bridge") == 0) return "bridge";
+		if (strcmp(devtype, "bond")   == 0) return "bond_master";
+		if (strcmp(devtype, "veth")   == 0) return "veth";
+		if (strcmp(devtype, "vxlan")  == 0 || strcmp(devtype, "geneve") == 0 ||
+		    strcmp(devtype, "gre")    == 0 || strcmp(devtype, "gretap") == 0 ||
+		    strcmp(devtype, "ip6gre") == 0 || strcmp(devtype, "sit")    == 0 ||
+		    strcmp(devtype, "ipip")   == 0 || strcmp(devtype, "ip6tnl") == 0 ||
+		    strcmp(devtype, "vti")    == 0 || strcmp(devtype, "vti6")   == 0)
+			return "tunnel";
 	}
 	if (strncmp(ifname, "veth", 4) == 0)   return "veth";
 	if (strncmp(ifname, "docker", 6) == 0) return "bridge";
@@ -592,15 +616,21 @@ static cJSON *collect_disks_via_lsblk(void)
 		cJSON_AddStringToObject(item, "name", name->valuestring);
 		add_major_minor(item, major, minor);
 
-		double size_bytes = 0;
+		/* size/type come straight from lsblk; if a field is absent or malformed
+		 * emit null rather than a fabricated 0 / "disk". The engine filters on
+		 * kind (below), not on the raw lsblk type. */
 		if (cJSON_IsNumber(size))
-			size_bytes = size->valuedouble;
-		else if (cJSON_IsString(size))
-			size_bytes = strtod(size->valuestring, NULL);
-		cJSON_AddNumberToObject(item, "size_bytes", size_bytes);
+			cJSON_AddNumberToObject(item, "size_bytes", size->valuedouble);
+		else if (cJSON_IsString(size) && *size->valuestring)
+			cJSON_AddNumberToObject(item, "size_bytes",
+			                        strtod(size->valuestring, NULL));
+		else
+			cJSON_AddNullToObject(item, "size_bytes");
 
-		cJSON_AddStringToObject(item, "type",
-		                        cJSON_IsString(type) ? type->valuestring : "disk");
+		if (cJSON_IsString(type))
+			cJSON_AddStringToObject(item, "type", type->valuestring);
+		else
+			cJSON_AddNullToObject(item, "type");
 		cJSON_AddStringToObject(item, "kind", disk_kind(name->valuestring));
 		cJSON_AddItemToArray(arr, item);
 	}
@@ -684,6 +714,62 @@ static int is_excluded_fstype(const char *fstype)
 	if (!fstype) return 1;
 	for (int i = 0; skip_fs[i]; i++)
 		if (strcmp(fstype, skip_fs[i]) == 0)
+			return 1;
+	return 0;
+}
+
+/* /proc/filesystems marks device-less filesystems with a leading "nodev" — the
+ * kernel's own authority on what has no backing block device. Every pseudo/
+ * virtual fs (proc, sysfs, cgroup, selinuxfs, usbfs, ...) is nodev; real block
+ * filesystems (ext4, xfs, fuseblk/ntfs-3g) are not. This catches pseudo mounts
+ * the static skip list above misses, on any kernel, without a growing denylist.
+ * The registered set only lists currently-loaded fs, which always includes any
+ * fs that is actually mounted — exactly the ones we classify. Result cached. */
+static int fstype_is_nodev(const char *fstype)
+{
+	static char nodev[2048] = "\n";
+	static int loaded = 0;
+	if (!loaded) {
+		loaded = 1;
+		char *content = read_file_all("/proc/filesystems");
+		if (content) {
+			size_t len = 1;
+			char *save = NULL;
+			for (char *line = strtok_r(content, "\n", &save); line;
+			     line = strtok_r(NULL, "\n", &save)) {
+				if (strncmp(line, "nodev", 5) != 0) continue;
+				const char *name = line + 5;
+				while (*name == ' ' || *name == '\t') name++;
+				size_t nl = strlen(name);
+				if (nl == 0 || len + nl + 1 >= sizeof nodev) continue;
+				memcpy(nodev + len, name, nl);
+				len += nl;
+				nodev[len++] = '\n';
+				nodev[len]   = '\0';
+			}
+			free(content);
+		}
+	}
+	if (!fstype || !*fstype) return 0;
+	char needle[80];
+	int n = snprintf(needle, sizeof needle, "\n%s\n", fstype);
+	if (n <= 0 || (size_t)n >= sizeof needle) return 0;
+	return strstr(nodev, needle) != NULL;
+}
+
+/* Device-less filesystems that nonetheless hold real (remote/user) data and so
+ * must NOT be dropped as pseudo: network filesystems and FUSE mounts. fuseblk
+ * (real block device, e.g. ntfs-3g) is not nodev and never reaches here. */
+static int is_kept_deviceless_fs(const char *fstype)
+{
+	if (!fstype) return 0;
+	if (strncmp(fstype, "fuse", 4) == 0) return 1;
+	static const char *net_fs[] = {
+		"nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs",
+		"afs", "lustre", "orangefs", "ncpfs", "coda", "beegfs", NULL,
+	};
+	for (int i = 0; net_fs[i]; i++)
+		if (strcmp(fstype, net_fs[i]) == 0)
 			return 1;
 	return 0;
 }
@@ -795,7 +881,13 @@ static struct mount_entry *list_real_mounts(size_t *out_count)
 		char *mnt = NULL, *fst = NULL;
 		if (!parse_mountinfo_line(line, &mj, &mn, &mnt, &fst))
 			continue;
-		if (is_excluded_fstype(fst)) {
+		/* Drop pseudo/virtual mounts so mounts[] carries only real storage:
+		 * the static skip list (fast path) plus any device-less (nodev) fs the
+		 * kernel reports, except network/FUSE which hold real data. Without the
+		 * nodev net, fs missing from the skip list (selinuxfs, usbfs, ...) would
+		 * leak through and be mislabeled kind="data". */
+		if (is_excluded_fstype(fst) ||
+		    (fstype_is_nodev(fst) && !is_kept_deviceless_fs(fst))) {
 			free(mnt); free(fst);
 			continue;
 		}
@@ -818,7 +910,13 @@ static struct mount_entry *list_real_mounts(size_t *out_count)
 	return arr;
 }
 
-static cJSON *collect_mounts_inventory(void)
+/* Split by role so the static inventory does not carry time-series data:
+ *   with_usage=0 (inventory) -> structure: mount/major/minor/total_bytes/fstype/kind
+ *   with_usage=1 (metrics)   -> usage:     mount/kind/fstype/total_bytes/free/avail
+ * total_bytes stays in both (metrics needs it for %, like mem_total_kb); the
+ * dynamic free/avail live only in metrics, so disk usage has one time-series
+ * source instead of also being duplicated into every inventory snapshot. */
+static cJSON *collect_mounts(int with_usage)
 {
 	cJSON *arr = cJSON_CreateArray();
 	if (!arr)
@@ -831,49 +929,21 @@ static cJSON *collect_mounts_inventory(void)
 		if (statvfs(mounts[i].mount, &st) != 0)
 			continue;
 		double total = (double)st.f_blocks * (double)st.f_frsize;
-		double freeb = (double)st.f_bfree  * (double)st.f_frsize;
-		double avail = (double)st.f_bavail * (double)st.f_frsize;
 
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "mount", mounts[i].mount);
-		add_major_minor(item, mounts[i].major, mounts[i].minor);
-		cJSON_AddNumberToObject(item, "total_bytes", total);
-		cJSON_AddNumberToObject(item, "free_bytes", freeb);
-		cJSON_AddNumberToObject(item, "avail_bytes", avail);
-		cJSON_AddStringToObject(item, "fstype", mounts[i].fstype);
 		cJSON_AddStringToObject(item, "kind",
 		                        mount_kind(mounts[i].mount, mounts[i].fstype));
-		cJSON_AddItemToArray(arr, item);
-	}
-	free_mount_entries(mounts, n);
-	return arr;
-}
-
-static cJSON *collect_mounts_metrics(void)
-{
-	cJSON *arr = cJSON_CreateArray();
-	if (!arr)
-		return NULL;
-
-	size_t n = 0;
-	struct mount_entry *mounts = list_real_mounts(&n);
-	for (size_t i = 0; i < n; i++) {
-		struct statvfs st;
-		if (statvfs(mounts[i].mount, &st) != 0)
-			continue;
-		double total = (double)st.f_blocks * (double)st.f_frsize;
-		double freeb = (double)st.f_bfree  * (double)st.f_frsize;
-		double avail = (double)st.f_bavail * (double)st.f_frsize;
-
-		cJSON *item = cJSON_CreateObject();
-		cJSON_AddStringToObject(item, "mount", mounts[i].mount);
-		add_major_minor(item, mounts[i].major, mounts[i].minor);
-		cJSON_AddNumberToObject(item, "total_bytes", total);
-		cJSON_AddNumberToObject(item, "free_bytes", freeb);
-		cJSON_AddNumberToObject(item, "avail_bytes", avail);
 		cJSON_AddStringToObject(item, "fstype", mounts[i].fstype);
-		cJSON_AddStringToObject(item, "kind",
-		                        mount_kind(mounts[i].mount, mounts[i].fstype));
+		cJSON_AddNumberToObject(item, "total_bytes", total);
+		if (with_usage) {
+			double freeb = (double)st.f_bfree  * (double)st.f_frsize;
+			double avail = (double)st.f_bavail * (double)st.f_frsize;
+			cJSON_AddNumberToObject(item, "free_bytes",  freeb);
+			cJSON_AddNumberToObject(item, "avail_bytes", avail);
+		} else {
+			add_major_minor(item, mounts[i].major, mounts[i].minor);
+		}
 		cJSON_AddItemToArray(arr, item);
 	}
 	free_mount_entries(mounts, n);
@@ -910,7 +980,7 @@ static cJSON *build_default_gw_v4(void)
 		return map;
 
 	char line[512];
-	if (fgets(line, sizeof line, f)) {   /* 헤더 한 줄 스킵 */
+	if (fgets(line, sizeof line, f)) {   /* skip header row */
 		while (fgets(line, sizeof line, f)) {
 			char iface[64];
 			unsigned long dest, gw, flags, mask;
@@ -934,8 +1004,7 @@ static cJSON *build_default_gw_v4(void)
 	return map;
 }
 
-/* 구조화 인터페이스 배열(name/address/prefix/family/kind/gateway, IPv6 포함).
- * cutover로 구형 ip_internal(CIDR 문자열, IPv4-only) 대체(단독 발행). */
+/* 구조화 인터페이스 배열(name/address/prefix/family/kind/gateway, IPv6 포함). */
 static cJSON *collect_interfaces(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1401,7 +1470,7 @@ static cJSON *collect_services(void)
 					if (!cJSON_IsString(u) || strcmp(u->valuestring, cur_id) != 0)
 						continue;
 					if (cJSON_GetObjectItemCaseSensitive(it, "pid"))
-						break;   /* 이미 설정됨 */
+						break;
 					if (cur_pid > 0) {
 						cJSON_AddNumberToObject(it, "pid", (double)cur_pid);
 						char comm[64];
@@ -1653,9 +1722,9 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	if (!add_mem_total_swap_total(root)) ok = 0;
 
 	cJSON_AddItemToObject(root, "disks",       or_empty_array(collect_disks()));
-	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts_inventory()));
+	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts(0)));
 
-	cJSON_AddItemToObject(root, "services",     collect_services());
+	cJSON_AddItemToObject(root, "services",     or_json_null(collect_services()));
 	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
 	cJSON_AddItemToObject(root, "interfaces",    or_empty_array(collect_interfaces()));
 	cJSON_AddItemToObject(root, "mac_addresses", or_empty_array(collect_mac_addresses()));
@@ -1674,21 +1743,25 @@ static int add_cpu_stat(cJSON *root)
 	char *content = read_file_all("/proc/stat");
 	if (!content)
 		return 0;
-	long u = 0, n = 0, s = 0, i = 0, w = 0, q = 0, sq = 0, st = 0;
+	long v[8] = { 0 };
 	int got = sscanf(content, "cpu  %ld %ld %ld %ld %ld %ld %ld %ld",
-	                 &u, &n, &s, &i, &w, &q, &sq, &st);
+	                 &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
 	free(content);
 	if (got < 4)
 		return 0;
+	/* sscanf fills left-to-right: fields [0,got) are measured, the rest weren't
+	 * present on this line — emit those as null, not a fabricated 0. Standard
+	 * /proc/stat on kernel 2.6.32+ always yields all 8. */
+	static const char *const keys[8] = {
+		"user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"
+	};
 	cJSON *obj = cJSON_CreateObject();
-	cJSON_AddNumberToObject(obj, "user",    (double)u);
-	cJSON_AddNumberToObject(obj, "nice",    (double)n);
-	cJSON_AddNumberToObject(obj, "system",  (double)s);
-	cJSON_AddNumberToObject(obj, "idle",    (double)i);
-	cJSON_AddNumberToObject(obj, "iowait",  (double)w);
-	cJSON_AddNumberToObject(obj, "irq",     (double)q);
-	cJSON_AddNumberToObject(obj, "softirq", (double)sq);
-	cJSON_AddNumberToObject(obj, "steal",   (double)st);
+	for (int k = 0; k < 8; k++) {
+		if (k < got)
+			cJSON_AddNumberToObject(obj, keys[k], (double)v[k]);
+		else
+			cJSON_AddNullToObject(obj, keys[k]);
+	}
 	cJSON_AddItemToObject(root, "cpu_stat", obj);
 	return 1;
 }
@@ -1769,10 +1842,12 @@ static int add_meminfo_full(cJSON *root)
 	long swap_total    = meminfo_get_kb(content, "SwapTotal");
 	long swap_free     = meminfo_get_kb(content, "SwapFree");
 
+	/* MemAvailable is kernel 3.14+. On older kernels (EL6 2.6.32, EL7 3.10)
+	 * reproduce the kernel's si_mem_available() from zoneinfo watermarks. If
+	 * even that can't be computed, leave it unmeasured (null) — do not fall
+	 * back to a free+buffers+cached guess, which overstates reclaimability. */
 	if (mem_available < 0)
 		mem_available = derive_mem_available_kb(content, mem_free);
-	if (mem_available < 0 && mem_free >= 0 && mem_buffers >= 0 && mem_cached >= 0)
-		mem_available = mem_free + mem_buffers + mem_cached;
 
 	free(content);
 
@@ -1840,13 +1915,22 @@ static cJSON *collect_disk_io(void)
 		if (access(path, F_OK) != 0)
 			continue;
 
+		/* n>=7 guarantees the read fields (cols 4,6). The write fields live at
+		 * cols 8 and 10 — emit null if this line was shorter than that rather
+		 * than a fabricated 0. Standard /proc/diskstats on 2.6.32+ has 14 cols. */
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "device", dev);
 		add_major_minor(item, (int)major, (int)minor);
 		cJSON_AddNumberToObject(item, "reads_completed",  (double)reads_completed);
-		cJSON_AddNumberToObject(item, "writes_completed", (double)writes_completed);
+		if (n >= 8)
+			cJSON_AddNumberToObject(item, "writes_completed", (double)writes_completed);
+		else
+			cJSON_AddNullToObject(item, "writes_completed");
 		cJSON_AddNumberToObject(item, "sectors_read",     (double)sectors_read);
-		cJSON_AddNumberToObject(item, "sectors_written",  (double)sectors_written);
+		if (n >= 10)
+			cJSON_AddNumberToObject(item, "sectors_written",  (double)sectors_written);
+		else
+			cJSON_AddNullToObject(item, "sectors_written");
 		cJSON_AddStringToObject(item, "kind", disk_kind(dev));
 		cJSON_AddItemToArray(arr, item);
 	}
@@ -1935,7 +2019,7 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	if (!add_loadavg(root))      ok = 0;
 
 	cJSON_AddItemToObject(root, "disk_io", or_empty_array(collect_disk_io()));
-	cJSON_AddItemToObject(root, "mounts",  or_empty_array(collect_mounts_metrics()));
+	cJSON_AddItemToObject(root, "mounts",  or_empty_array(collect_mounts(1)));
 	cJSON_AddItemToObject(root, "net_io",  or_empty_array(collect_net_io()));
 
 	if (!ok) {

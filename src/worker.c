@@ -223,6 +223,7 @@ static const char *reason_for_status(download_status_t  ds,
 	if (es == EXTRACT_ERR_INTERNAL)             return "internal_error";
 
 	if (xs == EXEC_ERR_SCRIPT_NOT_FOUND)        return "script_not_found";
+	if (xs == EXEC_ERR_SCRIPT_UNSAFE)           return "script_unsafe";
 	if (xs == EXEC_ERR_SCRIPT_FAILED)           return "script_failed";
 	if (xs == EXEC_ERR_SCRIPT_TIMEOUT)          return "script_timeout";
 	if (xs == EXEC_ERR_INTERNAL)                return "internal_error";
@@ -285,14 +286,22 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 		const cJSON *ja  = cJSON_GetObjectItemCaseSensitive(jinstall, "args");
 		if (cJSON_IsString(jty) && *jty->valuestring) install_type = jty->valuestring;
 		if (cJSON_IsString(js)) script      = js->valuestring;
-		if (cJSON_IsNumber(jt)) timeout_sec = (int)jt->valuedouble;
+		/* Non-positive timeout would disable both the wall-clock kill and the
+		 * RLIMIT_CPU cap in exec.c, hanging the single in-flight worker slot.
+		 * Ignore it and keep the default. */
+		if (cJSON_IsNumber(jt) && jt->valuedouble > 0) timeout_sec = (int)jt->valuedouble;
 		if (cJSON_IsArray(ja)) {
 			int n = cJSON_GetArraySize(ja);
 			iargs = (const char **)calloc((size_t)n + 1, sizeof(char *));
 			if (iargs) {
+				/* Compact: keep only string args, in order. A non-string
+				 * element (argv can't carry it) is skipped rather than left
+				 * as a NULL hole that would truncate every later arg in
+				 * exec.c's NULL-terminated argv scan. */
+				int j = 0;
 				for (int i = 0; i < n; i++) {
 					const cJSON *e = cJSON_GetArrayItem(ja, i);
-					if (cJSON_IsString(e)) iargs[i] = e->valuestring;
+					if (cJSON_IsString(e)) iargs[j++] = e->valuestring;
 				}
 			}
 		}
@@ -355,7 +364,11 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 
 	int success = (ds == DOWNLOAD_OK && es == EXTRACT_OK && xs == EXEC_OK);
 	const char *reason = success ? "" : reason_for_status(ds, es, xs);
-	int has_exit = (xs != EXEC_ERR_SCRIPT_NOT_FOUND && xs != EXEC_ERR_INTERNAL &&
+	/* exit_code is a real measurement only when the script exited normally.
+	 * A signal-killed child (timeout SIGKILL, or a crash) has signal_no>0 and
+	 * leaves exit_code at its -1 placeholder — emit null, not a fake -1. */
+	int has_exit = (xs != EXEC_ERR_SCRIPT_NOT_FOUND && xs != EXEC_ERR_SCRIPT_UNSAFE &&
+	                xs != EXEC_ERR_INTERNAL && er.signal_no == 0 &&
 	                ds == DOWNLOAD_OK && es == EXTRACT_OK);
 
 	char *res = build_result_json(ctx, task_id,

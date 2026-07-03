@@ -6,11 +6,11 @@
 # needed by `make vendor-build` (mostly: compiler toolchain, cmake, git, and
 # Perl + IPC::Cmd which OpenSSL 3.0+ Configure requires).
 #
-# Two ways the project consumes this:
-#   - Native amd64 build host: operator runs `sudo bash scripts/build-prep.sh`
-#     once, then `make vendor-fetch && make vendor-build && make USE_VENDORED=1 release`
-#   - Containerized build: `scripts/build-linux.sh` calls this from inside
-#     the manylinux2014 container automatically (yum branch).
+# This is for the NATIVE-host dev build only: operator runs
+# `sudo bash scripts/build-prep.sh` once, then `make vendor-fetch &&
+# make vendor-build && make USE_VENDORED=1 release`. Note a native glibc host
+# yields a glibc binary — the musl static RELEASE artifact comes exclusively
+# from scripts/build-linux.sh (Alpine container, apk add — does not call this).
 
 set -eu
 
@@ -58,9 +58,9 @@ elif command -v yum >/dev/null 2>&1; then
 		try_install_one yum "$pkg"
 	done
 	# cmake 최소 요구: rabbitmq-c v0.15.0 은 CMake 3.22+ 를 요구한다.
-	# 최신 manylinux 이미지엔 이미 pipx cmake(4.x)가 /usr/local/bin/cmake 로 있으므로,
-	# EPEL cmake3(3.17)로 덮어쓰면 오히려 강등되어 rabbitmq-c 빌드가 깨진다.
-	# 기존 cmake 가 3.22+ 이면 손대지 않고, 그보다 낮을 때만 cmake3 로 보강한다.
+	# 호스트에 이미 3.22+ cmake 가 있으면 EPEL cmake3(3.17)로 덮어쓸 때 오히려
+	# 강등되어 rabbitmq-c 빌드가 깨진다. 그래서 기존 cmake 가 3.22+ 이면 손대지
+	# 않고, 그보다 낮을 때만 cmake3 로 보강한다.
 	cmake_ok=0
 	have=$(cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
 	if [ -n "$have" ]; then

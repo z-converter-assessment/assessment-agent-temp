@@ -26,14 +26,31 @@
 #include <winperf.h>
 #include "nt52_compat.h"
 
-#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
-#define AGENT_NT6 1
-#else
-#define AGENT_NT6 0
-#endif
+/* ---- 런타임 capability dispatch (NT5.2 단일 바이너리) ----
+ * 하나의 i686 바이너리가 NT5.2(2003/XP)부터 NT10까지 커버한다. NT6+ 전용 API를 하드임포트하면
+ * 2003/XP에서 로드가 실패하므로 전부 GetProcAddress로 런타임 해소하고, 세대 분기는 컴파일 타임이 아니라
+ * RtlGetVersion(major>=6)으로 실행 시 고른다. 패턴은 util.c monotonic_ms / compat_rand_bytes와 동일. */
+static int agent_is_nt6(void)
+{
+	static int resolved = 0, is_nt6 = 0;
+	if (!resolved) {
+		resolved = 1;
+		HMODULE nt = GetModuleHandleA("ntdll.dll");
+		typedef LONG (WINAPI *RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+		RtlGetVersionFn rgv = nt ? (RtlGetVersionFn)(void *)GetProcAddress(nt, "RtlGetVersion") : NULL;
+		if (rgv) {
+			RTL_OSVERSIONINFOW vi;
+			ZeroMemory(&vi, sizeof vi);
+			vi.dwOSVersionInfoSize = sizeof vi;
+			if (rgv(&vi) == 0)
+				is_nt6 = (vi.dwMajorVersion >= 6);
+		}
+	}
+	return is_nt6;
+}
 
-#if !AGENT_NT6
-
+/* NT5.2 ws2_32엔 inet_ntop이 없다(Vista+ export). 완전형 formatter를 항상 컴파일해두고,
+ * NT6+에선 real inet_ntop을 런타임 해소해 압축형(::1)을, NT5.2에선 이 완전형을 쓴다. */
 static const char *compat_inet_ntop(int af, const void *src, char *dst, size_t size)
 {
 	const unsigned char *b = (const unsigned char *)src;
@@ -51,8 +68,23 @@ static const char *compat_inet_ntop(int af, const void *src, char *dst, size_t s
 	}
 	return NULL;
 }
-#define inet_ntop compat_inet_ntop
-#endif
+
+static const char *agent_inet_ntop(int af, const void *src, char *dst, size_t size)
+{
+	typedef PCSTR (WSAAPI *inet_ntop_fn)(INT, const void *, PSTR, size_t);
+	static int resolved = 0;
+	static inet_ntop_fn real = NULL;
+	if (!resolved) {
+		resolved = 1;
+		HMODULE ws = GetModuleHandleA("ws2_32.dll");
+		if (ws)
+			real = (inet_ntop_fn)(void *)GetProcAddress(ws, "inet_ntop");
+	}
+	if (real)
+		return real(af, src, dst, size);
+	return compat_inet_ntop(af, src, dst, size);
+}
+#define inet_ntop agent_inet_ntop
 
 static char g_boot_time_iso[32]      = {0};
 static char g_agent_started_iso[32]  = {0};
@@ -204,7 +236,7 @@ static void cpu_model_string(char *out, size_t len)
 	int regs[4] = {0};
 	__cpuid(regs, 0x80000000);
 	if ((unsigned)regs[0] < 0x80000004) {
-		snprintf(out, len, "Unknown");
+		if (len) out[0] = '\0';   /* brand string unsupported -> caller emits null */
 		return;
 	}
 	char brand[49] = {0};
@@ -335,8 +367,8 @@ static cJSON *enumerate_physical_disks(void)
 			char name[32];
 			snprintf(name, sizeof name, "PhysicalDrive%d", i);
 			cJSON_AddStringToObject(o, "name", name);
-			cJSON_AddNumberToObject(o, "major", 0);
-			cJSON_AddNumberToObject(o, "minor", i);
+			cJSON_AddNullToObject(o, "major");   /* dev_t is Linux-only */
+			cJSON_AddNullToObject(o, "minor");
 			cJSON_AddNumberToObject(o, "size_bytes", (double)gli.Length.QuadPart);
 			cJSON_AddStringToObject(o, "type", "disk");
 			cJSON_AddStringToObject(o, "kind", "physical");
@@ -377,25 +409,13 @@ static cJSON *query_disk_queue(void)
 	return arr;
 }
 
-static int drive_letter_to_phys_num(wchar_t letter)
-{
-	wchar_t path[8];
-	swprintf(path, 8, L"\\\\.\\%c:", (int)letter);
-	HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
-	                       NULL, OPEN_EXISTING, 0, NULL);
-	if (h == INVALID_HANDLE_VALUE) return -1;
-	STORAGE_DEVICE_NUMBER sdn;
-	DWORD ret = 0;
-	int n = -1;
-	if (DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0,
-	                    &sdn, sizeof sdn, &ret, NULL)) {
-		n = (int)sdn.DeviceNumber;
-	}
-	CloseHandle(h);
-	return n;
-}
-
-static cJSON *enumerate_mounts(int include_fstype)
+/* Split by role to mirror Linux collect_mounts(with_usage):
+ *   with_usage=0 (inventory) -> structure: mount/kind/fstype/total_bytes + major/minor(null)
+ *   with_usage=1 (metrics)   -> usage:     mount/kind/fstype/total_bytes + free/avail
+ * Dynamic free/avail live only in metrics so disk usage is not duplicated into
+ * every inventory snapshot. GetVolumeInformationW/GetDiskFreeSpaceExW are on
+ * NT5.2 kernel32 — no NT6 API involved. */
+static cJSON *enumerate_mounts(int with_usage)
 {
 	cJSON *arr = cJSON_CreateArray();
 	wchar_t drives[256];
@@ -411,26 +431,27 @@ static cJSON *enumerate_mounts(int include_fstype)
 				char mount[16];
 				WideCharToMultiByte(CP_UTF8, 0, p, -1, mount, sizeof mount, NULL, NULL);
 				cJSON_AddStringToObject(o, "mount", mount);
-
-				int dnum = drive_letter_to_phys_num(p[0]);
-				cJSON_AddNumberToObject(o, "major", 0);
-				cJSON_AddNumberToObject(o, "minor", dnum >= 0 ? dnum : 0);
-				cJSON_AddNumberToObject(o, "total_bytes", (double)total.QuadPart);
-				cJSON_AddNumberToObject(o, "free_bytes",  (double)total_free.QuadPart);
-				cJSON_AddNumberToObject(o, "avail_bytes", (double)avail_to_caller.QuadPart);
 				cJSON_AddStringToObject(o, "kind", "data");
 
-				if (include_fstype) {
-					wchar_t fs[16] = {0};
-					if (GetVolumeInformationW(p, NULL, 0, NULL, NULL, NULL, fs, 16)) {
-						char fstype[16];
-						WideCharToMultiByte(CP_UTF8, 0, fs, -1, fstype, sizeof fstype, NULL, NULL);
-						for (char *q = fstype; *q; q++)
-							*q = (char)tolower((unsigned char)*q);
-						cJSON_AddStringToObject(o, "fstype", fstype);
-					} else {
-						cJSON_AddNullToObject(o, "fstype");
-					}
+				wchar_t fs[16] = {0};
+				if (GetVolumeInformationW(p, NULL, 0, NULL, NULL, NULL, fs, 16)) {
+					char fstype[16];
+					WideCharToMultiByte(CP_UTF8, 0, fs, -1, fstype, sizeof fstype, NULL, NULL);
+					for (char *q = fstype; *q; q++)
+						*q = (char)tolower((unsigned char)*q);
+					cJSON_AddStringToObject(o, "fstype", fstype);
+				} else {
+					cJSON_AddNullToObject(o, "fstype");
+				}
+
+				cJSON_AddNumberToObject(o, "total_bytes", (double)total.QuadPart);
+				if (with_usage) {
+					cJSON_AddNumberToObject(o, "free_bytes",  (double)total_free.QuadPart);
+					cJSON_AddNumberToObject(o, "avail_bytes", (double)avail_to_caller.QuadPart);
+				} else {
+					/* dev_t (major:minor) is a Linux concept absent on Windows. */
+					cJSON_AddNullToObject(o, "major");
+					cJSON_AddNullToObject(o, "minor");
 				}
 				cJSON_AddItemToArray(arr, o);
 			}
@@ -614,8 +635,8 @@ static void disk_io_perflib(cJSON *arr)
 				snprintf(dev, sizeof dev, "PhysicalDrive%d", drive);
 				cJSON *e = cJSON_CreateObject();
 				cJSON_AddStringToObject(e, "device", dev);
-				cJSON_AddNumberToObject(e, "major", 0);
-				cJSON_AddNumberToObject(e, "minor", drive);
+				cJSON_AddNullToObject(e, "major");   /* dev_t is Linux-only */
+				cJSON_AddNullToObject(e, "minor");
 				cJSON_AddNumberToObject(e, "reads_completed",  (double)perf_read(cb, c_r));
 				cJSON_AddNumberToObject(e, "writes_completed", (double)perf_read(cb, c_w));
 				cJSON_AddNumberToObject(e, "sectors_read",     (double)(perf_read(cb, c_rb) / 512));
@@ -640,8 +661,8 @@ static cJSON *enumerate_disk_io(void)
 	if (query_system_io(&rop, &wop, &rby, &wby)) {
 		cJSON *e = cJSON_CreateObject();
 		cJSON_AddStringToObject(e, "device", "PhysicalDrive0");
-		cJSON_AddNumberToObject(e, "major", 0);
-		cJSON_AddNumberToObject(e, "minor", 0);
+		cJSON_AddNullToObject(e, "major");   /* dev_t is Linux-only */
+		cJSON_AddNullToObject(e, "minor");
 		cJSON_AddNumberToObject(e, "reads_completed",  (double)rop);
 		cJSON_AddNumberToObject(e, "writes_completed", (double)wop);
 		cJSON_AddNumberToObject(e, "sectors_read",     (double)(rby / 512));
@@ -665,43 +686,57 @@ static const char *win_net_kind(ULONG if_type)
 	return "virtual";
 }
 
-#if AGENT_NT6
+/* NT6.1+: GetIfTable2(64비트 카운터 + FilterInterface 중복 제거). GetIfTable2/FreeMibTable가
+ * 해소되면 이 경로, 아니면(NT5.2) GetIfTable 폴백. 두 경로 모두 하나의 바이너리에 포함. */
 static cJSON *enumerate_net_io(void)
 {
-	cJSON *arr = cJSON_CreateArray();
-	PMIB_IF_TABLE2 table = NULL;
-	if (GetIfTable2(&table) != NO_ERROR || !table) return arr;
-	for (ULONG i = 0; i < table->NumEntries; i++) {
-		MIB_IF_ROW2 *r = &table->Table[i];
-		if (r->Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-		if (r->OperStatus != IfOperStatusUp) continue;
-		/* WFP/QoS 필터 드라이버는 기반 NIC의 카운터를 그대로 복제한다 -> 스킵(중복 합산 방지). */
-		if (r->InterfaceAndOperStatusFlags.FilterInterface) continue;
-
-		char name[256];
-		WideCharToMultiByte(CP_UTF8, 0, r->Alias, -1, name, sizeof name, NULL, NULL);
-
-		cJSON *o = cJSON_CreateObject();
-		cJSON_AddStringToObject(o, "interface", name);
-		cJSON_AddNumberToObject(o, "rx_bytes",   (double)r->InOctets);
-		cJSON_AddNumberToObject(o, "tx_bytes",   (double)r->OutOctets);
-		cJSON_AddNumberToObject(o, "rx_packets", (double)(r->InUcastPkts + r->InNUcastPkts));
-		cJSON_AddNumberToObject(o, "tx_packets", (double)(r->OutUcastPkts + r->OutNUcastPkts));
-		cJSON_AddNumberToObject(o, "rx_errors",  (double)r->InErrors);
-		cJSON_AddNumberToObject(o, "tx_errors",  (double)r->OutErrors);
-		/* 하드웨어 NIC만 win_net_kind(physical 가능). 비-하드웨어(가상/miniport)는 virtual. */
-		cJSON_AddStringToObject(o, "kind",
-		    r->InterfaceAndOperStatusFlags.HardwareInterface ? win_net_kind(r->Type) : "virtual");
-		cJSON_AddItemToArray(arr, o);
+	typedef DWORD (WINAPI *GetIfTable2_fn)(PMIB_IF_TABLE2 *);
+	typedef void  (WINAPI *FreeMibTable_fn)(PVOID);
+	static int resolved = 0;
+	static GetIfTable2_fn p_get   = NULL;
+	static FreeMibTable_fn p_free = NULL;
+	if (!resolved) {
+		resolved = 1;
+		HMODULE ip = GetModuleHandleA("iphlpapi.dll");
+		if (ip) {
+			p_get  = (GetIfTable2_fn)(void *)GetProcAddress(ip, "GetIfTable2");
+			p_free = (FreeMibTable_fn)(void *)GetProcAddress(ip, "FreeMibTable");
+		}
 	}
-	FreeMibTable(table);
-	return arr;
-}
-#else
 
-static cJSON *enumerate_net_io(void)
-{
 	cJSON *arr = cJSON_CreateArray();
+
+	if (p_get && p_free) {
+		PMIB_IF_TABLE2 table = NULL;
+		if (p_get(&table) != NO_ERROR || !table) return arr;
+		for (ULONG i = 0; i < table->NumEntries; i++) {
+			MIB_IF_ROW2 *r = &table->Table[i];
+			if (r->Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+			if (r->OperStatus != IfOperStatusUp) continue;
+			/* WFP/QoS 필터 드라이버는 기반 NIC의 카운터를 그대로 복제한다 -> 스킵(중복 합산 방지). */
+			if (r->InterfaceAndOperStatusFlags.FilterInterface) continue;
+
+			char name[256];
+			WideCharToMultiByte(CP_UTF8, 0, r->Alias, -1, name, sizeof name, NULL, NULL);
+
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddStringToObject(o, "interface", name);
+			cJSON_AddNumberToObject(o, "rx_bytes",   (double)r->InOctets);
+			cJSON_AddNumberToObject(o, "tx_bytes",   (double)r->OutOctets);
+			cJSON_AddNumberToObject(o, "rx_packets", (double)(r->InUcastPkts + r->InNUcastPkts));
+			cJSON_AddNumberToObject(o, "tx_packets", (double)(r->OutUcastPkts + r->OutNUcastPkts));
+			cJSON_AddNumberToObject(o, "rx_errors",  (double)r->InErrors);
+			cJSON_AddNumberToObject(o, "tx_errors",  (double)r->OutErrors);
+			/* 하드웨어 NIC만 win_net_kind(physical 가능). 비-하드웨어(가상/miniport)는 virtual. */
+			cJSON_AddStringToObject(o, "kind",
+			    r->InterfaceAndOperStatusFlags.HardwareInterface ? win_net_kind(r->Type) : "virtual");
+			cJSON_AddItemToArray(arr, o);
+		}
+		p_free(table);
+		return arr;
+	}
+
+	/* NT5.2 폴백: GetIfTable(32비트 카운터, 4GB wrap). */
 	ULONG sz = 0;
 	if (GetIfTable(NULL, &sz, FALSE) != ERROR_INSUFFICIENT_BUFFER) return arr;
 	MIB_IFTABLE *t = (MIB_IFTABLE *)malloc(sz);
@@ -711,15 +746,23 @@ static cJSON *enumerate_net_io(void)
 		MIB_IFROW *r = &t->table[i];
 		if (r->dwType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
 
+		/* NT5.2의 wszName은 null-termination이 불안정해(인접 struct 메모리로 새 나가 깨진 문자열이
+		 * 나옴) 신뢰할 수 없다. 길이가 명시된 bDescr(ANSI 어댑터 설명)를 우선 쓰고, 없을 때만
+		 * wszName을 길이 제한 변환한다. name은 반드시 초기화해 변환 실패 시 스택 쓰레기가 남지 않게 한다. */
 		char name[256];
-		WideCharToMultiByte(CP_UTF8, 0, r->wszName, -1, name, sizeof name, NULL, NULL);
-
-		if (name[0] == '\0') {
-			if (r->dwDescrLen > 0 && r->bDescr[0])
-				snprintf(name, sizeof name, "%.*s", (int)r->dwDescrLen, (char *)r->bDescr);
-			else
-				snprintf(name, sizeof name, "if%lu", (unsigned long)r->dwIndex);
+		name[0] = '\0';
+		if (r->dwDescrLen > 0 && r->bDescr[0]) {
+			int dl = (int)r->dwDescrLen;
+			if (dl >= (int)sizeof name) dl = (int)sizeof name - 1;
+			snprintf(name, sizeof name, "%.*s", dl, (char *)r->bDescr);
 		}
+		if (name[0] == '\0') {
+			int n = WideCharToMultiByte(CP_UTF8, 0, r->wszName, MAX_INTERFACE_NAME_LEN,
+			                            name, (int)sizeof name - 1, NULL, NULL);
+			name[(n > 0 && n < (int)sizeof name) ? n : 0] = '\0';
+		}
+		if (name[0] == '\0')
+			snprintf(name, sizeof name, "if%lu", (unsigned long)r->dwIndex);
 
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddStringToObject(o, "interface", name);
@@ -735,16 +778,15 @@ static cJSON *enumerate_net_io(void)
 	free(t);
 	return arr;
 }
-#endif
 
 static int mac_cmp(const void *a, const void *b)
 {
 	return strcmp(*(const char **)a, *(const char **)b);
 }
 
-#if !AGENT_NT6
 /* NT5.2: GAA가 gateway를 안 줘, IfIndex의 IPv4 default route gateway를
- * GetIpForwardTable(NT4+)에서 직접 찾는다. NT6+는 FirstGatewayAddress를 쓴다. */
+ * GetIpForwardTable(NT4+)에서 직접 찾는다. NT6+는 FirstGatewayAddress를 쓴다.
+ * 두 경로 모두 바이너리에 포함되어 런타임에 선택된다. */
 static int legacy_ipv4_gateway(DWORD if_index, char *out, size_t out_sz)
 {
 	ULONG sz = 0;
@@ -768,7 +810,36 @@ static int legacy_ipv4_gateway(DWORD if_index, char *out, size_t out_sz)
 	free(t);
 	return found;
 }
-#endif
+
+/* NT5.2 GAA(구형 IP_ADAPTER_UNICAST_ADDRESS)엔 OnLinkPrefixLength가 없다. IPv4 prefix
+ * (netmask 길이)는 GetIpAddrTable(NT4+)의 dwMask 에서 실측한다 — 마스크는 연속 비트라
+ * popcount = prefix 길이. gateway 를 GetIpForwardTable 로 뽑는 것과 같은 세대-dispatch 실측
+ * 이다(측정 가능한 값을 null 로 두지 않는다). IPv6 는 이 테이블에 없어 측정 불가 -> 호출측 null.
+ * NT6+는 OnLinkPrefixLength 를 직접 쓴다. addr_be/dwAddr 은 둘 다 network byte order. */
+static int legacy_ipv4_prefix(DWORD if_index, unsigned addr_be, int *out_prefix)
+{
+	ULONG sz = 0;
+	if (GetIpAddrTable(NULL, &sz, FALSE) != ERROR_INSUFFICIENT_BUFFER)
+		return 0;
+	MIB_IPADDRTABLE *t = malloc(sz);
+	if (!t)
+		return 0;
+	int found = 0;
+	if (GetIpAddrTable(t, &sz, FALSE) == NO_ERROR) {
+		for (DWORD i = 0; i < t->dwNumEntries; i++) {
+			MIB_IPADDRROW *r = &t->table[i];
+			if (r->dwIndex == if_index && r->dwAddr == addr_be) {
+				unsigned m = r->dwMask, n = 0;
+				while (m) { n += m & 1u; m >>= 1; }
+				*out_prefix = (int)n;
+				found = 1;
+				break;
+			}
+		}
+	}
+	free(t);
+	return found;
+}
 
 static void fill_network_info(cJSON *inv)
 {
@@ -778,9 +849,8 @@ static void fill_network_info(cJSON *inv)
 	/* gateway = 이 주소와 같은 family의 default route. NT6+는 GAA_FLAG_INCLUDE_GATEWAYS의
 	 * FirstGatewayAddress, NT5.2는 GetIpForwardTable(IPv4 default route)로 얻는다. */
 	ULONG gaa_flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-#if AGENT_NT6
-	gaa_flags |= GAA_FLAG_INCLUDE_GATEWAYS;
-#endif
+	if (agent_is_nt6())
+		gaa_flags |= GAA_FLAG_INCLUDE_GATEWAYS;
 
 	ULONG buf_len = 16 * 1024;
 	IP_ADAPTER_ADDRESSES *aa = malloc(buf_len);
@@ -817,45 +887,54 @@ static void fill_network_info(cJSON *inv)
 				family = "ipv6";
 			}
 			if (!ip[0]) continue;
-			unsigned prefix = 0;
-#if AGENT_NT6
-			prefix = (unsigned)u->OnLinkPrefixLength;
-#endif
+			/* prefix(netmask 길이): NT6+는 OnLinkPrefixLength, NT5.2는 구형 구조체라 이 필드가
+			 * 없어 IPv4 는 GetIpAddrTable(dwMask)로 실측한다. IPv6(NT5.2)는 측정 불가 -> null.
+			 * -1 = 미측정. 0 은 유효한 /0 실측과 구분해야 하므로 null 로 발행한다. */
+			int prefix = -1;
+			if (agent_is_nt6()) {
+				prefix = (int)u->OnLinkPrefixLength;
+			} else if (u->Address.lpSockaddr &&
+			           u->Address.lpSockaddr->sa_family == AF_INET) {
+				unsigned addr_be =
+					((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.S_un.S_addr;
+				int pfx;
+				if (legacy_ipv4_prefix(p->IfIndex, addr_be, &pfx))
+					prefix = pfx;
+			}
 
-			/* 구조화 interfaces[] (name/address/prefix/family/kind).
-			 * cutover로 구형 ip_internal 대체(단독 발행). */
+			/* 구조화 interfaces[] (name/address/prefix/family/kind). */
 			char ifname[256];
 			WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1,
 			                    ifname, sizeof ifname, NULL, NULL);
 			cJSON *io = cJSON_CreateObject();
 			cJSON_AddStringToObject(io, "name",    ifname);
 			cJSON_AddStringToObject(io, "address", ip);
-			cJSON_AddNumberToObject(io, "prefix",  (double)prefix);
+			if (prefix >= 0) cJSON_AddNumberToObject(io, "prefix", (double)prefix);
+			else             cJSON_AddNullToObject(io, "prefix");
 			cJSON_AddStringToObject(io, "family",  family ? family : "");
 			cJSON_AddStringToObject(io, "kind",    win_net_kind(p->IfType));
 
 			/* gateway = 이 주소와 같은 family의 default route. NT6+는 FirstGatewayAddress,
 			 * NT5.2는 GetIpForwardTable(IPv4 default route). IPv6 항목은 null. */
 			cJSON *gw_item = NULL;
-#if AGENT_NT6
-			int ufam = u->Address.lpSockaddr->sa_family;
-			for (IP_ADAPTER_GATEWAY_ADDRESS_LH *g = p->FirstGatewayAddress; g; g = g->Next) {
-				if (!g->Address.lpSockaddr || g->Address.lpSockaddr->sa_family != ufam)
-					continue;
-				char gbuf[INET6_ADDRSTRLEN] = {0};
-				if (ufam == AF_INET)
-					inet_ntop(AF_INET, &((struct sockaddr_in *)g->Address.lpSockaddr)->sin_addr, gbuf, sizeof gbuf);
-				else if (ufam == AF_INET6)
-					inet_ntop(AF_INET6, &((struct sockaddr_in6 *)g->Address.lpSockaddr)->sin6_addr, gbuf, sizeof gbuf);
-				if (gbuf[0]) { gw_item = cJSON_CreateString(gbuf); break; }
-			}
-#else
-			if (u->Address.lpSockaddr->sa_family == AF_INET) {
+			if (agent_is_nt6()) {
+				int ufam = u->Address.lpSockaddr->sa_family;
+				for (IP_ADAPTER_GATEWAY_ADDRESS_LH *g = p->FirstGatewayAddress; g; g = g->Next) {
+					if (!g->Address.lpSockaddr || g->Address.lpSockaddr->sa_family != ufam)
+						continue;
+					char gbuf[INET6_ADDRSTRLEN] = {0};
+					if (ufam == AF_INET)
+						inet_ntop(AF_INET, &((struct sockaddr_in *)g->Address.lpSockaddr)->sin_addr, gbuf, sizeof gbuf);
+					else if (ufam == AF_INET6)
+						inet_ntop(AF_INET6, &((struct sockaddr_in6 *)g->Address.lpSockaddr)->sin6_addr, gbuf, sizeof gbuf);
+					if (gbuf[0]) { gw_item = cJSON_CreateString(gbuf); break; }
+				}
+			} else if (u->Address.lpSockaddr->sa_family == AF_INET) {
+				/* NT5.2: GAA가 gateway 미제공 -> IPv4 default route. IPv6 gateway는 null. */
 				char gbuf[INET_ADDRSTRLEN];
 				if (legacy_ipv4_gateway(p->IfIndex, gbuf, sizeof gbuf))
 					gw_item = cJSON_CreateString(gbuf);
 			}
-#endif
 			cJSON_AddItemToObject(io, "gateway", gw_item ? gw_item : cJSON_CreateNull());
 			cJSON_AddItemToArray(ifaces, io);
 		}
@@ -1237,28 +1316,38 @@ static void fill_comm_for_pid(DWORD pid, char *out, size_t out_sz)
 {
 	out[0] = '\0';
 	if (pid == 0) return;
-#if AGENT_NT6
-	/* 1차: QueryFullProcessImageName(전체 경로 -> 베이스명). System(4) 등 보호 프로세스는
-	 * OpenProcess가 거부돼 결과가 비므로 2차로 Toolhelp32 폴백. */
-	HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-	if (hp) {
-		wchar_t wname[1024];
-		DWORD wsz = 1024;
-		if (QueryFullProcessImageNameW(hp, 0, wname, &wsz)) {
-			wchar_t *base = wcsrchr(wname, L'\\');
-			base = base ? base + 1 : wname;
-			WideCharToMultiByte(CP_UTF8, 0, base, -1, out, (int)out_sz, NULL, NULL);
-			char *dot = strrchr(out, '.');
-			if (dot && _stricmp(dot, ".exe") == 0) *dot = '\0';
+
+	/* 1차: QueryFullProcessImageName(전체 경로 -> 베이스명). NT6+ export라 런타임 해소한다.
+	 * WOW64 32비트 프로세스에서도 64비트 대상 프로세스의 네이티브 경로를 정상적으로 준다.
+	 * System(4) 등 보호 프로세스는 OpenProcess가 거부돼 결과가 비므로 2차로 Toolhelp32 폴백.
+	 * NT5.2(2003/XP)엔 QueryFullProcessImageName이 없어 Toolhelp32만 쓴다. */
+	typedef BOOL (WINAPI *QFPIN_fn)(HANDLE, DWORD, LPWSTR, PDWORD);
+	static int resolved = 0;
+	static QFPIN_fn p_qfpin = NULL;
+	if (!resolved) {
+		resolved = 1;
+		HMODULE k = GetModuleHandleA("kernel32.dll");
+		if (k)
+			p_qfpin = (QFPIN_fn)(void *)GetProcAddress(k, "QueryFullProcessImageNameW");
+	}
+
+	if (p_qfpin) {
+		HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+		if (hp) {
+			wchar_t wname[1024];
+			DWORD wsz = 1024;
+			if (p_qfpin(hp, 0, wname, &wsz)) {
+				wchar_t *base = wcsrchr(wname, L'\\');
+				base = base ? base + 1 : wname;
+				WideCharToMultiByte(CP_UTF8, 0, base, -1, out, (int)out_sz, NULL, NULL);
+				char *dot = strrchr(out, '.');
+				if (dot && _stricmp(dot, ".exe") == 0) *dot = '\0';
+			}
+			CloseHandle(hp);
 		}
-		CloseHandle(hp);
 	}
 	if (!out[0])
 		fill_comm_toolhelp(pid, out, out_sz);
-#else
-	/* NT5.2(2003/XP): QueryFullProcessImageName이 없어 Toolhelp32만 쓴다. */
-	fill_comm_toolhelp(pid, out, out_sz);
-#endif
 }
 
 static void add_listen_entry(cJSON *arr, const char *proto, const char *addr,
@@ -1398,9 +1487,11 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	char display[64] = {0}, build[64] = {0};
 	os_version_info(display, sizeof display, build, sizeof build);
-	cJSON_AddStringToObject(m, "os_version",    display[0] ? display : "");
+	if (display[0]) cJSON_AddStringToObject(m, "os_version", display);
+	else            cJSON_AddNullToObject  (m, "os_version");
 	cJSON_AddNullToObject  (m, "os_codename");
-	cJSON_AddStringToObject(m, "kernel_version", build[0] ? build : "");
+	if (build[0]) cJSON_AddStringToObject(m, "kernel_version", build);
+	else          cJSON_AddNullToObject  (m, "kernel_version");
 
 	SYSTEM_INFO si;
 	GetNativeSystemInfo(&si);
@@ -1408,12 +1499,13 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	char cpu_brand[64];
 	cpu_model_string(cpu_brand, sizeof cpu_brand);
-	cJSON_AddStringToObject(m, "cpu_model", cpu_brand);
+	if (cpu_brand[0]) cJSON_AddStringToObject(m, "cpu_model", cpu_brand);
+	else              cJSON_AddNullToObject  (m, "cpu_model");
 
 	fill_memory_inventory(m);
 
 	cJSON_AddItemToObject(m, "disks",        enumerate_physical_disks());
-	cJSON_AddItemToObject(m, "mounts",       enumerate_mounts(1));
+	cJSON_AddItemToObject(m, "mounts",       enumerate_mounts(0));
 	cJSON_AddItemToObject(m, "services",     enumerate_running_services());
 	cJSON_AddItemToObject(m, "listen_ports", enumerate_listen_ports());
 
@@ -1497,7 +1589,7 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	cJSON_AddNullToObject(m, "load_15m");
 
 	cJSON_AddItemToObject(m, "disk_io", enumerate_disk_io());
-	cJSON_AddItemToObject(m, "mounts",  enumerate_mounts(0));
+	cJSON_AddItemToObject(m, "mounts",  enumerate_mounts(1));
 	cJSON_AddItemToObject(m, "net_io",  enumerate_net_io());
 	fill_saturation(m);
 

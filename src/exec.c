@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "exec.h"
+#include "extract.h"
 #include "util.h"
 
 #include <errno.h>
@@ -162,6 +163,12 @@ exec_status_t exec_install_script(const char  *extract_dir,
 
 	memset(out, 0, sizeof *out);
 	out->exit_code = -1;
+
+	/* script must stay inside the extracted package. extract_path_safe rejects
+	 * absolute paths and any ".." component, so "../../bin/sh" can't escape the
+	 * workspace via the "%s/%s" join below or the "./%s" execve target. */
+	if (!extract_path_safe(script))
+		return EXEC_ERR_SCRIPT_UNSAFE;
 
 	{
 		char full[4096];

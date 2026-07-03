@@ -1,6 +1,6 @@
 # payload 계약 (에이전트 -> 엔진)
 
-에이전트가 RabbitMQ 브로커로 발행하는 wire 계약. 5종 바이너리 모두 동일 스키마다.
+에이전트가 RabbitMQ 브로커로 발행하는 wire 계약. 2종 바이너리 모두 동일 스키마다.
 Linux/Windows 차이는 아래 "OS별 차이"에만 있다.
 
 ## 메시지 종류와 라우팅 키
@@ -43,15 +43,15 @@ CI가 git 태그에서 주입한다(`v1.0.0` -> `1.0.0`, release.yml). 로컬/de
 | kernel_version | 커널 |
 | mem_total_kb, swap_total_kb | 메모리/스왑 총량 |
 | disks[] | 물리 디스크. device/kind/major/minor/size 등 |
-| mounts[] | 마운트. mount/kind/fstype/total_bytes 등 |
+| mounts[] | 마운트 구조. mount/major/minor/total_bytes/fstype/kind. 동적 사용량(free/avail)은 싣지 않는다(metrics 전담) |
 | services[] | 서비스. unit/sub/pid/exe |
 | listen_ports[] | 리슨 소켓. proto/addr/port/pid/comm |
 | interfaces[] | 인터페이스. name/address/prefix/family/kind/gateway (IPv4+IPv6) |
 | mac_addresses[] | MAC 목록(감사용) |
-| ip_external[] | 외부 IP |
+| ip_external[] | 외부(공인) IP. IMDS 전용 best-effort — 클라우드 메타데이터(AWS/Azure/GCP)나 AGENT_EXTERNAL_IP env 로만 채운다. VM 게스트는 NAT된 공인 IP를 자기 인터페이스에서 볼 수 없어, IMDS 없는 환경(OpenStack floating IP 등)에서는 null. floating IP 매핑이 필요하면 엔진이 클라우드 API로 채운다(에이전트 범위 밖) |
 
 services.pid와 listen_ports.pid로 unit-포트 조인이 가능하다. Linux services는 systemd unit(systemctl) 기반이고, systemd가 없는 SysV 호스트(CentOS/RHEL 6)는 /var/lock/subsys의 실행 중 서비스를 열거해 /var/run/<name>.pid로 pid/exe를 채운다. 표준 pid 파일이 있는 데몬만 pid/exe가 차고, 부팅 1회성 스크립트(iptables/network 등)·pid 파일이 표준 위치에 없는 데몬·systemd의 socket·MainPID 없는 unit은 pid/exe=null이다(추측 pid를 넣지 않는다). Windows는 SCM(EnumServicesStatusEx)에서 pid/exe를 채운다.
-interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 IP(없으면 null). Linux는 IPv4 default route(/proc/net/route), Windows modern/win7은 FirstGatewayAddress, win2003(NT5.2)은 GetIpForwardTable(IPv4 default route)로 얻는다. IPv6 항목은 null.
+interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 IP(없으면 null). Linux는 IPv4 default route(/proc/net/route), Windows는 실행 시 OS 세대를 감지해 NT6+에서는 FirstGatewayAddress, NT5.2(2003/XP)에서는 GetIpForwardTable(IPv4 default route)로 얻는다. NT5.2의 IPv6 gateway 항목은 null.
 
 ## metrics 필드
 
@@ -65,7 +65,7 @@ interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 
 | mem_* / swap_* | mem_total_kb, mem_free_kb, mem_available_kb, mem_buffers_kb, mem_cached_kb, swap_total_kb, swap_free_kb. 불변식 mem_available<=mem_total, swap_free<=swap_total 보장 |
 | disk_io[] | device/kind + reads/writes 카운터 |
 | net_io[] | interface/kind + rx/tx 카운터 |
-| mounts[] | mount/kind/fstype + 사용량 |
+| mounts[] | 마운트 사용량. mount/kind/fstype/total_bytes/free_bytes/avail_bytes. 시계열(free/avail)은 여기만 싣는다 — inventory 는 구조만, metrics 는 사용량만이라 중복이 없다. total_bytes 는 % 계산용으로 양쪽에 둔다(mem_total_kb 와 동일 이유) |
 
 ## task.result 필드
 
@@ -83,7 +83,9 @@ task_id로 매칭하므로 식별 큐와 무관하다.
 | interfaces / net_io | physical, loopback, bridge, veth, bond_master, bond_member, vlan, tunnel, virtual |
 | mounts | data, virtual_fs, boot, image (+ fstype) |
 
-한 device를 여러 메시지가 다르게 태그하지 않는다. lo/loop/ram/sr 등만 pre-drop한다.
+한 device를 여러 메시지가 다르게 태그하지 않는다.
+- disks/interfaces: lo/loop/ram/sr 등만 pre-drop. interfaces 의 가상 종류는 sysfs(bridge/bonding/tun_flags dir)와 uevent DEVTYPE(vlan/bridge/bond/veth, vxlan/gre/sit 등 터널)로 판별한다 — 이름 규칙이 아니라 커널 신호 기준.
+- mounts: 실제 스토리지만 싣는다. pseudo/virtual filesystem(proc/sysfs/cgroup/selinuxfs/usbfs 등)은 /proc/filesystems 의 nodev 플래그(커널이 "블록 디바이스 없음"으로 표시)로 배포판 무관하게 pre-drop 하고, 네트워크(nfs/cifs)·FUSE 실데이터는 남긴다. 그 결과 Linux mounts.kind 는 data/boot/image 이고 virtual_fs 는 taxonomy 예약값이다.
 
 ## 값 의미론 (0 / null)
 
@@ -122,7 +124,11 @@ task_id로 매칭하므로 식별 큐와 무관하다.
 - Windows cpu_stat은 user/system/idle만 실측하고 nice/iowait/irq/softirq/steal은 미지원이라 null이다.
   mem_free_kb는 perflib로 진짜 free를 실측(available과 별개, NT5.2는 null), mem_buffers/cached·load_1m/5m/15m은 미지원 null이다. (값 의미론 참고)
 - listen_ports.uid는 Windows에서 null(POSIX uid 없음).
+- disks/disk_io/mounts 의 major/minor 는 Windows 에서 null 이다. major:minor(dev_t)는 리눅스 커널 장치번호 개념이라 Windows 에 대응이 없다 — 0 으로 위조하지 않는다(디스크 정체성은 name=PhysicalDriveN).
+- interfaces.prefix 는 NT6+ 에서 OnLinkPrefixLength 로 실측한다. NT5.2(2003/XP)는 구형 GAA 구조체에 이 필드가 없어, IPv4 는 GetIpAddrTable(dwMask popcount)로 실측하고 IPv6 는 이 테이블에 없어 측정 불가라 null 이다(0 은 유효한 /0 실측과 구분되지 않으므로 미측정에 쓰지 않는다). 즉 prefix 는 측정 가능한 전 경로에서 값이고, 오직 NT5.2 IPv6 에서만 null 이다.
+- mounts 는 리눅스와 동일하게 inventory=구조(mount/kind/fstype/total_bytes/major/minor) / metrics=사용량(mount/kind/fstype/total_bytes/free_bytes/avail_bytes)으로 역할 분리한다 — 동적 free/avail 은 metrics 에만 싣는다.
+- os_version/kernel_version/cpu_model 은 측정 불가 시 null 이다("" 나 "Unknown" 같은 대체값을 넣지 않는다). 실무상 RtlGetVersion·cpuid 폴백으로 거의 항상 채워진다.
 
 ## 빌드/릴리즈
 
-소스 빌드(5종), CI 태그 릴리즈, 저장소 트리는 BUILD.md 참고.
+소스 빌드(2종), CI 태그 릴리즈, 저장소 트리는 BUILD.md 참고.

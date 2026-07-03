@@ -511,7 +511,11 @@ static unsigned __stdcall install_thread_main(void *arg)
 	long duration_ms = (long)(monotonic_ms() - t0);
 	int success = (ds == DOWNLOAD_OK && xs == EXEC_OK);
 	const char *reason = success ? "" : reason_for_status(ds, xs);
-	int has_exit = (ds == DOWNLOAD_OK && xs != EXEC_ERR_SCRIPT_NOT_FOUND && xs != EXEC_ERR_INTERNAL);
+	/* exit_code is a real result only when the process exited on its own. On
+	 * timeout exec.c force-terminates it (TerminateProcess code 1), so that 1
+	 * is our kill code, not the installer's result -> emit null, not a fake 1. */
+	int has_exit = (ds == DOWNLOAD_OK && xs != EXEC_ERR_SCRIPT_NOT_FOUND &&
+	                xs != EXEC_ERR_SCRIPT_TIMEOUT && xs != EXEC_ERR_INTERNAL);
 
 	cJSON *root = cJSON_CreateObject();
 	if (root) {
@@ -693,7 +697,10 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		const cJSON *jty = cJSON_GetObjectItemCaseSensitive(jinstall, "type");
 		const cJSON *jt  = cJSON_GetObjectItemCaseSensitive(jinstall, "timeout_sec");
 		if (cJSON_IsString(jty) && *jty->valuestring) install_type_s = jty->valuestring;
-		if (cJSON_IsNumber(jt)) timeout_sec = (int)jt->valuedouble;
+		/* Non-positive timeout would disable the wall-clock kill in exec.c
+		 * (term_at_ms=-1), letting a hung installer occupy the single worker
+		 * slot forever. Ignore it and keep the default. */
+		if (cJSON_IsNumber(jt) && jt->valuedouble > 0) timeout_sec = (int)jt->valuedouble;
 	}
 
 	exec_install_type_t install_type;
