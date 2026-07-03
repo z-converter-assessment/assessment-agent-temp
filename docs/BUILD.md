@@ -26,7 +26,7 @@ docker run --rm --network host -v "$PWD":/w -w /w debian:bookworm bash -c '
 ```
 
 빌드 상세: agent 소스는 `_WIN32_WINNT=0x0600`으로 컴파일해 NT6 구조체를 선언하되, NT6 전용 함수는 하드임포트하지 않고 GetProcAddress로 해소한다. 벤더 라이브러리(OpenSSL 1.0.2u/curl/rabbitmq-c)는 `0x0502`로 빌드하고, Makefile이 rabbitmq-c의 win32/threads를 NT5.2용 패치(`windows-agent/patches/nt52-threads/`, SRWLock -> CRITICAL_SECTION)로 교체한다. verify가 (1) 시스템 DLL만 참조하는지, (2) NT6+ 심볼이 하드임포트되지 않았는지(NT5.2 로드 가드)를 검사해 위반 시 빌드를 실패시킨다.
-win2003 실기 배포는 hive ComputerName + Tcpip MTU=1280 설정을 사용한다.
+win2003 실기 배포는 hive ComputerName + Tcpip MTU=1280 + EnablePMTUBHDetect=1(구형 스택 PMTU black-hole 감지) 설정을 사용한다.
 
 ## 계약 conformance
 
