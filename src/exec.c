@@ -103,8 +103,14 @@ static int child_bootstrap(const char *extract_dir,
 	signal(SIGPIPE, SIG_DFL);
 
 	if (clearenv() != 0) return -1;
-	setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
+	/* root 로 시스템 서비스를 설치하므로 sbin 계열(chkconfig/service/ldconfig/setenforce
+	 * 등)을 PATH 에 포함한다 — SysV 호스트 install 이 이 도구들을 호출한다. 빠지면
+	 * command not found 로 스크립트가 죽는다(systemd 호스트는 systemctl 이 /usr/bin 이라 비치명). */
+	setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin", 1);
 	setenv("LANG", "C.UTF-8", 1);
+	/* clearenv 로 지워진 TERM 복구 — install 스크립트의 tput 이 graceful degrade 하도록.
+	 * 없으면 tput 경고 스팸이 stderr_tail(4KB) 을 채워 실제 에러 라인을 밀어낸다. */
+	setenv("TERM", "dumb", 1);
 	setenv("HOME", "/tmp", 1);
 	setenv("USER", "agent", 1);
 	if (task_id)    setenv("TASK_ID",    task_id, 1);
