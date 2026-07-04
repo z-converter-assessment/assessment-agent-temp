@@ -23,6 +23,9 @@ typedef struct {
 	int              nofile_limit;
 } worker_config_t;
 
+/* emit dry-run 계약 검증용 대표 task.result JSON(호출자 free). 실제 발행 경로와 동일 직렬화. */
+char *worker_emit_sample_result_json(const char *machine_id, const char *agent_version);
+
 worker_ctx_t *worker_init(const worker_config_t *cfg);
 
 int worker_tick(worker_ctx_t *ctx);

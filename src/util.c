@@ -223,17 +223,6 @@ char *iso8601_utc(time_t t, char *buf, size_t len)
 	return buf;
 }
 
-char *iso8601_utc_ms(struct timespec ts, char *buf, size_t len)
-{
-	struct tm tm;
-	gmtime_r(&ts.tv_sec, &tm);
-	char base[32];
-	strftime(base, sizeof base, "%Y-%m-%dT%H:%M:%S", &tm);
-	long ms = ts.tv_nsec / 1000000L;
-	snprintf(buf, len, "%s.%03ldZ", base, ms);
-	return buf;
-}
-
 char *uuid_v4(char *buf, size_t len)
 {
 	FILE *f = fopen("/proc/sys/kernel/random/uuid", "r");

@@ -198,8 +198,7 @@ static char *iso8601_now(void)
 	return buf;
 }
 
-/* task.result os_version은 inventory와 동일 소스(DisplayVersion, fallback ReleaseId)를
- * 쓴다 — 과거 bare CurrentBuildNumber와 의미가 달랐던 것을 통일. */
+/* task.result os_version은 inventory와 동일 소스(DisplayVersion, fallback ReleaseId)를 쓴다. */
 static void os_display_version(char *out, size_t out_sz)
 {
 	if (out_sz) out[0] = '\0';
@@ -240,6 +239,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 		cJSON_AddStringToObject(root, "os_version", os_build_b);
 	else
 		cJSON_AddNullToObject  (root, "os_version");
+	cJSON_AddNullToObject  (root, "os_codename");   /* Windows 는 codename 개념 없음(inventory 와 동일 null) */
 	cJSON_AddStringToObject(root, "agent_version",    agent_version ? agent_version : AGENT_VERSION);
 	cJSON_AddStringToObject(root, "collected_at",     iso8601_now());
 
@@ -290,6 +290,16 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	                             task_id, status, failure_reason,
 	                             has_exit_code, exit_code, duration_ms,
 	                             stdout_tail, stderr_tail);
+}
+
+/* wire 계약 conformance(emit dry-run)용 대표 task.result. 실제 발행 경로와 동일한
+ * build_result_json_raw 직렬화를 태운다(더미 task 값 — 값이 아니라 구조를 검증). */
+char *worker_emit_sample_result_json(const char *machine_id, const char *agent_version)
+{
+	return build_result_json_raw(machine_id, agent_version,
+	                             "00000000-0000-0000-0000-000000000000",
+	                             "success", NULL,
+	                             1, 0, 0L, "", "");
 }
 
 static int replay_filename_to_task_id(const char *fname, char *out, size_t out_sz)

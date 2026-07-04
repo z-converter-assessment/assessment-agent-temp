@@ -22,8 +22,6 @@ char *trim_inplace(char *s);
 
 char *iso8601_utc(time_t t, char *buf, size_t len);
 
-char *iso8601_utc_ms(struct timespec ts, char *buf, size_t len);
-
 char *uuid_v4(char *buf, size_t len);
 
 int jitter_seconds(int base_sec, double frac);

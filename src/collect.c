@@ -2043,16 +2043,9 @@ cJSON *build_error_payload(const char *machine_id,
 		return NULL;
 	add_common_metadata(root, "error", machine_id, agent_version);
 
-	struct timespec ts;
-	clock_gettime(CLOCK_REALTIME, &ts);
-	char ms_buf[32];
-	iso8601_utc_ms(ts, ms_buf, sizeof ms_buf);
-	cJSON_DeleteItemFromObject(root, "collected_at");
-	cJSON_AddStringToObject(root, "collected_at", ms_buf);
-
 	cJSON_AddStringToObject(root, "error_code",       error_code       ? error_code       : "UNKNOWN");
 	cJSON_AddStringToObject(root, "error_message",    error_message    ? error_message    : "");
-	cJSON_AddStringToObject(root, "failed_component", failed_component ? failed_component : "collect");
+	cJSON_AddStringToObject(root, "failed_component", failed_component ? failed_component : "agent");
 
 	if (retry_count >= 0)
 		cJSON_AddNumberToObject(root, "retry_count", (double)retry_count);

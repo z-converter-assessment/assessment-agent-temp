@@ -6,7 +6,9 @@
 
   "oneOf": [
     { "$ref": "#/$defs/inventory" },
-    { "$ref": "#/$defs/metrics" }
+    { "$ref": "#/$defs/metrics" },
+    { "$ref": "#/$defs/task_result" },
+    { "$ref": "#/$defs/error" }
   ],
 
   "$defs": {
@@ -262,6 +264,57 @@
                    "cpu_stat", "mem_total_kb", "mem_free_kb", "mem_available_kb",
                    "mem_buffers_kb", "mem_cached_kb", "swap_total_kb", "swap_free_kb",
                    "disk_io", "net_io", "mounts"]
+    },
+
+    "task_result": {
+      "$comment": "worker task 완료 result. add_common_metadata 경로를 타지 않고 필드를 직접 구성한다: composite_id 를 싣지 않고(task_id 로 매칭하므로 식별키 불필요), boot_time/agent_started_at 은 항상 null, os 식별은 os_family/os_id/os_version/os_codename(inventory 와 동일 4필드, Windows os_codename 은 null).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "message_type":     { "const": "task.result" },
+        "message_id":       { "type": "string", "minLength": 1 },
+        "hostname":         { "type": "string" },
+        "machine_id":       { "$ref": "#/$defs/str_or_null" },
+        "agent_id":         { "type": "string", "minLength": 1 },
+        "agent_version":    { "type": "string", "minLength": 1 },
+        "boot_time":        { "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
+        "collected_at":     { "$ref": "#/$defs/iso8601" },
+        "agent_started_at": { "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
+        "os_family":        { "$ref": "#/$defs/os_family" },
+        "os_id":            { "$ref": "#/$defs/str_or_null" },
+        "os_version":       { "$ref": "#/$defs/str_or_null" },
+        "os_codename":      { "$ref": "#/$defs/str_or_null" },
+        "task_id":          { "type": "string" },
+        "status":           { "type": "string", "minLength": 1 },
+        "failure_reason":   { "$ref": "#/$defs/str_or_null" },
+        "exit_code":        { "$ref": "#/$defs/int_or_null" },
+        "duration_ms":      { "type": "integer", "minimum": 0 },
+        "stdout_tail":      { "type": "string" },
+        "stderr_tail":      { "type": "string" },
+        "completed_at":     { "$ref": "#/$defs/iso8601" }
+      },
+      "required": ["message_type", "message_id", "hostname", "machine_id",
+                   "agent_id", "agent_version", "boot_time", "collected_at",
+                   "agent_started_at", "os_family", "os_id", "os_version", "os_codename",
+                   "task_id", "status", "failure_reason", "exit_code", "duration_ms",
+                   "stdout_tail", "stderr_tail", "completed_at"]
+    },
+
+    "error": {
+      "$comment": "수집/발행 실패 이벤트. add_common_metadata 전체(composite_id 포함)를 그대로 싣고 error_code/error_message/failed_component 를 더한다. retry_count/first_failed_at/recovered_at 은 재시도·복구 맥락에서만 실리는 옵셔널. collected_at 은 common 과 동일 초 정밀도 iso8601(두 트리 통일).",
+      "type": "object",
+      "unevaluatedProperties": false,
+      "allOf": [ { "$ref": "#/$defs/common_metadata" } ],
+      "properties": {
+        "message_type":     { "const": "error" },
+        "error_code":       { "type": "string", "minLength": 1 },
+        "error_message":    { "type": "string" },
+        "failed_component": { "type": "string", "minLength": 1 },
+        "retry_count":      { "type": "integer", "minimum": 0 },
+        "first_failed_at":  { "$ref": "#/$defs/iso8601" },
+        "recovered_at":     { "$ref": "#/$defs/iso8601" }
+      },
+      "required": ["error_code", "error_message", "failed_component"]
     }
   }
 }

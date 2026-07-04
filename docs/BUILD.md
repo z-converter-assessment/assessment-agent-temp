@@ -30,14 +30,14 @@ win2003 실기 배포는 hive ComputerName + Tcpip MTU=1280 + EnablePMTUBHDetect
 
 ## 계약 conformance
 
-wire 계약의 기계검증 정본은 `schema/wire.schema.json`(JSON Schema)이고, 산문 설명은 [payload-contract.md](payload-contract.md)다. 두 바이너리는 `emit` dry-run 서브커맨드로 실제 직렬화 코드를 태워 한 페이로드를 stdout에 출력한다(발행/MQ/TLS 없음).
+wire 계약의 기계검증 정본은 `schema/wire.schema.json`(JSON Schema)이고, 산문 설명은 [payload-contract.md](payload-contract.md)다. 두 바이너리는 `emit` dry-run 서브커맨드로 실제 직렬화 코드를 태워 한 페이로드를 stdout에 출력한다(발행/MQ/TLS 없음). 대상은 inventory / metrics / task.result / error 4종이다.
 
 ```bash
 scripts/check-contract.sh dist/assessment-agent-linux-x86_64            # 네이티브
 scripts/check-contract.sh dist/assessment-agent-windows-x86.exe wine    # 로컬 wine
 ```
 
-`check-contract.sh`가 `emit inventory`/`emit metrics` 출력을 스키마로 검증한다(`scripts/validate-wire.py`). 필드/타입/null 의미론과 os_family 조건부(예: saturation은 Windows 전용)를 강제해, 리눅스-윈도우 트리 간 드리프트와 자기계약 위반을 잡는다.
+`check-contract.sh`가 `emit inventory`/`emit metrics`/`emit task.result`/`emit error` 출력을 스키마로 검증한다(`scripts/validate-wire.py`). 필드/타입/null 의미론과 os_family 조건부(예: saturation은 Windows 전용, task.result의 Windows os_codename=null)를 강제해, 리눅스-윈도우 트리 간 드리프트와 자기계약 위반을 잡는다.
 
 ## CI
 

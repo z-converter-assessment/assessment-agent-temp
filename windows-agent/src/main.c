@@ -397,13 +397,25 @@ static int emit_payload(const char *which)
 	char *machine_id = resolve_machine_id();
 	if (!machine_id) machine_id = strdup("");
 	if (!machine_id) { WSACleanup(); return 2; }
+	if (strcmp(which, "task.result") == 0) {
+		char *s = worker_emit_sample_result_json(machine_id, AGENT_VERSION);
+		free(machine_id); WSACleanup();
+		if (!s) { fprintf(stderr, "[agent] emit: task.result build failed\n"); return 1; }
+		printf("%s\n", s);
+		free(s);
+		return 0;
+	}
 	cJSON *p = NULL;
 	if (strcmp(which, "inventory") == 0)
 		p = collect_inventory_payload(machine_id, AGENT_VERSION);
 	else if (strcmp(which, "metrics") == 0)
 		p = collect_metrics_payload(machine_id, AGENT_VERSION);
+	else if (strcmp(which, "error") == 0)
+		p = build_error_payload(machine_id, AGENT_VERSION, "SAMPLE_ERROR",
+		                        "contract emit sample", "collect", 0,
+		                        "1970-01-01T00:00:00Z", "1970-01-01T00:00:00Z");
 	else {
-		fprintf(stderr, "[agent] emit: expected 'inventory' or 'metrics', got '%s'\n", which);
+		fprintf(stderr, "[agent] emit: expected 'inventory', 'metrics', 'task.result', or 'error', got '%s'\n", which);
 		free(machine_id); WSACleanup(); return 2;
 	}
 	free(machine_id);

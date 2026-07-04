@@ -65,9 +65,8 @@ AGENT_VERSION ?= 0.0.0-dev
 # Vendor static libraries (gitignored — built locally before agent build).
 VENDOR_DIR         := vendor
 CJSON_VERSION      := v1.7.18
-RABBITMQ_C_VERSION ?= v0.15.0
 ZLIB_VERSION       := v1.3.1
-# CURL_VERSION / OPENSSL_VERSION are pinned per profile above.
+# CURL_VERSION / OPENSSL_VERSION / RABBITMQ_C_VERSION are pinned per profile above.
 
 CJSON_DIR          := $(VENDOR_DIR)/cJSON
 RABBITMQ_C_DIR     := $(VENDOR_DIR)/rabbitmq-c
@@ -151,16 +150,13 @@ vendor-fetch:
 vendor-build: vendor-fetch vendor-build-openssl vendor-build-zlib vendor-build-cjson vendor-build-rabbitmq vendor-build-curl
 
 vendor-build-openssl:
-	# --libdir=lib: OpenSSL 3.x may install to lib64/lib/<host>; pin to install/lib.
+	# --libdir=lib: install 트리를 install/lib 로 고정(호스트별 lib64 배치 회피).
 	cd $(OPENSSL_DIR) && ./Configure $(OPENSSL_TARGET) $(OPENSSL_CONFIG_OPTS) $(OPENSSL_CROSS) \
 	    --libdir=lib --prefix=$(CURDIR)/$(OPENSSL_DIR)/install
 	# 1.0.2 install_sw mkdir is not idempotent — wipe prefix first.
 	rm -rf $(OPENSSL_DIR)/install
-	# 라이브러리(libssl/libcrypto)만 필요 — apps(openssl.exe)는 빌드하지 않는다.
-	# 기본 타깃 build_sw는 apps/openssl.rc를 RC(=$(CROSS_COMPILE)windres)로 컴파일하는데,
-	# --cross-compile-prefix가 windres 이름에도 적용되어 이중 prefix
-	# (x86_64-w64-mingw32-x86_64-w64-mingw32-windres)가 되어 실패한다.
-	# 3.0.15엔 no-apps 옵션이 없으므로 build_libs + install_dev 로 apps 를 건너뛴다.
+	# libssl/libcrypto 만 설치하면 된다. 타깃은 위 OPENSSL_MAKE_TGT/OPENSSL_INSTALL_TGT 참고
+	# (1.0.2u: 전체 빌드 + install_sw, apps 는 .rc 가 없어 windres 이중 prefix 문제 없음).
 	$(MAKE) -C $(OPENSSL_DIR) -j$(JOBS) $(OPENSSL_MAKE_TGT)
 	$(MAKE) -C $(OPENSSL_DIR) $(OPENSSL_INSTALL_TGT)
 
@@ -181,7 +177,7 @@ vendor-build-rabbitmq:
 	cp patches/nt52-threads/rabbitmq-threads.h $(RABBITMQ_C_DIR)/librabbitmq/win32/threads.h
 	cp patches/nt52-threads/rabbitmq-threads.c $(RABBITMQ_C_DIR)/librabbitmq/win32/threads.c
 	@echo "[patch] NT5.2 win32/threads applied (SRWLock -> CRITICAL_SECTION)"
-	# GCC 14+ promotes -Wincompatible-pointer-types to error (rabbitmq-c v0.15.0
+	# GCC 14+ promotes -Wincompatible-pointer-types to error (rabbitmq-c
 	# amqp_socket.c ioctlsocket mismatch) — demote until upstream fix.
 	$(CMAKE) -S $(RABBITMQ_C_DIR) -B $(RABBITMQ_C_DIR)/build \
 	      -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=$(CC) \

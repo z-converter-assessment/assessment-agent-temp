@@ -149,14 +149,17 @@ static int task_id_valid(const char *id)
 	return 1;
 }
 
-static char *build_result_json(const worker_ctx_t *ctx,
-                               const char *task_id,
-                               const char *status,
-                               const char *failure_reason,
-                               int   has_exit_code, int exit_code,
-                               long  duration_ms,
-                               const char *stdout_tail,
-                               const char *stderr_tail)
+/* task.result 페이로드 구성의 단일 소스. task 처리 경로(build_result_json 래퍼, ctx 보유)와
+ * emit dry-run(worker_emit_sample_result_json)이 모두 이걸 호출해 필드 셋 드리프트를 막는다.
+ * machine_id/agent_version 만 호출자별로 다르다. */
+static char *build_result_json_raw(const char *machine_id, const char *agent_version,
+                                   const char *task_id,
+                                   const char *status,
+                                   const char *failure_reason,
+                                   int   has_exit_code, int exit_code,
+                                   long  duration_ms,
+                                   const char *stdout_tail,
+                                   const char *stderr_tail)
 {
 	cJSON *root = cJSON_CreateObject();
 	if (!root) return NULL;
@@ -167,10 +170,10 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	iso8601_utc(ts.tv_sec, now_buf, sizeof now_buf);
 
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
-	cJSON_AddStringToObject(root, "machine_id",       ctx->cfg.machine_id ? ctx->cfg.machine_id : "");
+	cJSON_AddStringToObject(root, "machine_id",       machine_id ? machine_id : "");
 	cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
-	collect_add_os_result_fields(root);   /* os_family/os_id/os_version */
-	cJSON_AddStringToObject(root, "agent_version",    ctx->cfg.agent_version ? ctx->cfg.agent_version : AGENT_VERSION);
+	collect_add_os_result_fields(root);   /* os_family/os_id/os_version/os_codename */
+	cJSON_AddStringToObject(root, "agent_version",    agent_version ? agent_version : AGENT_VERSION);
 	cJSON_AddStringToObject(root, "collected_at",     now_buf);
 
 	char host[256];
@@ -204,6 +207,32 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	char *json = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
 	return json;
+}
+
+/* ctx 편의 래퍼 — task 처리 경로가 쓴다. 필드 구성은 _raw 단일 소스. */
+static char *build_result_json(const worker_ctx_t *ctx,
+                               const char *task_id,
+                               const char *status,
+                               const char *failure_reason,
+                               int   has_exit_code, int exit_code,
+                               long  duration_ms,
+                               const char *stdout_tail,
+                               const char *stderr_tail)
+{
+	return build_result_json_raw(ctx->cfg.machine_id, ctx->cfg.agent_version,
+	                             task_id, status, failure_reason,
+	                             has_exit_code, exit_code, duration_ms,
+	                             stdout_tail, stderr_tail);
+}
+
+/* wire 계약 conformance(emit dry-run)용 대표 task.result. 실제 발행 경로와 동일한
+ * build_result_json_raw 직렬화를 태운다(더미 task 값 — 값이 아니라 구조를 검증). */
+char *worker_emit_sample_result_json(const char *machine_id, const char *agent_version)
+{
+	return build_result_json_raw(machine_id, agent_version,
+	                             "00000000-0000-0000-0000-000000000000",
+	                             "success", NULL,
+	                             1, 0, 0L, "", "");
 }
 
 static const char *reason_for_status(download_status_t  ds,

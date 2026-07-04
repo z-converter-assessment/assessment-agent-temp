@@ -5,8 +5,7 @@
 # statically linked against musl libc (and all vendored deps). It carries no
 # dynamic libc, so it is glibc-version independent and runs on ANY x86_64 Linux
 # with kernel >= 2.6.32. That covers every supported image in one artifact
-# (verified on EL6 / kernel 2.6.32 and SLES 11 / kernel 3.0.13), replacing the
-# former glibc modern+legacy split.
+# (verified on EL6 / kernel 2.6.32 and SLES 11 / kernel 3.0.13).
 #
 # Host requirement: **Docker only**. Everything (toolchain, vendor build, link)
 # happens inside the Alpine container; outputs are chown'd back to the caller.

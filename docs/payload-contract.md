@@ -2,8 +2,9 @@
 
 에이전트가 RabbitMQ 브로커로 발행하는 wire 계약. 이 문서는 산문 설명이고,
 기계검증 가능한 정본(source of truth)은 `schema/wire.schema.json`(JSON Schema)이다.
-CI가 두 바이너리의 `emit` dry-run 출력을 이 스키마로 강제해(`scripts/check-contract.sh`),
-리눅스-윈도우 트리 간 드리프트와 자기계약 위반을 릴리즈 전에 잡는다. 로컬 검증:
+CI가 두 바이너리의 `emit` dry-run 출력(inventory / metrics / task.result / error 4종 전부)을 이
+스키마로 강제해(`scripts/check-contract.sh`), 리눅스-윈도우 트리 간 드리프트와 자기계약 위반을
+릴리즈 전에 잡는다. 로컬 검증:
 `scripts/check-contract.sh dist/assessment-agent-linux-x86_64` /
 `... dist/assessment-agent-windows-x86.exe wine`.
 
@@ -50,10 +51,10 @@ CI가 git 태그에서 주입한다(`v1.0.0` -> `1.0.0`, release.yml). 로컬/de
 | cpu_cores, cpu_model | CPU |
 | kernel_version | 커널 |
 | mem_total_kb, swap_total_kb | 메모리/스왑 총량 |
-| disks[] | 물리 디스크. device/kind/major/minor/size 등 |
+| disks[] | 물리 디스크. name/kind/major/minor/size_bytes/type |
 | mounts[] | 마운트 구조. mount/major/minor/total_bytes/fstype/kind. 동적 사용량(free/avail)은 싣지 않는다(metrics 전담) |
 | services[] | 서비스. unit/sub/pid/exe |
-| listen_ports[] | 리슨 소켓. proto/addr/port/pid/comm |
+| listen_ports[] | 리슨 소켓. proto/addr/port/uid/pid/comm (uid는 Windows에서 null) |
 | interfaces[] | 인터페이스. name/address/prefix/family/kind/gateway (IPv4+IPv6) |
 | mac_addresses[] | MAC 목록(감사용) |
 | ip_external[] | 외부(공인) IP. IMDS 전용 best-effort — 클라우드 메타데이터(AWS/Azure/GCP)나 AGENT_EXTERNAL_IP env 로만 채운다. VM 게스트는 NAT된 공인 IP를 자기 인터페이스에서 볼 수 없어, IMDS 없는 환경(OpenStack floating IP 등)에서는 null. floating IP 매핑이 필요하면 엔진이 클라우드 API로 채운다(에이전트 범위 밖) |
@@ -68,7 +69,7 @@ interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 
 | 필드 | 내용 |
 |---|---|
 | collection_interval_sec | 설정된 수집 주기(초). 엔진 표본 충분성 계산 기준 |
-| loadavg | 1/5/15분 (Linux) |
+| load_1m / load_5m / load_15m | 1/5/15분 로드애버리지. Linux 실측, Windows는 미지원 null |
 | cpu_stat | user/nice/system/idle/iowait/irq/softirq/steal |
 | mem_* / swap_* | mem_total_kb, mem_free_kb, mem_available_kb, mem_buffers_kb, mem_cached_kb, swap_total_kb, swap_free_kb. 불변식 mem_available<=mem_total, swap_free<=swap_total 보장 |
 | disk_io[] | device/kind + reads/writes 카운터 |
@@ -78,8 +79,32 @@ interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 
 ## task.result 필드
 
 task_id, status, exit_code, failure_reason, duration_ms, completed_at,
-stdout_tail, stderr_tail + 공통 메타데이터 + os_family/os_id/os_version.
-task_id로 매칭하므로 식별 큐와 무관하다.
+stdout_tail, stderr_tail + os_family/os_id/os_version/os_codename + 공통 메타데이터.
+단 task.result는 공통 메타데이터 중 composite_id를 싣지 않고(boot_time·agent_started_at은 항상 null),
+os 식별은 os_family/os_id/os_version/os_codename으로 붙인다(inventory와 동일 4필드, Windows
+os_codename은 codename 개념이 없어 null). task_id로 매칭하므로 composite_id 같은 식별키 없이도
+조인되며, 식별 큐와 무관하다.
+
+inventory/metrics와 마찬가지로 task.result도 스키마 정본(`schema/wire.schema.json`의 `task_result`)에
+포함돼 CI 계약 검증 대상이다 — 두 바이너리가 `emit task.result`로 실제 직렬화(build_result_json_raw)를
+태워 필드 셋을 스키마로 강제하므로, 트리 간 필드 드리프트(예: 한쪽만 os_codename 유무)가 릴리즈 전에 막힌다.
+
+## error 필드
+
+공통 메타데이터 전체(composite_id 포함, task.result와 달리 add_common_metadata 경로를 그대로 탄다) + 아래.
+
+| 필드 | 내용 |
+|---|---|
+| error_code | 실패 분류 코드(예: COLLECT_INVENTORY_FAILED, PUBLISH_RECOVERED). 자유형 문자열 |
+| error_message | 사람이 읽는 실패 설명 |
+| failed_component | 실패 단계(collect/publish 등). 미지정 fallback은 두 트리 모두 "agent" |
+| retry_count | 재시도 횟수. 재시도 맥락에서만 실리는 옵셔널 |
+| first_failed_at | 최초 실패 시각(iso8601). 옵셔널 |
+| recovered_at | 복구 시각(iso8601). 복구 이벤트에서만 실리는 옵셔널 |
+
+collected_at은 공통 메타데이터와 동일한 초 정밀도 iso8601이다(두 트리 통일). error도 스키마 정본(`error` 정의)에
+포함돼 `emit error`로 CI 계약 검증 대상이며, 트리 간 드리프트(collected_at 정밀도, failed_component fallback 등)가
+릴리즈 전에 막힌다.
 
 ## device kind taxonomy
 

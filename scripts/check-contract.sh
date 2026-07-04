@@ -25,7 +25,7 @@ run() {
 }
 
 rc=0
-for kind in inventory metrics; do
+for kind in inventory metrics task.result error; do
 	echo "[contract] ${RUNNER[*]:-native} $(basename "$BIN") emit $kind"
 	if ! run emit "$kind" 2>/dev/null | "$PY" "$HERE/validate-wire.py" "$SCHEMA"; then
 		rc=1
