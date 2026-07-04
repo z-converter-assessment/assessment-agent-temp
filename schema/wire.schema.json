@@ -82,7 +82,7 @@
       "properties": {
         "mount":       { "type": "string", "minLength": 1 },
         "kind":        { "$ref": "#/$defs/mount_kind" },
-        "fstype":      { "type": "string" },
+        "fstype":      { "$ref": "#/$defs/str_or_null" },
         "major":       { "$ref": "#/$defs/int_or_null" },
         "minor":       { "$ref": "#/$defs/int_or_null" },
         "total_bytes": { "$ref": "#/$defs/int_or_null" }
@@ -96,7 +96,7 @@
       "properties": {
         "mount":       { "type": "string", "minLength": 1 },
         "kind":        { "$ref": "#/$defs/mount_kind" },
-        "fstype":      { "type": "string" },
+        "fstype":      { "$ref": "#/$defs/str_or_null" },
         "total_bytes": { "$ref": "#/$defs/int_or_null" },
         "free_bytes":  { "$ref": "#/$defs/int_or_null" },
         "avail_bytes": { "$ref": "#/$defs/int_or_null" }
@@ -220,7 +220,7 @@
         "mac_addresses": { "type": "array", "items": { "type": "string" } },
         "disks":         { "type": "array", "items": { "$ref": "#/$defs/disk" } },
         "mounts":        { "type": "array", "items": { "$ref": "#/$defs/mount_struct" } },
-        "services":      { "type": "array", "items": { "$ref": "#/$defs/service" } },
+        "services":      { "type": ["array", "null"], "items": { "$ref": "#/$defs/service" } },
         "listen_ports":  { "type": "array", "items": { "$ref": "#/$defs/listen_port" } }
       },
       "required": ["os_id", "os_version", "os_codename", "kernel_version",

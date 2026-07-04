@@ -175,10 +175,10 @@ char *resolve_machine_id(void)
 	return out;
 }
 
-static void os_version_info(char *display_out, size_t dsz, char *build_out, size_t bsz)
+void os_version_info(char *display_out, size_t dsz, char *build_out, size_t bsz)
 {
-	display_out[0] = '\0';
-	build_out[0]   = '\0';
+	if (dsz) display_out[0] = '\0';
+	if (bsz) build_out[0]   = '\0';
 
 	HKEY hKey;
 	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
@@ -686,6 +686,31 @@ static const char *win_net_kind(ULONG if_type)
 	return "virtual";
 }
 
+/* NT6+: IfIndex 가 하드웨어 NIC 인지(가상 miniport 아닌지) — MIB_IF_ROW2.HardwareInterface.
+ * net_io(enumerate_net_io)가 이 게이트로 가상 어댑터를 virtual 로 태그하는데, GAA 기반 interfaces
+ * 에는 이 플래그가 없어 IfType 만으로 physical 로 갈릴 수 있다. 같은 게이트를 태워 크로스메시지
+ * kind 를 맞춘다. NT5.2 는 이 플래그가 없어 판정 불가 -> 1 반환(게이트 미적용, 양 경로 동일하게
+ * win_net_kind 만 — net_io NT5.2 폴백도 게이트가 없어 대칭이다). GetIfEntry2 는 GetProcAddress
+ * 해소라 하드임포트되지 않는다(NT5.2 로드 가드 유지). */
+static int iface_is_hardware(DWORD if_index)
+{
+	if (!agent_is_nt6()) return 1;
+	typedef DWORD (WINAPI *GetIfEntry2_fn)(PMIB_IF_ROW2);
+	static int resolved = 0;
+	static GetIfEntry2_fn p_get2 = NULL;
+	if (!resolved) {
+		resolved = 1;
+		HMODULE ip = GetModuleHandleA("iphlpapi.dll");
+		if (ip) p_get2 = (GetIfEntry2_fn)(void *)GetProcAddress(ip, "GetIfEntry2");
+	}
+	if (!p_get2) return 1;
+	MIB_IF_ROW2 row;
+	memset(&row, 0, sizeof row);
+	row.InterfaceIndex = if_index;
+	if (p_get2(&row) != NO_ERROR) return 1;
+	return row.InterfaceAndOperStatusFlags.HardwareInterface ? 1 : 0;
+}
+
 /* NT6.1+: GetIfTable2(64비트 카운터 + FilterInterface 중복 제거). GetIfTable2/FreeMibTable가
  * 해소되면 이 경로, 아니면(NT5.2) GetIfTable 폴백. 두 경로 모두 하나의 바이너리에 포함. */
 static cJSON *enumerate_net_io(void)
@@ -912,7 +937,11 @@ static void fill_network_info(cJSON *inv)
 			if (prefix >= 0) cJSON_AddNumberToObject(io, "prefix", (double)prefix);
 			else             cJSON_AddNullToObject(io, "prefix");
 			cJSON_AddStringToObject(io, "family",  family ? family : "");
-			cJSON_AddStringToObject(io, "kind",    win_net_kind(p->IfType));
+			/* IPv6-only 어댑터는 IfIndex 가 0 일 수 있어 GetIfEntry2 가 실패한다 -> 유효한
+			 * Ipv6IfIndex 로 폴백해 하드웨어 판정이 빠지지 않게 한다. */
+			DWORD if_idx = p->IfIndex ? p->IfIndex : p->Ipv6IfIndex;
+			cJSON_AddStringToObject(io, "kind",
+			    iface_is_hardware(if_idx) ? win_net_kind(p->IfType) : "virtual");
 
 			/* gateway = 이 주소와 같은 family의 default route. NT6+는 FirstGatewayAddress,
 			 * NT5.2는 GetIpForwardTable(IPv4 default route). IPv6 항목은 null. */

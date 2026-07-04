@@ -446,14 +446,71 @@ static int add_suse_release_fallback(cJSON *root)
 	return 1;
 }
 
+/* /etc/lsb-release 보완(os-release 없는 lsb-only 구형 Ubuntu/Debian 등).
+ * DISTRIB_ID/DISTRIB_RELEASE/DISTRIB_CODENAME -> os_id(소문자)/os_version/os_codename. */
+static int add_lsb_release_fallback(cJSON *root)
+{
+	char *content = read_file_all("/etc/lsb-release");
+	if (!content || !content[0]) {
+		free(content);
+		return 0;
+	}
+	char *id = NULL, *ver = NULL, *code = NULL;
+	read_os_release_field(content, "DISTRIB_ID", &id);
+	read_os_release_field(content, "DISTRIB_RELEASE", &ver);
+	read_os_release_field(content, "DISTRIB_CODENAME", &code);
+	free(content);
+	/* 빈 문자열(DISTRIB_ID= 처럼 값 없는 키)은 측정 불가 -> null 로 강등(""로 발행 금지). */
+	if ((!id || !*id) && (!ver || !*ver)) {
+		free(id); free(ver); free(code);
+		return 0;
+	}
+	if (id && *id)
+		for (char *p = id; *p; p++)
+			*p = (char)tolower((unsigned char)*p);
+	(id   && *id)   ? cJSON_AddStringToObject(root, "os_id", id)         : cJSON_AddNullToObject(root, "os_id");
+	(ver  && *ver)  ? cJSON_AddStringToObject(root, "os_version", ver)   : cJSON_AddNullToObject(root, "os_version");
+	(code && *code) ? cJSON_AddStringToObject(root, "os_codename", code) : cJSON_AddNullToObject(root, "os_codename");
+	free(id); free(ver); free(code);
+	return 1;
+}
+
+/* /etc/debian_version 보완(lsb-release 도 없는 최구형 Debian). 파일 내용이 버전 문자열이다. */
+static int add_debian_version_fallback(cJSON *root)
+{
+	char *content = read_file_all("/etc/debian_version");
+	if (!content || !content[0]) {
+		free(content);
+		return 0;
+	}
+	char *nl = strchr(content, '\n');
+	if (nl) *nl = '\0';
+	char *v = content;
+	while (*v == ' ' || *v == '\t') v++;
+	if (!*v) {
+		free(content);
+		return 0;
+	}
+	cJSON_AddStringToObject(root, "os_id", "debian");
+	cJSON_AddStringToObject(root, "os_version", v);
+	cJSON_AddNullToObject(root, "os_codename");
+	free(content);
+	return 1;
+}
+
 static int add_os_release(cJSON *root)
 {
 	char *content = read_file_all("/etc/os-release");
-	if (!content) {
+	if (!content || !content[0]) {
+		free(content);   /* 존재하나 빈 os-release 도 폴백을 타게 한다 */
 
 		if (add_redhat_release_fallback(root))
 			return 1;
 		if (add_suse_release_fallback(root))
+			return 1;
+		if (add_lsb_release_fallback(root))
+			return 1;
+		if (add_debian_version_fallback(root))
 			return 1;
 		cJSON_AddNullToObject(root, "os_id");
 		cJSON_AddNullToObject(root, "os_version");
@@ -653,7 +710,7 @@ static cJSON *collect_disks_via_lsblk(void)
 	if (!arr)
 		return NULL;
 
-	char *out = run_cmd("lsblk -dn -b -e 7,11 -o NAME,MAJ:MIN,SIZE,TYPE -J 2>/dev/null");
+	char *out = run_cmd("lsblk -dn -b -e 7,11 -o NAME,KNAME,MAJ:MIN,SIZE,TYPE -J 2>/dev/null");
 	if (!out)
 		return arr;
 
@@ -666,6 +723,7 @@ static cJSON *collect_disks_via_lsblk(void)
 	cJSON *dev = NULL;
 	cJSON_ArrayForEach(dev, devices) {
 		cJSON *name = cJSON_GetObjectItemCaseSensitive(dev, "name");
+		cJSON *kname = cJSON_GetObjectItemCaseSensitive(dev, "kname");
 
 		cJSON *majmin = cJSON_GetObjectItemCaseSensitive(dev, "maj:min");
 		if (!majmin)
@@ -700,7 +758,12 @@ static cJSON *collect_disks_via_lsblk(void)
 			cJSON_AddStringToObject(item, "type", type->valuestring);
 		else
 			cJSON_AddNullToObject(item, "type");
-		cJSON_AddStringToObject(item, "kind", disk_kind(name->valuestring));
+		/* disk_kind 는 sysfs 를 kernel 이름 키로 probe 하므로 KNAME(dm-0 등)을 쓴다 — lsblk
+		 * NAME(친화명 vg0-lv0)이면 sysfs miss 로 오분류(virtual). disk_io[](diskstats kernel
+		 * 이름)와 같은 키로 분류해 크로스메시지 kind 드리프트를 막는다. name 발행은 NAME 유지. */
+		const char *kn = (cJSON_IsString(kname) && *kname->valuestring)
+		                 ? kname->valuestring : name->valuestring;
+		cJSON_AddStringToObject(item, "kind", disk_kind(kn));
 		cJSON_AddItemToArray(arr, item);
 	}
 	cJSON_Delete(parsed);

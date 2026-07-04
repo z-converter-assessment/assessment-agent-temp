@@ -198,21 +198,6 @@ static char *iso8601_now(void)
 	return buf;
 }
 
-/* task.result os_version은 inventory와 동일 소스(DisplayVersion, fallback ReleaseId)를 쓴다. */
-static void os_display_version(char *out, size_t out_sz)
-{
-	if (out_sz) out[0] = '\0';
-	HKEY hKey;
-	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-	    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
-	    0, KEY_READ, &hKey) != ERROR_SUCCESS) return;
-	DWORD sz = (DWORD)out_sz;
-	if (RegQueryValueExA(hKey, "DisplayVersion", NULL, NULL, (LPBYTE)out, &sz) != ERROR_SUCCESS) {
-		sz = (DWORD)out_sz;
-		RegQueryValueExA(hKey, "ReleaseId", NULL, NULL, (LPBYTE)out, &sz);
-	}
-	RegCloseKey(hKey);
-}
 
 /* task.result 페이로드 구성의 단일 소스. task 처리 경로(build_result_json 래퍼, ctx 보유)와
  * install 스레드(install_thread_arg_t 보유)가 모두 이걸 호출해, 정상 완료 result 와 synth/복구
@@ -229,14 +214,18 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	cJSON *root = cJSON_CreateObject();
 	if (!root) return NULL;
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
-	cJSON_AddStringToObject(root, "machine_id",       machine_id ? machine_id : "");
+	/* machine_id 부재 시 null — inventory/metrics/error(add_common_metadata)와 통일. */
+	if (machine_id && *machine_id)
+		cJSON_AddStringToObject(root, "machine_id", machine_id);
+	else
+		cJSON_AddNullToObject  (root, "machine_id");
 	cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
 	cJSON_AddStringToObject(root, "os_family",        "windows");
 	cJSON_AddStringToObject(root, "os_id",            "windows");
-	char os_build_b[32];
-	os_display_version(os_build_b, sizeof os_build_b);
-	if (os_build_b[0])
-		cJSON_AddStringToObject(root, "os_version", os_build_b);
+	char os_ver_b[64], os_build_b[64];   /* inventory 와 동일 크기 — DisplayVersion 이 길어도 두 경로가 갈리지 않게 */
+	os_version_info(os_ver_b, sizeof os_ver_b, os_build_b, sizeof os_build_b);
+	if (os_ver_b[0])
+		cJSON_AddStringToObject(root, "os_version", os_ver_b);
 	else
 		cJSON_AddNullToObject  (root, "os_version");
 	cJSON_AddNullToObject  (root, "os_codename");   /* Windows 는 codename 개념 없음(inventory 와 동일 null) */

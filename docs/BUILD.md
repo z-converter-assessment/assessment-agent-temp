@@ -41,10 +41,10 @@ scripts/check-contract.sh dist/assessment-agent-windows-x86.exe wine    # 로컬
 
 ## CI
 
-`v*` 태그를 push하면 2종을 빌드해 해당 태그의 GitHub Release에 게시한다.
+`v*` 태그를 push하면 2종을 빌드해 해당 태그의 GitHub Release에 게시한다. 릴리즈는 v1.0.3 하나로 유지하고, 재릴리즈는 태그를 덮어쓴다.
 
 ```bash
-git tag v1.2.3 && git push origin v1.2.3
+git tag -f v1.0.3 && git push -f origin v1.0.3
 ```
 
 linux-x86_64와 windows-x86 둘 다 required — 없으면 릴리즈 실패한다. 릴리즈 전 계약 conformance가 강제된다: Linux는 빌드 잡에서 musl static을 네이티브 실행해, Windows는 `windows-latest` 러너에서 exe를 WoW64로 직접 실행해 emit 출력을 스키마로 검증한다. 어느 한쪽이라도 계약을 어기면 릴리즈가 막힌다.

@@ -170,7 +170,12 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	iso8601_utc(ts.tv_sec, now_buf, sizeof now_buf);
 
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
-	cJSON_AddStringToObject(root, "machine_id",       machine_id ? machine_id : "");
+	/* machine_id 부재 시 null — inventory/metrics/error(add_common_metadata)와 통일.
+	 * ""로 채우면 같은 호스트가 메시지별로 ""/null 로 갈려 감사/조인이 오염된다. */
+	if (machine_id && *machine_id)
+		cJSON_AddStringToObject(root, "machine_id", machine_id);
+	else
+		cJSON_AddNullToObject  (root, "machine_id");
 	cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
 	collect_add_os_result_fields(root);   /* os_family/os_id/os_version/os_codename */
 	cJSON_AddStringToObject(root, "agent_version",    agent_version ? agent_version : AGENT_VERSION);

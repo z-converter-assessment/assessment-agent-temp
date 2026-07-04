@@ -51,7 +51,7 @@ ALLOWED_DLLS        := kernel32|advapi32|user32|gdi32|ws2_32|iphlpapi|crypt32|se
 # (1) NT6+ 전용 API: collect.c/util.c에서 GetProcAddress로 런타임 해소해야 한다.
 # (2) secure-CRT(strncpy_s 등): 2003 msvcrt.dll에 없다 -> nt52_compat.h 로컬 구현으로 대체해야 한다.
 # verify가 둘 다 강제 차단한다.
-NT6_FORBID_SYMS     := GetIfTable2|FreeMibTable|QueryFullProcessImageNameW|QueryFullProcessImageNameA|GetTickCount64|BCryptGenRandom|inet_ntop|inet_pton|InitializeSRWLock|AcquireSRWLockExclusive|AcquireSRWLockShared|ReleaseSRWLockExclusive|ReleaseSRWLockShared|InitializeConditionVariable|strncpy_s|strtok_s|_putenv_s|strcpy_s|strcat_s|sprintf_s|_vsnprintf_s|vsprintf_s|memcpy_s|wcscpy_s|wcsncpy_s|wcstok_s
+NT6_FORBID_SYMS     := GetIfTable2|GetIfEntry2|FreeMibTable|QueryFullProcessImageNameW|QueryFullProcessImageNameA|GetTickCount64|BCryptGenRandom|inet_ntop|inet_pton|InitializeSRWLock|AcquireSRWLockExclusive|AcquireSRWLockShared|ReleaseSRWLockExclusive|ReleaseSRWLockShared|InitializeConditionVariable|strncpy_s|strtok_s|_putenv_s|strcpy_s|strcat_s|sprintf_s|_vsnprintf_s|vsprintf_s|memcpy_s|wcscpy_s|wcsncpy_s|wcstok_s
 
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2 -std=c11 \
            -D_WIN32_WINNT=$(WINNT_VER) -DWINVER=$(WINNT_VER) -DUNICODE -D_UNICODE \
