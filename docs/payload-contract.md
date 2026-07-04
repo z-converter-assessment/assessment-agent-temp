@@ -78,12 +78,24 @@ interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 
 
 ## task.result 필드
 
-task_id, status, exit_code, failure_reason, duration_ms, completed_at,
+task_id, status, exit_code, signal_no, failure_reason, duration_ms, completed_at,
 stdout_tail, stderr_tail + os_family/os_id/os_version/os_codename + 공통 메타데이터.
 단 task.result는 공통 메타데이터 중 composite_id를 싣지 않고(boot_time·agent_started_at은 항상 null),
 os 식별은 os_family/os_id/os_version/os_codename으로 붙인다(inventory와 동일 4필드, Windows
 os_codename은 codename 개념이 없어 null). task_id로 매칭하므로 composite_id 같은 식별키 없이도
 조인되며, 식별 큐와 무관하다.
+
+exit_code와 signal_no는 POSIX wait status를 그대로 반영해 상호배타다:
+
+| 종료 형태 | exit_code | signal_no |
+|---|---|---|
+| 정상 종료(WIFEXITED) | 값 | null |
+| 시그널 종료(crash/timeout kill, WIFSIGNALED) | null | 값(예: 9=SIGKILL, 11=SIGSEGV, 15=SIGTERM, 6=SIGABRT) |
+| 상태 미포착(internal) | null | null |
+
+엔진은 이 세 조합으로 "코드 N 종료"/"시그널 N 사망"/"상태 미포착"을 구분한다. signal_no는 자식(install.sh)을
+종료시킨 시그널 번호로, timeout 케이스(worker의 SIGTERM vs 강제 SIGKILL)도 이 값으로 갈린다. Linux 전용
+개념이라 Windows task.result는 항상 null(POSIX 시그널 없음).
 
 inventory/metrics와 마찬가지로 task.result도 스키마 정본(`schema/wire.schema.json`의 `task_result`)에
 포함돼 CI 계약 검증 대상이다 — 두 바이너리가 `emit task.result`로 실제 직렬화(build_result_json_raw)를
@@ -118,7 +130,9 @@ collected_at은 공통 메타데이터와 동일한 초 정밀도 iso8601이다(
 
 한 device를 여러 메시지가 다르게 태그하지 않는다.
 - disks/interfaces: lo/loop/ram/sr 등만 pre-drop. interfaces 의 가상 종류는 sysfs(bridge/bonding/tun_flags dir)와 uevent DEVTYPE(vlan/bridge/bond/veth, vxlan/gre/sit 등 터널)로 판별한다 — 이름 규칙이 아니라 커널 신호 기준.
+- bond(본딩): bond_master(bond0 등)가 본딩 네트워크의 집계 단위다 — /proc/net/dev 의 bond0 엔트리가 슬레이브 합산 트래픽 카운터를 그대로 나른다. bond_member(물리 leg eth0/eth1)는 그 합산분이 이미 bond_master 에 실리므로 net_io 집계에서 제외한다. 슬레이브를 physical 로 태그하지 않는다(그러면 bond_master + physical 합산 시 이중집계). 엔진은 net_io 를 kind in {physical, bond_master} 로 집계해야 본딩 호스트 트래픽이 누락(0)되지 않는다.
 - mounts: 실제 스토리지만 싣는다. pseudo/virtual filesystem(proc/sysfs/cgroup/selinuxfs/usbfs 등)은 /proc/filesystems 의 nodev 플래그(커널이 "블록 디바이스 없음"으로 표시)로 배포판 무관하게 pre-drop 하고, 네트워크(nfs/cifs)·FUSE 실데이터는 남긴다. 그 결과 Linux mounts.kind 는 data/boot/image 이고 virtual_fs 는 taxonomy 예약값이다.
+- mounts dedup: 같은 (major,minor) block 스토리지가 여러 경로(bind 마운트·동일 LV 이중 마운트)로 올라와도 (major,minor) 기준으로 dedup 해 한 번만 발행한다. inventory·metrics 가 같은 수집 경로(collect_mounts)를 타 양쪽 모두 적용되므로, 엔진이 시계열 용량/사용량을 합산할 때 이중집계되지 않는다 — 시계열 payload 엔 major/minor 가 없어 엔진 단독 device dedup 이 불가하므로 에이전트가 보장한다.
 
 ## 값 의미론 (0 / null)
 

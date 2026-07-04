@@ -156,7 +156,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
                                    const char *task_id,
                                    const char *status,
                                    const char *failure_reason,
-                                   int   has_exit_code, int exit_code,
+                                   int   has_exit_code, int exit_code, int signal_no,
                                    long  duration_ms,
                                    const char *stdout_tail,
                                    const char *stderr_tail)
@@ -199,6 +199,10 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 		cJSON_AddNullToObject(root, "failure_reason");
 	if (has_exit_code) cJSON_AddNumberToObject(root, "exit_code", exit_code);
 	else               cJSON_AddNullToObject(root, "exit_code");
+	/* exit_code 와 signal_no 는 상호배타(POSIX wait status): 정상 종료면 exit_code 실측
+	 * signal_no null, 시그널 종료면 그 반대, 상태 미포착이면 둘 다 null. */
+	if (signal_no > 0) cJSON_AddNumberToObject(root, "signal_no", signal_no);
+	else               cJSON_AddNullToObject(root, "signal_no");
 	cJSON_AddNumberToObject(root, "duration_ms", (double)duration_ms);
 	cJSON_AddStringToObject(root, "stdout_tail",  stdout_tail ? stdout_tail : "");
 	cJSON_AddStringToObject(root, "stderr_tail",  stderr_tail ? stderr_tail : "");
@@ -214,14 +218,14 @@ static char *build_result_json(const worker_ctx_t *ctx,
                                const char *task_id,
                                const char *status,
                                const char *failure_reason,
-                               int   has_exit_code, int exit_code,
+                               int   has_exit_code, int exit_code, int signal_no,
                                long  duration_ms,
                                const char *stdout_tail,
                                const char *stderr_tail)
 {
 	return build_result_json_raw(ctx->cfg.machine_id, ctx->cfg.agent_version,
 	                             task_id, status, failure_reason,
-	                             has_exit_code, exit_code, duration_ms,
+	                             has_exit_code, exit_code, signal_no, duration_ms,
 	                             stdout_tail, stderr_tail);
 }
 
@@ -232,7 +236,7 @@ char *worker_emit_sample_result_json(const char *machine_id, const char *agent_v
 	return build_result_json_raw(machine_id, agent_version,
 	                             "00000000-0000-0000-0000-000000000000",
 	                             "success", NULL,
-	                             1, 0, 0L, "", "");
+	                             1, 0, 0, 0L, "", "");
 }
 
 static const char *reason_for_status(download_status_t  ds,
@@ -287,7 +291,7 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	if (cJSON_IsString(jmachine) && ctx->cfg.machine_id &&
 	    strcmp(jmachine->valuestring, ctx->cfg.machine_id) != 0) {
 		char *res = build_result_json(ctx, task_id, "failure", "internal_error",
-		                              0, 0, 0, "", "machine_id mismatch — task routed in error\n");
+		                              0, 0, 0, 0, "", "machine_id mismatch — task routed in error\n");
 		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
 		_exit(0);
 	}
@@ -339,7 +343,7 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	if (strcmp(install_type, "shell") != 0) {
 		char *res = build_result_json(ctx, task_id, "failure",
 		                              "unsupported_install_type",
-		                              0, 0, 0, "",
+		                              0, 0, 0, 0, "",
 		                              "install.type not handled by this OS\n");
 		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
 		free(iargs);
@@ -351,7 +355,7 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	rmrf(work);
 	if (mkdir(work, 0700) != 0) {
 		char *res = build_result_json(ctx, task_id, "failure", "internal_error",
-		                              0, 0, 0, "", "workspace mkdir failed\n");
+		                              0, 0, 0, 0, "", "workspace mkdir failed\n");
 		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
 		free(iargs);
 		_exit(0);
@@ -403,7 +407,7 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	char *res = build_result_json(ctx, task_id,
 	                              success ? "success" : "failure",
 	                              success ? "" : reason,
-	                              has_exit, er.exit_code,
+	                              has_exit, er.exit_code, er.signal_no,
 	                              duration_ms,
 	                              er.stdout_tail, er.stderr_tail);
 	if (res) {
@@ -467,7 +471,7 @@ static int publish_synth_failure(worker_ctx_t *ctx,
                                  const char *err_tail)
 {
 	char *body = build_result_json(ctx, task_id, "failure", reason,
-	                               0, 0, 0, "", err_tail ? err_tail : "");
+	                               0, 0, 0, 0, "", err_tail ? err_tail : "");
 	if (!body) return -1;
 
 	char dst[1024];
@@ -599,7 +603,7 @@ static void recover_stale_running(worker_ctx_t *ctx)
 
 		if (!have_done && !have_results) {
 			char *body = build_result_json(ctx, task_id, "failure", "internal_error",
-			                               0, 0, 0, "",
+			                               0, 0, 0, 0, "",
 			                               "agent terminated mid-install; recovered on restart\n");
 			if (!body) {
 
@@ -812,7 +816,7 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	if (file_exists(done_path)) {
 		fprintf(stderr, "[worker] task %s already_done — synthesizing result\n", task_id);
 		char *res = build_result_json(ctx, task_id, "failure", "already_done",
-		                              0, 0, 0, "", "");
+		                              0, 0, 0, 0, "", "");
 		if (!res) {
 
 			fprintf(stderr, "[worker] OOM building already_done synth for %s — leaving unacked\n", task_id);

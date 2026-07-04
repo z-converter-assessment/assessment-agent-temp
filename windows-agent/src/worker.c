@@ -265,6 +265,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 		cJSON_AddNumberToObject(root, "exit_code", exit_code);
 	else
 		cJSON_AddNullToObject  (root, "exit_code");
+	cJSON_AddNullToObject  (root, "signal_no");   /* Windows 는 POSIX 시그널 개념 없음 — 항상 null */
 
 	cJSON_AddNumberToObject(root, "duration_ms", duration_ms);
 	cJSON_AddStringToObject(root, "stdout_tail", stdout_tail ? stdout_tail : "");

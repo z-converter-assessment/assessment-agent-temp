@@ -379,12 +379,81 @@ static int add_redhat_release_fallback(cJSON *root)
 	return 1;
 }
 
+/* 구세대 SUSE(/etc/SuSE-release) 보완. os-release 는 SLES 12+·openSUSE 에만 있어
+ * SLES 11 은 이 파일로만 OS 를 식별한다. 포맷:
+ *   SUSE Linux Enterprise Server 11 (x86_64)
+ *   VERSION = 11
+ *   PATCHLEVEL = 3
+ * -> os_id=sles, os_version="11.3"(PATCHLEVEL 없으면 VERSION 만), os_codename=null. */
+static int add_suse_release_fallback(cJSON *root)
+{
+	char *content = read_file_all("/etc/SuSE-release");
+	if (!content || !content[0]) {
+		free(content);
+		return 0;
+	}
+
+	char first[256];
+	size_t fi = 0;
+	for (; content[fi] && content[fi] != '\n' && fi < sizeof first - 1; fi++)
+		first[fi] = (char)tolower((unsigned char)content[fi]);
+	first[fi] = '\0';
+
+	const char *os_id = NULL;
+	if      (strstr(first, "enterprise server"))  os_id = "sles";
+	else if (strstr(first, "enterprise desktop")) os_id = "sled";
+	else if (strstr(first, "opensuse"))           os_id = "opensuse";
+	else if (strstr(first, "suse"))               os_id = "suse";
+
+	char version[16] = {0}, patch[16] = {0};
+	for (char *p = content; p && *p; ) {
+		char *eol = strchr(p, '\n');
+		if (eol) *eol = '\0';
+		char *dst = NULL; size_t dsz = 0;
+		if      (strncmp(p, "VERSION", 7) == 0)     { dst = version; dsz = sizeof version; }
+		else if (strncmp(p, "PATCHLEVEL", 10) == 0) { dst = patch;   dsz = sizeof patch; }
+		if (dst) {
+			const char *q = strchr(p, '=');
+			if (q) {
+				q++;
+				while (*q == ' ' || *q == '\t') q++;
+				size_t v = 0;
+				while (*q >= '0' && *q <= '9' && v < dsz - 1)
+					dst[v++] = *q++;
+				dst[v] = '\0';
+			}
+		}
+		if (!eol) break;
+		*eol = '\n';
+		p = eol + 1;
+	}
+
+	if (!os_id || version[0] == '\0') {
+		free(content);
+		return 0;
+	}
+
+	char os_version[32];
+	if (patch[0])
+		snprintf(os_version, sizeof os_version, "%s.%s", version, patch);
+	else
+		snprintf(os_version, sizeof os_version, "%s", version);
+
+	cJSON_AddStringToObject(root, "os_id", os_id);
+	cJSON_AddStringToObject(root, "os_version", os_version);
+	cJSON_AddNullToObject(root, "os_codename");
+	free(content);
+	return 1;
+}
+
 static int add_os_release(cJSON *root)
 {
 	char *content = read_file_all("/etc/os-release");
 	if (!content) {
 
 		if (add_redhat_release_fallback(root))
+			return 1;
+		if (add_suse_release_fallback(root))
 			return 1;
 		cJSON_AddNullToObject(root, "os_id");
 		cJSON_AddNullToObject(root, "os_version");

@@ -288,6 +288,7 @@
         "status":           { "type": "string", "minLength": 1 },
         "failure_reason":   { "$ref": "#/$defs/str_or_null" },
         "exit_code":        { "$ref": "#/$defs/int_or_null" },
+        "signal_no":        { "$ref": "#/$defs/int_or_null" },
         "duration_ms":      { "type": "integer", "minimum": 0 },
         "stdout_tail":      { "type": "string" },
         "stderr_tail":      { "type": "string" },
@@ -296,7 +297,7 @@
       "required": ["message_type", "message_id", "hostname", "machine_id",
                    "agent_id", "agent_version", "boot_time", "collected_at",
                    "agent_started_at", "os_family", "os_id", "os_version", "os_codename",
-                   "task_id", "status", "failure_reason", "exit_code", "duration_ms",
+                   "task_id", "status", "failure_reason", "exit_code", "signal_no", "duration_ms",
                    "stdout_tail", "stderr_tail", "completed_at"]
     },
 
