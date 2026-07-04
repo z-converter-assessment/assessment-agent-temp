@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: build (musl fully-static)
         # payload agent_version = 릴리즈 태그(v1.0.0 -> 1.0.0). 별도 스키마 버전 안 매김.
         run: AGENT_VERSION="${GITHUB_REF_NAME#v}" sh scripts/build-linux.sh
@@ -37,7 +37,7 @@ jobs:
         run: |
           python3 -m pip install --quiet 'jsonschema>=4.18'
           bash scripts/check-contract.sh dist/assessment-agent-linux-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/assessment-agent-linux-x86_64
@@ -48,13 +48,13 @@ jobs:
   # (collect.c agent_is_nt6 + GetProcAddress). debian:bookworm(gcc 12.2, CRT runtime 10.x)로만
   # 빌드 — CRT v10이 NT5.2 startup을 유지한다. CRT 12+(ubuntu 최신)로는 verify는 통과해도
   # 실기 startup이 드롭된다. verify가 NT6+ 심볼 하드임포트를 차단해 2003 로드 실패를 빌드
-  # 단계에서 막는다. checkout은 runner(node20)에서, 빌드만 컨테이너 안에서(docker run).
+  # 단계에서 막는다. checkout은 runner에서, 빌드만 컨테이너 안에서(docker run).
   build-windows:
     name: Windows (windows-x86 / single i686)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: build in debian:bookworm (CRT v10)
         run: |
           docker run --rm --network host -e AGENT_VERSION="${GITHUB_REF_NAME#v}" -v "$PWD/windows-agent":/w -w /w debian:bookworm bash -c '
@@ -66,7 +66,7 @@ jobs:
             make JOBS=2 vendor-build
             make AGENT_VERSION="$AGENT_VERSION" release
           '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: win
           path: windows-agent/dist/*.exe
@@ -82,8 +82,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: win
           path: dist
@@ -102,7 +102,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -116,7 +116,7 @@ jobs:
           ls -la
           cat SHA256SUMS
       - name: publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
