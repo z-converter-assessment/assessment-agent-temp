@@ -68,15 +68,25 @@ interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 
 
 공통 메타데이터 + 아래.
 
+모든 신규 신호는 raw 카운터로만 발행한다 — 엔진이 델타/비율/임계를 계산하니 에이전트는
+단위 변환·해석을 하지 않는다. 커널/구성이 없어 못 읽는 신호는 0 위조 없이 null(엔진이 신뢰도로 흡수).
+
 | 필드 | 내용 |
 |---|---|
 | collection_interval_sec | 설정된 수집 주기(초). 엔진 표본 충분성 계산 기준 |
 | load_1m / load_5m / load_15m | 1/5/15분 로드애버리지. Linux 실측, Windows는 미지원 null |
 | cpu_stat | user/nice/system/idle/iowait/irq/softirq/steal |
-| mem_* / swap_* | mem_total_kb, mem_free_kb, mem_available_kb, mem_buffers_kb, mem_cached_kb, swap_total_kb, swap_free_kb. 불변식 mem_available<=mem_total, swap_free<=swap_total 보장 |
-| disk_io[] | device/kind + reads/writes 카운터 |
-| net_io[] | interface/kind + rx/tx 카운터 |
-| mounts[] | 마운트 사용량. mount/kind/fstype/total_bytes/free_bytes/avail_bytes. 시계열(free/avail)은 여기만 싣는다 — inventory 는 구조만, metrics 는 사용량만이라 중복이 없다. total_bytes 는 % 계산용으로 양쪽에 둔다(mem_total_kb 와 동일 이유) |
+| procs_running / procs_blocked | 실행 큐 길이 / D-state IO 블록 프로세스 수(/proc/stat). procs_running=CPU 포화 주신호, procs_blocked=IO발 CPU 로드 분리(근본원인 판정 핵심). Windows null |
+| cpu_per_core[] | 코어별 user..steal raw 카운터 배열(/proc/stat cpu0..N). 단일스레드 병목 감지. Windows는 별도 수집(NtQuerySystemInformation) — 미구현시 빈 배열/null |
+| schedstat_run_wait_ns | runqueue 대기시간 누적(ns, /proc/schedstat). 실행 대기 적분값이라 procs_running 스냅샷보다 우선. CONFIG_SCHEDSTATS 없으면 null |
+| pswpin / pswpout | 스왑 in/out 페이지 누적(/proc/vmstat). 메모리 포화 주신호 + 메모리발 디스크I/O 판별(근본원인). Windows는 Pages Input/sec 등 별도 |
+| oom_kill | OOM 킬 누적(/proc/vmstat, 4.13+). 없으면 null. pgmajfault는 파일 mmap fault 혼입으로 발행 안 함 |
+| psi_cpu_some_total / psi_mem_some_total / psi_io_some_total | PSI some total(us 누적, /proc/pressure/*, 4.20+). 관측·검증용(분류 미사용). 없으면 null |
+| tcp_retrans_segs / tcp_tw | TCP 재전송 누적(/proc/net/snmp RetransSegs) / TIME_WAIT 소켓 수(/proc/net/sockstat). 네트워크 품질 신호 |
+| conntrack_count / conntrack_max | nf_conntrack 현재/상한(연결 고갈 신호). conntrack 모듈 미로드면 파일 부재 -> null |
+| disk_io[] | device/kind + reads_completed/writes_completed/sectors_read/sectors_written + await 원자료 time_reading_ms/time_writing_ms(diskstats 7·11) + io_ticks_ms/weighted_io_ms(13·14, %util·avgqu 참고값). virtio라 %util 대신 await가 포화 주신호 |
+| net_io[] | interface/kind + rx/tx bytes/packets/errors/drops. drops는 포화 신호 |
+| mounts[] | 마운트 사용량. mount/kind/fstype/total_bytes/free_bytes/avail_bytes + inodes_total/inodes_free(작은 파일 폭증 시 바이트 남아도 inode 먼저 소진돼 ENOSPC 조기감지). 시계열(free/avail/inode)은 여기만 싣는다 — inventory 는 구조만, metrics 는 사용량만이라 중복이 없다. total_bytes 는 % 계산용으로 양쪽에 둔다(mem_total_kb 와 동일 이유) |
 
 ## task.result 필드
 
@@ -160,12 +170,19 @@ collected_at은 공통 메타데이터와 동일한 초 정밀도 iso8601이다(
   포화를 표현하며, 엔진이 os_family로 정규화한다(load<->cpu_run_queue, iowait<->disk_queue). 스키마는
   os_family=windows일 때만 saturation을 요구하고 linux일 때는 금지한다.
 - Windows metrics는 saturation 객체를 싣는다: `{disk_queue, cpu_run_queue, mem_paging_rate}`.
-  disk_queue는 물리 디스크별 배열 `[{device, queue}]`(device=PhysicalDriveN)로 IOCTL_DISK_PERFORMANCE의
-  QueueDepth를 실측한다. diskperf 미부착(OpenStack virtio 등)이면 IOCTL이 ERROR_INVALID_FUNCTION이라 측정
-  불가 -> 해당 디스크를 배열에서 제외한다(빈 배열=미측정). perflib "Current Disk Queue Length"는 diskperf
+  disk_queue는 물리 디스크별 배열 `[{device, queue, read_time, write_time, idle_time, read_count,
+  write_count, query_time}]`(device=PhysicalDriveN)로 IOCTL_DISK_PERFORMANCE를 실측한다. queue=QueueDepth,
+  나머지는 await·%util 산출용 시간/카운트 원자료(100ns 누적 raw, 엔진이 델타·단위 해석). diskperf
+  미부착(OpenStack virtio 구세대 등)이면 IOCTL이 ERROR_INVALID_FUNCTION이라 측정 불가 -> 해당 디스크를
+  배열에서 제외한다(빈 배열=미측정, 엔진이 포화 미관측 처리). perflib "Current Disk Queue Length"는 diskperf
   미부착 시에도 raw 0을 내 측정 불가와 실측 0을 구분하지 못해 쓰지 않는다.
   cpu_run_queue(System\Processor Queue Length), mem_paging_rate(Memory\Pages/sec 누적)는 perflib raw이며
   카운터를 못 읽으면 null이다.
+- Windows 신규 신호(right-sizing): net_io[]에 rx_drops/tx_drops(MIB_IF_ROW2 In/OutDiscards, NT5.2는
+  MIB_IFROW dw* 폴백)를 발행한다. metrics 최상위에 mem_pages_input(Memory\Pages Input/sec — 총 Pages/sec와
+  달리 파일 mmap I/O 미혼입, 하드 read 폴트만)과 tcp_retrans_segs(GetTcpStatistics.dwRetransSegs)를 발행한다.
+  기존 mem_paging_rate(총 Pages/sec)는 계약 유지를 위해 그대로 둔다. per-core 이용률은 GetSystemTimes가
+  전체만 줘 NtQuerySystemInformation(SystemProcessorPerformanceInformation) 신규 수집이 필요 -> 우선순위 낮아 미구현(후속).
 - Windows cpu_stat은 user/system/idle만 실측하고 nice/iowait/irq/softirq/steal은 미지원이라 null이다.
   mem_free_kb는 perflib로 진짜 free를 실측(available과 별개, NT5.2는 null), mem_buffers/cached, load_1m/5m/15m은 미지원 null이다.
 - listen_ports.uid는 Windows에서 null(POSIX uid 없음).

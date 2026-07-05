@@ -99,7 +99,9 @@
         "fstype":      { "$ref": "#/$defs/str_or_null" },
         "total_bytes": { "$ref": "#/$defs/int_or_null" },
         "free_bytes":  { "$ref": "#/$defs/int_or_null" },
-        "avail_bytes": { "$ref": "#/$defs/int_or_null" }
+        "avail_bytes": { "$ref": "#/$defs/int_or_null" },
+        "inodes_total":{ "$ref": "#/$defs/int_or_null" },
+        "inodes_free": { "$ref": "#/$defs/int_or_null" }
       },
       "required": ["mount", "kind", "fstype", "total_bytes", "free_bytes", "avail_bytes"]
     },
@@ -151,7 +153,13 @@
       "additionalProperties": false,
       "properties": {
         "device": { "type": "string", "minLength": 1 },
-        "queue":  { "type": "integer", "minimum": 0 }
+        "queue":  { "type": "integer", "minimum": 0 },
+        "read_time":   { "$ref": "#/$defs/int_or_null" },
+        "write_time":  { "$ref": "#/$defs/int_or_null" },
+        "idle_time":   { "$ref": "#/$defs/int_or_null" },
+        "read_count":  { "$ref": "#/$defs/int_or_null" },
+        "write_count": { "$ref": "#/$defs/int_or_null" },
+        "query_time":  { "$ref": "#/$defs/int_or_null" }
       },
       "required": ["device", "queue"]
     },
@@ -178,7 +186,11 @@
         "reads_completed": { "$ref": "#/$defs/int_or_null" },
         "writes_completed":{ "$ref": "#/$defs/int_or_null" },
         "sectors_read":    { "$ref": "#/$defs/int_or_null" },
-        "sectors_written": { "$ref": "#/$defs/int_or_null" }
+        "sectors_written": { "$ref": "#/$defs/int_or_null" },
+        "time_reading_ms": { "$ref": "#/$defs/int_or_null" },
+        "time_writing_ms": { "$ref": "#/$defs/int_or_null" },
+        "io_ticks_ms":     { "$ref": "#/$defs/int_or_null" },
+        "weighted_io_ms":  { "$ref": "#/$defs/int_or_null" }
       },
       "required": ["device", "kind", "major", "minor",
                    "reads_completed", "writes_completed", "sectors_read", "sectors_written"]
@@ -195,7 +207,9 @@
         "rx_packets": { "$ref": "#/$defs/int_or_null" },
         "tx_packets": { "$ref": "#/$defs/int_or_null" },
         "rx_errors":  { "$ref": "#/$defs/int_or_null" },
-        "tx_errors":  { "$ref": "#/$defs/int_or_null" }
+        "tx_errors":  { "$ref": "#/$defs/int_or_null" },
+        "rx_drops":   { "$ref": "#/$defs/int_or_null" },
+        "tx_drops":   { "$ref": "#/$defs/int_or_null" }
       },
       "required": ["interface", "kind", "rx_bytes", "tx_bytes",
                    "rx_packets", "tx_packets", "rx_errors", "tx_errors"]
@@ -258,6 +272,21 @@
         "disk_io": { "type": "array", "items": { "$ref": "#/$defs/disk_io" } },
         "net_io":  { "type": "array", "items": { "$ref": "#/$defs/net_io" } },
         "mounts":  { "type": "array", "items": { "$ref": "#/$defs/mount_usage" } },
+        "procs_running":         { "$ref": "#/$defs/int_or_null" },
+        "procs_blocked":         { "$ref": "#/$defs/int_or_null" },
+        "cpu_per_core":          { "type": "array", "items": { "$ref": "#/$defs/cpu_stat" } },
+        "schedstat_run_wait_ns": { "$ref": "#/$defs/int_or_null" },
+        "pswpin":                { "$ref": "#/$defs/int_or_null" },
+        "pswpout":               { "$ref": "#/$defs/int_or_null" },
+        "oom_kill":              { "$ref": "#/$defs/int_or_null" },
+        "psi_cpu_some_total":    { "$ref": "#/$defs/int_or_null" },
+        "psi_mem_some_total":    { "$ref": "#/$defs/int_or_null" },
+        "psi_io_some_total":     { "$ref": "#/$defs/int_or_null" },
+        "tcp_retrans_segs":      { "$ref": "#/$defs/int_or_null" },
+        "tcp_tw":                { "$ref": "#/$defs/int_or_null" },
+        "conntrack_count":       { "$ref": "#/$defs/int_or_null" },
+        "conntrack_max":         { "$ref": "#/$defs/int_or_null" },
+        "mem_pages_input":       { "$ref": "#/$defs/int_or_null" },
         "saturation": { "$ref": "#/$defs/saturation" }
       },
       "required": ["collection_interval_sec", "load_1m", "load_5m", "load_15m",

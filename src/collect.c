@@ -1073,6 +1073,10 @@ static cJSON *collect_mounts(int with_usage)
 			double avail = (double)st.f_bavail * (double)st.f_frsize;
 			cJSON_AddNumberToObject(item, "free_bytes",  freeb);
 			cJSON_AddNumberToObject(item, "avail_bytes", avail);
+			/* inode: 작은 파일 폭증 시 바이트가 남아도 inode 가 먼저 소진돼
+			 * ENOSPC. 같은 statvfs 호출이라 공짜. inode 개념 없는 fs 는 f_files=0. */
+			cJSON_AddNumberToObject(item, "inodes_total", (double)st.f_files);
+			cJSON_AddNumberToObject(item, "inodes_free",  (double)st.f_ffree);
 		} else {
 			add_major_minor(item, mounts[i].major, mounts[i].minor);
 		}
@@ -1878,9 +1882,10 @@ static int add_cpu_stat(cJSON *root)
 	long v[8] = { 0 };
 	int got = sscanf(content, "cpu  %ld %ld %ld %ld %ld %ld %ld %ld",
 	                 &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
-	free(content);
-	if (got < 4)
+	if (got < 4) {
+		free(content);
 		return 0;
+	}
 	/* sscanf fills left-to-right: fields [0,got) are measured, the rest weren't
 	 * present on this line — emit those as null, not a fabricated 0. Standard
 	 * /proc/stat on kernel 2.6.32+ always yields all 8. */
@@ -1895,6 +1900,46 @@ static int add_cpu_stat(cJSON *root)
 			cJSON_AddNullToObject(obj, keys[k]);
 	}
 	cJSON_AddItemToObject(root, "cpu_stat", obj);
+
+	/* per-core 이용률 원자료(cpu0..N) + procs_running/procs_blocked.
+	 * 같은 /proc/stat 한 번 읽기로 공짜. per-core=단일스레드 병목 감지,
+	 * procs_running=CPU 포화 주신호, procs_blocked=IO발 로드 분리(근본원인 핵심). */
+	cJSON *cores = cJSON_CreateArray();
+	long procs_running = -1, procs_blocked = -1;
+	char *save = NULL;
+	for (char *line = strtok_r(content, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		if (strncmp(line, "cpu", 3) == 0 && line[3] >= '0' && line[3] <= '9') {
+			long c[8] = { 0 };
+			int cn = sscanf(line, "cpu%*d %ld %ld %ld %ld %ld %ld %ld %ld",
+			                &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7]);
+			if (cn < 4)
+				continue;
+			cJSON *core = cJSON_CreateObject();
+			for (int k = 0; k < 8; k++) {
+				if (k < cn)
+					cJSON_AddNumberToObject(core, keys[k], (double)c[k]);
+				else
+					cJSON_AddNullToObject(core, keys[k]);
+			}
+			cJSON_AddItemToArray(cores, core);
+		} else if (strncmp(line, "procs_running ", 14) == 0) {
+			procs_running = strtol(line + 14, NULL, 10);
+		} else if (strncmp(line, "procs_blocked ", 14) == 0) {
+			procs_blocked = strtol(line + 14, NULL, 10);
+		}
+	}
+	free(content);
+
+	cJSON_AddItemToObject(root, "cpu_per_core", cores);
+	if (procs_running >= 0)
+		cJSON_AddNumberToObject(root, "procs_running", (double)procs_running);
+	else
+		cJSON_AddNullToObject(root, "procs_running");
+	if (procs_blocked >= 0)
+		cJSON_AddNumberToObject(root, "procs_blocked", (double)procs_blocked);
+	else
+		cJSON_AddNullToObject(root, "procs_blocked");
 	return 1;
 }
 
@@ -2012,6 +2057,36 @@ static int add_loadavg(cJSON *root)
 	return 1;
 }
 
+/* /proc/vmstat 의 스왑 발생/OOM 카운터. pswpin/pswpout 은 메모리 포화 주신호이자
+ * 메모리발 디스크 I/O 를 구분하는 근본원인 판별 신호. oom_kill 은 4.13+ 만 존재.
+ * 실패해도 metrics 전체를 실패시키지 않는다(선택 신호 -> null). */
+static void add_vmstat(cJSON *root)
+{
+	long pswpin = -1, pswpout = -1, oom_kill = -1;
+	char *content = read_file_all("/proc/vmstat");
+	if (content) {
+		char *save = NULL;
+		for (char *line = strtok_r(content, "\n", &save); line;
+		     line = strtok_r(NULL, "\n", &save)) {
+			if (strncmp(line, "pswpin ", 7) == 0)
+				pswpin = strtol(line + 7, NULL, 10);
+			else if (strncmp(line, "pswpout ", 8) == 0)
+				pswpout = strtol(line + 8, NULL, 10);
+			else if (strncmp(line, "oom_kill ", 9) == 0)
+				oom_kill = strtol(line + 9, NULL, 10);
+		}
+		free(content);
+	}
+	/* pgmajfault 는 요청서 지침대로 발행하지 않는다 — 파일 mmap major fault 가 섞여
+	 * 대용량 파일 호스트(DB 등)를 메모리 압박으로 오판한다. */
+	if (pswpin >= 0)   cJSON_AddNumberToObject(root, "pswpin",  (double)pswpin);
+	else               cJSON_AddNullToObject(root, "pswpin");
+	if (pswpout >= 0)  cJSON_AddNumberToObject(root, "pswpout", (double)pswpout);
+	else               cJSON_AddNullToObject(root, "pswpout");
+	if (oom_kill >= 0) cJSON_AddNumberToObject(root, "oom_kill", (double)oom_kill);
+	else               cJSON_AddNullToObject(root, "oom_kill");
+}
+
 static cJSON *collect_disk_io(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -2063,6 +2138,22 @@ static cJSON *collect_disk_io(void)
 			cJSON_AddNumberToObject(item, "sectors_written",  (double)sectors_written);
 		else
 			cJSON_AddNullToObject(item, "sectors_written");
+		/* await 원자료(엔진이 델타/완료수로 응답지연 산출) + %util·avgqu 참고값.
+		 * diskstats 필드: 7=time_reading(ms) 11=time_writing(ms) 13=io_ticks(ms)
+		 * 14=weighted(ms). n>=7 은 위 continue 로 보장, 그 외는 짧은 라인이면 null. */
+		cJSON_AddNumberToObject(item, "time_reading_ms", (double)time_reading);
+		if (n >= 11)
+			cJSON_AddNumberToObject(item, "time_writing_ms", (double)time_writing);
+		else
+			cJSON_AddNullToObject(item, "time_writing_ms");
+		if (n >= 13)
+			cJSON_AddNumberToObject(item, "io_ticks_ms", (double)time_io);
+		else
+			cJSON_AddNullToObject(item, "io_ticks_ms");
+		if (n >= 14)
+			cJSON_AddNumberToObject(item, "weighted_io_ms", (double)weighted_time);
+		else
+			cJSON_AddNullToObject(item, "weighted_io_ms");
 		cJSON_AddStringToObject(item, "kind", disk_kind(dev));
 		cJSON_AddItemToArray(arr, item);
 	}
@@ -2097,15 +2188,18 @@ static cJSON *collect_net_io(void)
 		if (strcmp(iface, "lo") == 0)
 			continue;
 
-		long rx_bytes = 0, rx_packets = 0, rx_errors = 0;
-		long tx_bytes = 0, tx_packets = 0, tx_errors = 0;
+		long rx_bytes = 0, rx_packets = 0, rx_errors = 0, rx_drop = 0;
+		long tx_bytes = 0, tx_packets = 0, tx_errors = 0, tx_drop = 0;
 
+		/* /proc/net/dev — rx: bytes packets errs drop [fifo frame compressed
+		 * multicast], tx: bytes packets errs drop [...]. drop 은 포화 신호라
+		 * 이제 버리지 않고 파싱한다(errs 는 이미 발행 중). */
 		int n = sscanf(colon + 1,
-		               "%ld %ld %ld %*d %*d %*d %*d %*d "
-		               "%ld %ld %ld",
-		               &rx_bytes, &rx_packets, &rx_errors,
-		               &tx_bytes, &tx_packets, &tx_errors);
-		if (n < 6)
+		               "%ld %ld %ld %ld %*d %*d %*d %*d "
+		               "%ld %ld %ld %ld",
+		               &rx_bytes, &rx_packets, &rx_errors, &rx_drop,
+		               &tx_bytes, &tx_packets, &tx_errors, &tx_drop);
+		if (n < 8)
 			continue;
 
 		cJSON *item = cJSON_CreateObject();
@@ -2116,11 +2210,168 @@ static cJSON *collect_net_io(void)
 		cJSON_AddNumberToObject(item, "tx_packets", (double)tx_packets);
 		cJSON_AddNumberToObject(item, "rx_errors",  (double)rx_errors);
 		cJSON_AddNumberToObject(item, "tx_errors",  (double)tx_errors);
+		cJSON_AddNumberToObject(item, "rx_drops",   (double)rx_drop);
+		cJSON_AddNumberToObject(item, "tx_drops",   (double)tx_drop);
 		cJSON_AddStringToObject(item, "kind", net_kind(iface));
 		cJSON_AddItemToArray(arr, item);
 	}
 	free(content);
 	return arr;
+}
+
+/* /proc/net/snmp 의 Tcp: RetransSegs — 헤더행에서 인덱스 찾아 값행 같은 위치.
+ * 커널/버전마다 컬럼 수가 달라 고정 오프셋 대신 헤더 매칭. 없으면 -1. */
+static long snmp_tcp_retranssegs(void)
+{
+	char *content = read_file_all("/proc/net/snmp");
+	if (!content)
+		return -1;
+	long result = -1;
+	char *hdr = NULL, *val = NULL, *save = NULL;
+	for (char *line = strtok_r(content, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		if (strncmp(line, "Tcp: ", 5) == 0) {
+			if (!hdr)
+				hdr = line;
+			else {
+				val = line;
+				break;
+			}
+		}
+	}
+	if (hdr && val) {
+		int idx = -1, i = 0;
+		char *hs = NULL;
+		for (char *t = strtok_r(hdr, " ", &hs); t;
+		     t = strtok_r(NULL, " ", &hs), i++) {
+			if (strcmp(t, "RetransSegs") == 0) {
+				idx = i;
+				break;
+			}
+		}
+		if (idx >= 0) {
+			int j = 0;
+			char *vs = NULL;
+			for (char *t = strtok_r(val, " ", &vs); t;
+			     t = strtok_r(NULL, " ", &vs), j++) {
+				if (j == idx) {
+					result = strtol(t, NULL, 10);
+					break;
+				}
+			}
+		}
+	}
+	free(content);
+	return result;
+}
+
+/* 네트워크 품질 신규 신호: TCP 재전송(재전송 품질) · TIME_WAIT 적체 · conntrack
+ * 사용률(연결 고갈). 전부 raw 카운터(엔진이 비율 계산). conntrack 모듈 미로드면
+ * 파일 부재 -> null(skip). */
+static void add_net_quality(cJSON *root)
+{
+	long retrans = snmp_tcp_retranssegs();
+	if (retrans >= 0)
+		cJSON_AddNumberToObject(root, "tcp_retrans_segs", (double)retrans);
+	else
+		cJSON_AddNullToObject(root, "tcp_retrans_segs");
+
+	long tcp_tw = -1;
+	char *ss = read_file_all("/proc/net/sockstat");
+	if (ss) {
+		char *p = strstr(ss, "TCP: ");
+		if (p) {
+			char *tw = strstr(p, "tw ");
+			if (tw)
+				tcp_tw = strtol(tw + 3, NULL, 10);
+		}
+		free(ss);
+	}
+	if (tcp_tw >= 0)
+		cJSON_AddNumberToObject(root, "tcp_tw", (double)tcp_tw);
+	else
+		cJSON_AddNullToObject(root, "tcp_tw");
+
+	char *cc = read_file_all("/proc/sys/net/netfilter/nf_conntrack_count");
+	if (cc) {
+		cJSON_AddNumberToObject(root, "conntrack_count", (double)strtol(cc, NULL, 10));
+		free(cc);
+	} else {
+		cJSON_AddNullToObject(root, "conntrack_count");
+	}
+	char *cm = read_file_all("/proc/sys/net/netfilter/nf_conntrack_max");
+	if (cm) {
+		cJSON_AddNumberToObject(root, "conntrack_max", (double)strtol(cm, NULL, 10));
+		free(cm);
+	} else {
+		cJSON_AddNullToObject(root, "conntrack_max");
+	}
+}
+
+/* /proc/schedstat 의 runqueue 대기시간 누적(ns) 합 — 실행 대기 적분값이라
+ * procs_running 스냅샷보다 표본 사이 스파이크를 안 놓친다. CONFIG_SCHEDSTATS
+ * 없으면 파일 부재 -> null. cpuN 행 8번째 필드(0-idx 7)=runqueue wait time. */
+static void add_schedstat(cJSON *root)
+{
+	long total_wait = -1;
+	char *content = read_file_all("/proc/schedstat");
+	if (content) {
+		long acc = 0;
+		int found = 0;
+		char *save = NULL;
+		for (char *line = strtok_r(content, "\n", &save); line;
+		     line = strtok_r(NULL, "\n", &save)) {
+			if (strncmp(line, "cpu", 3) == 0 && line[3] >= '0' && line[3] <= '9') {
+				unsigned long f[9] = { 0 };
+				int cn = sscanf(line,
+				                "cpu%*d %lu %lu %lu %lu %lu %lu %lu %lu %lu",
+				                &f[0], &f[1], &f[2], &f[3], &f[4],
+				                &f[5], &f[6], &f[7], &f[8]);
+				if (cn >= 8) {
+					acc += (long)f[7];
+					found = 1;
+				}
+			}
+		}
+		free(content);
+		if (found)
+			total_wait = acc;
+	}
+	if (total_wait >= 0)
+		cJSON_AddNumberToObject(root, "schedstat_run_wait_ns", (double)total_wait);
+	else
+		cJSON_AddNullToObject(root, "schedstat_run_wait_ns");
+}
+
+/* PSI (4.20+) — 관측·검증용(분류 미사용, 요청서). some total(us 누적)만 raw 발행.
+ * 커널에 없으면 파일 부재 -> null. */
+static void add_psi(cJSON *root)
+{
+	static const struct {
+		const char *path;
+		const char *key;
+	} psi[] = {
+		{ "/proc/pressure/cpu",    "psi_cpu_some_total" },
+		{ "/proc/pressure/memory", "psi_mem_some_total" },
+		{ "/proc/pressure/io",     "psi_io_some_total" },
+	};
+	for (size_t i = 0; i < sizeof psi / sizeof psi[0]; i++) {
+		long total = -1;
+		char *c = read_file_all(psi[i].path);
+		if (c) {
+			char *t = strstr(c, "some");
+			if (t) {
+				char *tt = strstr(t, "total=");
+				if (tt)
+					total = strtol(tt + 6, NULL, 10);
+			}
+			free(c);
+		}
+		if (total >= 0)
+			cJSON_AddNumberToObject(root, psi[i].key, (double)total);
+		else
+			cJSON_AddNullToObject(root, psi[i].key);
+	}
 }
 
 /* 설정된 수집 주기(초). 엔진 sample_sufficiency 하드코딩(1440/day) 대체 기준값.
@@ -2149,6 +2400,10 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	if (!add_cpu_stat(root))     ok = 0;
 	if (!add_meminfo_full(root)) ok = 0;
 	if (!add_loadavg(root))      ok = 0;
+	add_vmstat(root);      /* 스왑/OOM (근본원인) — 실패해도 null 로 싣고 계속 */
+	add_net_quality(root); /* TCP 재전송/TIME_WAIT/conntrack — 네트워크 품질 */
+	add_schedstat(root);   /* runqueue 대기 누적(적분값) */
+	add_psi(root);         /* PSI some total — 관측용(분류 미사용) */
 
 	cJSON_AddItemToObject(root, "disk_io", or_empty_array(collect_disk_io()));
 	cJSON_AddItemToObject(root, "mounts",  or_empty_array(collect_mounts(1)));
