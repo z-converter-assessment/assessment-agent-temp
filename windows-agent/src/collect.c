@@ -402,6 +402,16 @@ static cJSON *query_disk_queue(void)
 			snprintf(dev, sizeof dev, "PhysicalDrive%d", i);
 			cJSON_AddStringToObject(o, "device", dev);
 			cJSON_AddNumberToObject(o, "queue", (double)dp.QueueDepth);
+			/* IOCTL_DISK_PERFORMANCE 시간/카운트 원자료(await·%util 산출용) —
+			 * QueueDepth 뽑는 이 호출에 동봉. 100ns 누적(raw, 엔진이 델타·단위 해석).
+			 * 구세대 viostor(diskperf 미부착)는 IOCTL 자체가 실패해 이 항목이 아예
+			 * 안 실린다 -> 엔진이 미관측(포화 미측정)으로 처리. */
+			cJSON_AddNumberToObject(o, "read_time",   (double)dp.ReadTime.QuadPart);
+			cJSON_AddNumberToObject(o, "write_time",  (double)dp.WriteTime.QuadPart);
+			cJSON_AddNumberToObject(o, "idle_time",   (double)dp.IdleTime.QuadPart);
+			cJSON_AddNumberToObject(o, "read_count",  (double)dp.ReadCount);
+			cJSON_AddNumberToObject(o, "write_count", (double)dp.WriteCount);
+			cJSON_AddNumberToObject(o, "query_time",  (double)dp.QueryTime.QuadPart);
 			cJSON_AddItemToArray(arr, o);
 		}
 		CloseHandle(h);
@@ -752,6 +762,8 @@ static cJSON *enumerate_net_io(void)
 			cJSON_AddNumberToObject(o, "tx_packets", (double)(r->OutUcastPkts + r->OutNUcastPkts));
 			cJSON_AddNumberToObject(o, "rx_errors",  (double)r->InErrors);
 			cJSON_AddNumberToObject(o, "tx_errors",  (double)r->OutErrors);
+			cJSON_AddNumberToObject(o, "rx_drops",   (double)r->InDiscards);
+			cJSON_AddNumberToObject(o, "tx_drops",   (double)r->OutDiscards);
 			/* 하드웨어 NIC만 win_net_kind(physical 가능). 비-하드웨어(가상/miniport)는 virtual. */
 			cJSON_AddStringToObject(o, "kind",
 			    r->InterfaceAndOperStatusFlags.HardwareInterface ? win_net_kind(r->Type) : "virtual");
@@ -797,6 +809,8 @@ static cJSON *enumerate_net_io(void)
 		cJSON_AddNumberToObject(o, "tx_packets", (double)((double)r->dwOutUcastPkts + r->dwOutNUcastPkts));
 		cJSON_AddNumberToObject(o, "rx_errors",  (double)r->dwInErrors);
 		cJSON_AddNumberToObject(o, "tx_errors",  (double)r->dwOutErrors);
+		cJSON_AddNumberToObject(o, "rx_drops",   (double)r->dwInDiscards);
+		cJSON_AddNumberToObject(o, "tx_drops",   (double)r->dwOutDiscards);
 		cJSON_AddStringToObject(o, "kind", win_net_kind(r->dwType));
 		cJSON_AddItemToArray(arr, o);
 	}
@@ -1557,8 +1571,8 @@ static void fill_saturation(cJSON *m)
 	BYTE *buf = perf_query(vn);
 	RegCloseKey(HKEY_PERFORMANCE_DATA);
 
-	int have_cpu = 0, have_mem = 0;
-	unsigned long long cpu_q = 0, pages = 0;
+	int have_cpu = 0, have_mem = 0, have_pin = 0;
+	unsigned long long cpu_q = 0, pages = 0, pages_in = 0;
 
 	if (buf) {
 		PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)buf;
@@ -1575,6 +1589,11 @@ static void fill_saturation(cJSON *m)
 			PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)omem + omem->DefinitionLength);
 			PERF_COUNTER_DEFINITION *c = perf_counter(omem, perf_index("Pages/sec"));
 			if (c) { pages = perf_read(cb, c); have_mem = 1; }
+			/* Pages Input/sec(하드 read 폴트)은 총 Pages/sec 와 달리 파일 mmap I/O 가
+			 * 안 섞여 고정 임계에 맞는다(요청서 권장). 기존 mem_paging_rate 는 계약
+			 * 유지 위해 그대로 두고, metrics 최상위에 mem_pages_input 신규 발행. */
+			PERF_COUNTER_DEFINITION *ci = perf_counter(omem, perf_index("Pages Input/sec"));
+			if (ci) { pages_in = perf_read(cb, ci); have_pin = 1; }
 		}
 		free(buf);
 	}
@@ -1588,6 +1607,9 @@ static void fill_saturation(cJSON *m)
 	else          cJSON_AddNullToObject  (s, "mem_paging_rate");
 
 	cJSON_AddItemToObject(m, "saturation", s);
+
+	if (have_pin) cJSON_AddNumberToObject(m, "mem_pages_input", (double)pages_in);
+	else          cJSON_AddNullToObject  (m, "mem_pages_input");
 }
 
 /* 설정된 수집 주기(초). main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60). */
@@ -1621,6 +1643,14 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	cJSON_AddItemToObject(m, "mounts",  enumerate_mounts(1));
 	cJSON_AddItemToObject(m, "net_io",  enumerate_net_io());
 	fill_saturation(m);
+
+	/* TCP 재전송(네트워크 품질) — GetTcpStatistics.dwRetransSegs(iphlpapi).
+	 * Linux tcp_retrans_segs 와 대칭. 못 읽으면 null. */
+	MIB_TCPSTATS ts;
+	if (GetTcpStatistics(&ts) == NO_ERROR)
+		cJSON_AddNumberToObject(m, "tcp_retrans_segs", (double)ts.dwRetransSegs);
+	else
+		cJSON_AddNullToObject(m, "tcp_retrans_segs");
 
 	return m;
 }
