@@ -6,7 +6,7 @@ LDFLAGS ?=
 AGENT_VERSION ?= 0.0.0-dev
 
 # USE_VENDORED=1 -> static link against vendor/ (release). default: pkg-config (dev).
-PKGS               := librabbitmq libcjson libcurl libarchive
+PKGS               := librabbitmq libcjson libcurl libarchive openssl
 
 VENDOR_DIR         := vendor
 CJSON_VERSION      := v1.7.18
