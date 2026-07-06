@@ -68,7 +68,7 @@ interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 
 
 공통 메타데이터 + 아래.
 
-모든 신규 신호는 raw 카운터로만 발행한다 — 엔진이 델타/비율/임계를 계산하니 에이전트는
+metrics 신호는 raw 카운터로만 발행한다 — 엔진이 델타/비율/임계를 계산하니 에이전트는
 단위 변환·해석을 하지 않는다. 커널/구성이 없어 못 읽는 신호는 0 위조 없이 null(엔진이 신뢰도로 흡수).
 
 | 필드 | 내용 |
@@ -76,6 +76,8 @@ interfaces[].gateway는 해당 인터페이스의 default route 게이트웨이 
 | collection_interval_sec | 설정된 수집 주기(초). 엔진 표본 충분성 계산 기준 |
 | load_1m / load_5m / load_15m | 1/5/15분 로드애버리지. Linux 실측, Windows는 미지원 null |
 | cpu_stat | user/nice/system/idle/iowait/irq/softirq/steal |
+| mem_total_kb / mem_free_kb / mem_available_kb / mem_buffers_kb / mem_cached_kb | 메모리 총량/여유/가용/버퍼/캐시(kb). Windows는 buffers/cached 미지원 null, NT5.2 mem_free null |
+| swap_total_kb / swap_free_kb | 스왑 총량/여유(kb) |
 | procs_running / procs_blocked | 실행 큐 길이 / D-state IO 블록 프로세스 수(/proc/stat). procs_running=CPU 포화 주신호, procs_blocked=IO발 CPU 로드 분리(근본원인 판정 핵심). Windows null |
 | cpu_per_core[] | 코어별 user..steal raw 카운터 배열(/proc/stat cpu0..N). 단일스레드 병목 감지. Windows는 별도 수집(NtQuerySystemInformation) — 미구현시 빈 배열/null |
 | schedstat_run_wait_ns | runqueue 대기시간 누적(ns, /proc/schedstat). 실행 대기 적분값이라 procs_running 스냅샷보다 우선. CONFIG_SCHEDSTATS 없으면 null |
@@ -178,11 +180,11 @@ collected_at은 공통 메타데이터와 동일한 초 정밀도 iso8601이다(
   미부착 시에도 raw 0을 내 측정 불가와 실측 0을 구분하지 못해 쓰지 않는다.
   cpu_run_queue(System\Processor Queue Length), mem_paging_rate(Memory\Pages/sec 누적)는 perflib raw이며
   카운터를 못 읽으면 null이다.
-- Windows 신규 신호(right-sizing): net_io[]에 rx_drops/tx_drops(MIB_IF_ROW2 In/OutDiscards, NT5.2는
+- Windows 네트워크/포화 신호: net_io[]에 rx_drops/tx_drops(MIB_IF_ROW2 In/OutDiscards, NT5.2는
   MIB_IFROW dw* 폴백)를 발행한다. metrics 최상위에 mem_pages_input(Memory\Pages Input/sec — 총 Pages/sec와
   달리 파일 mmap I/O 미혼입, 하드 read 폴트만)과 tcp_retrans_segs(GetTcpStatistics.dwRetransSegs)를 발행한다.
-  기존 mem_paging_rate(총 Pages/sec)는 계약 유지를 위해 그대로 둔다. per-core 이용률은 GetSystemTimes가
-  전체만 줘 NtQuerySystemInformation(SystemProcessorPerformanceInformation) 신규 수집이 필요 -> 우선순위 낮아 미구현(후속).
+  mem_paging_rate는 총 Pages/sec다. per-core 이용률은 GetSystemTimes가 전체만 주므로
+  NtQuerySystemInformation(SystemProcessorPerformanceInformation)이 필요하며, Windows에서는 수집하지 않아 빈 배열/null이다.
 - Windows cpu_stat은 user/system/idle만 실측하고 nice/iowait/irq/softirq/steal은 미지원이라 null이다.
   mem_free_kb는 perflib로 진짜 free를 실측(available과 별개, NT5.2는 null), mem_buffers/cached, load_1m/5m/15m은 미지원 null이다.
 - listen_ports.uid는 Windows에서 null(POSIX uid 없음).
