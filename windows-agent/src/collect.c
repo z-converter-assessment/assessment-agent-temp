@@ -347,16 +347,22 @@ static void fill_cpu_stat(cJSON *m)
 	cJSON_AddNullToObject  (cs, "steal");
 }
 
+/* \\.\PhysicalDrive<i> 를 read 로 연다(인덱스 초과면 INVALID_HANDLE_VALUE). GENERIC_READ
+ * 필요: access=0 핸들엔 디스크 IOCTL 이 ACCESS_DENIED. 에이전트는 LocalSystem 이라 물리
+ * 드라이브 read 권한이 있다. enumerate_physical_disks 와 query_disk_queue 가 공유한다. */
+static HANDLE open_physical_drive(int i)
+{
+	wchar_t path[64];
+	swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
+	return CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                   NULL, OPEN_EXISTING, 0, NULL);
+}
+
 static cJSON *enumerate_physical_disks(void)
 {
 	cJSON *arr = cJSON_CreateArray();
 	for (int i = 0; i < 32; i++) {
-		wchar_t path[64];
-		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
-		/* GENERIC_READ 필요: access=0 핸들엔 IOCTL_DISK_GET_LENGTH_INFO가 ACCESS_DENIED.
-		 * 에이전트는 LocalSystem이라 물리 드라이브 read 권한 있음. */
-		HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-		                       NULL, OPEN_EXISTING, 0, NULL);
+		HANDLE h = open_physical_drive(i);
 		if (h == INVALID_HANDLE_VALUE)
 			break;
 		GET_LENGTH_INFORMATION gli;
@@ -388,10 +394,7 @@ static cJSON *query_disk_queue(void)
 {
 	cJSON *arr = cJSON_CreateArray();
 	for (int i = 0; i < 32; i++) {
-		wchar_t path[64];
-		swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
-		HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-		                       NULL, OPEN_EXISTING, 0, NULL);
+		HANDLE h = open_physical_drive(i);
 		if (h == INVALID_HANDLE_VALUE)
 			break;
 		DISK_PERFORMANCE dp;
@@ -880,6 +883,40 @@ static int legacy_ipv4_prefix(DWORD if_index, unsigned addr_be, int *out_prefix)
 	return found;
 }
 
+/* GAA 결과에서 물리 MAC(6바이트; up·non-loopback·non-tunnel 어댑터)을 중복 제거하고
+ * 정렬해 mac_list 에 최대 cap 개 채운다(각 원소 malloc, 반환=개수). inventory
+ * mac_addresses 와 composite_id 해시 입력이 이 목록을 공유하므로 두 곳의 MAC 집합이
+ * 반드시 동일하다 — 필터/정렬을 이 한 곳에서만 정의한다. */
+static int collect_mac_list(IP_ADAPTER_ADDRESSES *aa, char *mac_list[], int cap)
+{
+	int mac_count = 0;
+	for (IP_ADAPTER_ADDRESSES *p = aa; p; p = p->Next) {
+		if (p->OperStatus != IfOperStatusUp)        continue;
+		if (p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+		if (p->IfType == IF_TYPE_TUNNEL)            continue;
+		if (p->PhysicalAddressLength != 6)          continue;
+		if (mac_count >= cap)                       break;
+
+		char mac[18];
+		snprintf(mac, sizeof mac, "%02x:%02x:%02x:%02x:%02x:%02x",
+			p->PhysicalAddress[0], p->PhysicalAddress[1], p->PhysicalAddress[2],
+			p->PhysicalAddress[3], p->PhysicalAddress[4], p->PhysicalAddress[5]);
+
+		int dup = 0;
+		for (int i = 0; i < mac_count; i++)
+			if (strcmp(mac_list[i], mac) == 0) { dup = 1; break; }
+		if (!dup) {
+			mac_list[mac_count] = malloc(sizeof mac);
+			if (mac_list[mac_count]) {
+				memcpy(mac_list[mac_count], mac, sizeof mac);
+				mac_count++;
+			}
+		}
+	}
+	qsort(mac_list, mac_count, sizeof(char *), mac_cmp);
+	return mac_count;
+}
+
 static void fill_network_info(cJSON *inv)
 {
 	cJSON *ifaces = cJSON_AddArrayToObject(inv, "interfaces");
@@ -981,26 +1018,9 @@ static void fill_network_info(cJSON *inv)
 			cJSON_AddItemToObject(io, "gateway", gw_item ? gw_item : cJSON_CreateNull());
 			cJSON_AddItemToArray(ifaces, io);
 		}
-
-		if (p->PhysicalAddressLength == 6 && mac_count < MAC_CAP) {
-			char mac[18];
-			snprintf(mac, sizeof mac, "%02x:%02x:%02x:%02x:%02x:%02x",
-				p->PhysicalAddress[0], p->PhysicalAddress[1], p->PhysicalAddress[2],
-				p->PhysicalAddress[3], p->PhysicalAddress[4], p->PhysicalAddress[5]);
-			int dup = 0;
-			for (int i = 0; i < mac_count; i++)
-				if (strcmp(mac_list[i], mac) == 0) { dup = 1; break; }
-			if (!dup) {
-				mac_list[mac_count] = malloc(sizeof mac);
-				if (mac_list[mac_count]) {
-					memcpy(mac_list[mac_count], mac, sizeof mac);
-					mac_count++;
-				}
-			}
-		}
 	}
 
-	qsort(mac_list, mac_count, sizeof(char *), mac_cmp);
+	mac_count = collect_mac_list(aa, mac_list, MAC_CAP);
 	for (int i = 0; i < mac_count; i++) {
 		cJSON_AddItemToArray(macs, cJSON_CreateString(mac_list[i]));
 		free(mac_list[i]);
@@ -1039,33 +1059,9 @@ const char *cached_composite_id(const char *machine_id)
 			}
 		}
 	}
-	if (aa && ret == NO_ERROR) {
-		for (IP_ADAPTER_ADDRESSES *p = aa; p; p = p->Next) {
-			if (p->OperStatus != IfOperStatusUp)        continue;
-			if (p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-			if (p->IfType == IF_TYPE_TUNNEL)            continue;
-			if (p->PhysicalAddressLength != 6)          continue;
-			if (mac_count >= MAC_CAP)                   break;
-
-			char mac[18];
-			snprintf(mac, sizeof mac, "%02x:%02x:%02x:%02x:%02x:%02x",
-				p->PhysicalAddress[0], p->PhysicalAddress[1], p->PhysicalAddress[2],
-				p->PhysicalAddress[3], p->PhysicalAddress[4], p->PhysicalAddress[5]);
-
-			int dup = 0;
-			for (int i = 0; i < mac_count; i++)
-				if (strcmp(mac_list[i], mac) == 0) { dup = 1; break; }
-			if (!dup) {
-				mac_list[mac_count] = malloc(sizeof mac);
-				if (mac_list[mac_count]) {
-					memcpy(mac_list[mac_count], mac, sizeof mac);
-					mac_count++;
-				}
-			}
-		}
-	}
+	if (aa && ret == NO_ERROR)
+		mac_count = collect_mac_list(aa, mac_list, MAC_CAP);
 	free(aa);
-	qsort(mac_list, mac_count, sizeof(char *), mac_cmp);
 
 	EVP_MD_CTX *md = EVP_MD_CTX_new();
 	int ok = (md != NULL) && (EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1);
@@ -1206,6 +1202,29 @@ static char *http_get_short(const char *url, const char *header, int put_request
 	return out;
 }
 
+/* AWS(IMDSv2 토큰)->Azure->GCP 순차 fallback 으로 IMDS metadata 하나를 페치한다.
+ * provider 별 URL/헤더가 다르며, 앞선 provider 가 값을 주면 이후는 건너뛴다.
+ * 전부 실패하면 NULL(호출자가 빈 처리). */
+static char *fetch_imds_chain(const char *aws_metadata_url,
+                              const char *azure_url, const char *gcp_url)
+{
+	char *v = NULL;
+	char *token = http_get_short(
+		"http://169.254.169.254/latest/api/token",
+		"X-aws-ec2-metadata-token-ttl-seconds: 60", 1);
+	if (token && *token) {
+		char hdr[256];
+		snprintf(hdr, sizeof hdr, "X-aws-ec2-metadata-token: %s", token);
+		v = http_get_short(aws_metadata_url, hdr, 0);
+	}
+	free(token);
+	if (!v)
+		v = http_get_short(azure_url, "Metadata: true", 0);
+	if (!v)
+		v = http_get_short(gcp_url, "Metadata-Flavor: Google", 0);
+	return v;
+}
+
 static cJSON *collect_external_ip(void)
 {
 	const char *override = getenv("AGENT_EXTERNAL_IP");
@@ -1224,31 +1243,12 @@ static cJSON *collect_external_ip(void)
 		return arr;
 	}
 
-	char *ip = NULL;
-
-	char *token = http_get_short(
-		"http://169.254.169.254/latest/api/token",
-		"X-aws-ec2-metadata-token-ttl-seconds: 60",
-		1 );
-	if (token && *token) {
-		char hdr[256];
-		snprintf(hdr, sizeof hdr, "X-aws-ec2-metadata-token: %s", token);
-		ip = http_get_short("http://169.254.169.254/latest/meta-data/public-ipv4", hdr, 0);
-	}
-	free(token);
-
-	if (!ip) {
-		ip = http_get_short(
-			"http://169.254.169.254/metadata/instance/network/interface/0/"
-			"ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text",
-			"Metadata: true", 0);
-	}
-	if (!ip) {
-		ip = http_get_short(
-			"http://metadata.google.internal/computeMetadata/v1/instance/"
-			"network-interfaces/0/access-configs/0/external-ip",
-			"Metadata-Flavor: Google", 0);
-	}
+	char *ip = fetch_imds_chain(
+		"http://169.254.169.254/latest/meta-data/public-ipv4",
+		"http://169.254.169.254/metadata/instance/network/interface/0/"
+		"ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text",
+		"http://metadata.google.internal/computeMetadata/v1/instance/"
+		"network-interfaces/0/access-configs/0/external-ip");
 
 	if (!ip || !*ip) {
 		free(ip);
@@ -1262,30 +1262,10 @@ static cJSON *collect_external_ip(void)
 
 static char *try_cloud_instance_id(void)
 {
-	char *id = NULL;
-
-	char *token = http_get_short(
-		"http://169.254.169.254/latest/api/token",
-		"X-aws-ec2-metadata-token-ttl-seconds: 60",
-		1 );
-	if (token && *token) {
-		char hdr[256];
-		snprintf(hdr, sizeof hdr, "X-aws-ec2-metadata-token: %s", token);
-		id = http_get_short("http://169.254.169.254/latest/meta-data/instance-id", hdr, 0);
-	}
-	free(token);
-
-	if (!id) {
-		id = http_get_short(
-			"http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text",
-			"Metadata: true", 0);
-	}
-	if (!id) {
-		id = http_get_short(
-			"http://metadata.google.internal/computeMetadata/v1/instance/id",
-			"Metadata-Flavor: Google", 0);
-	}
-
+	char *id = fetch_imds_chain(
+		"http://169.254.169.254/latest/meta-data/instance-id",
+		"http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text",
+		"http://metadata.google.internal/computeMetadata/v1/instance/id");
 	if (id) fprintf(stderr, "[agent] cloud IMDS instance-id fallback succeeded\n");
 	return id;
 }
@@ -1615,14 +1595,8 @@ static void fill_saturation(cJSON *m)
 /* 설정된 수집 주기(초). main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60). */
 static int agent_interval_sec(void)
 {
-	const char *v = getenv("AGENT_INTERVAL_SEC");
-	if (v && *v) {
-		char *end;
-		long n = strtol(v, &end, 10);
-		if (end != v && n > 0 && n < 86400)
-			return (int)n;
-	}
-	return 60;
+	int n = getenv_int_or("AGENT_INTERVAL_SEC", 60);
+	return (n > 0 && n < 86400) ? n : 60;
 }
 
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)

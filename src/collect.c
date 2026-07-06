@@ -136,10 +136,25 @@ static cJSON *or_json_null(cJSON *v)
 	return v ? v : cJSON_CreateNull();
 }
 
-static void add_kb_or_null(cJSON *root, const char *key, long val)
+/* 정수 metrics 를 발행하되 -1 센티넬(측정불가)이면 null. 카운터/kb 등 음수 불가
+ * 값에 공통 적용 — 값=실측/null=측정불가 계약을 한 곳에서 강제한다. */
+static void add_long_or_null(cJSON *root, const char *key, long val)
 {
 	if (val < 0) cJSON_AddNullToObject(root, key);
 	else         cJSON_AddNumberToObject(root, key, (double)val);
+}
+
+/* /proc 파일 하나를 읽어 첫 정수를 발행한다. 파일 부재(모듈/기능 미탑재)면
+ * null — conntrack 처럼 존재 자체가 조건부인 카운터용. */
+static void add_proc_long_file(cJSON *root, const char *key, const char *path)
+{
+	char *c = read_file_all(path);
+	if (c) {
+		cJSON_AddNumberToObject(root, key, (double)strtol(c, NULL, 10));
+		free(c);
+	} else {
+		cJSON_AddNullToObject(root, key);
+	}
 }
 
 static int is_excluded_block_dev(const char *name)
@@ -230,42 +245,55 @@ static const char *detect_cloud_vendor(void)
 	return result;
 }
 
-static char *try_cloud_instance_id(void)
+/* 클라우드 IMDS 에서 metadata 값 하나를 페치한다. vendor 별 인증/헤더/경로 차이를
+ * 흡수 — AWS 는 IMDSv2 토큰 선취득, azure/gcp 는 전용 헤더. vendor 가 아니거나
+ * 페치 실패면 NULL, 200 이지만 빈 응답이면 빈 문자열(호출자가 null/빈배열 구분). */
+static char *fetch_cloud_metadata(const char *aws_path, const char *azure_path,
+                                  const char *gcp_path)
 {
 	const char *vendor = detect_cloud_vendor();
 	if (!vendor)
 		return NULL;
 
 	char *out = NULL;
+	char cmd[512];
 	if (strcmp(vendor, "aws") == 0) {
-
 		char *token = run_cmd(
 			"curl -fsS -m 1 -X PUT "
 			"-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "
 			"http://169.254.169.254/latest/api/token 2>/dev/null");
 		if (token && *token) {
 			trim_inplace(token);
-			char cmd[512];
 			snprintf(cmd, sizeof cmd,
 			         "curl -fsS -m 1 -H 'X-aws-ec2-metadata-token: %s' "
-			         "http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null",
-			         token);
+			         "http://169.254.169.254/latest/meta-data/%s 2>/dev/null",
+			         token, aws_path);
 			out = run_cmd(cmd);
 		}
 		free(token);
 	} else if (strcmp(vendor, "azure") == 0) {
-		out = run_cmd(
-			"curl -fsS -m 1 -H 'Metadata: true' "
-			"'http://169.254.169.254/metadata/instance/compute/vmId"
-			"?api-version=2021-02-01&format=text' 2>/dev/null");
+		snprintf(cmd, sizeof cmd,
+		         "curl -fsS -m 1 -H 'Metadata: true' "
+		         "'http://169.254.169.254/metadata/instance/%s"
+		         "?api-version=2021-02-01&format=text' 2>/dev/null",
+		         azure_path);
+		out = run_cmd(cmd);
 	} else if (strcmp(vendor, "gcp") == 0) {
-		out = run_cmd(
-			"curl -fsS -m 1 -H 'Metadata-Flavor: Google' "
-			"http://metadata.google.internal/computeMetadata/v1/instance/id 2>/dev/null");
+		snprintf(cmd, sizeof cmd,
+		         "curl -fsS -m 1 -H 'Metadata-Flavor: Google' "
+		         "http://metadata.google.internal/computeMetadata/v1/%s 2>/dev/null",
+		         gcp_path);
+		out = run_cmd(cmd);
 	}
+	if (!out)
+		return NULL;
+	trim_inplace(out);
+	return out;
+}
 
-	if (out)
-		trim_inplace(out);
+static char *try_cloud_instance_id(void)
+{
+	char *out = fetch_cloud_metadata("instance-id", "compute/vmId", "instance/id");
 	if (!out || !*out) {
 		free(out);
 		return NULL;
@@ -626,7 +654,7 @@ static int add_mem_total_swap_total(cJSON *root)
 	if (mem_total < 0)
 		return 0;
 	cJSON_AddNumberToObject(root, "mem_total_kb", (double)mem_total);
-	add_kb_or_null(root, "swap_total_kb", swap_total);
+	add_long_or_null(root, "swap_total_kb", swap_total);
 	return 1;
 }
 
@@ -1413,41 +1441,12 @@ static cJSON *collect_external_ip(void)
 		return arr;
 	}
 
-	const char *vendor = detect_cloud_vendor();
-	if (!vendor)
-		return cJSON_CreateNull();
-
-	char *out = NULL;
-	if (strcmp(vendor, "aws") == 0) {
-		char *token = run_cmd(
-			"curl -fsS -m 1 -X PUT "
-			"-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "
-			"http://169.254.169.254/latest/api/token 2>/dev/null");
-		if (token && *token) {
-			trim_inplace(token);
-			char cmd[512];
-			snprintf(cmd, sizeof cmd,
-			         "curl -fsS -m 1 -H 'X-aws-ec2-metadata-token: %s' "
-			         "http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null",
-			         token);
-			out = run_cmd(cmd);
-		}
-		free(token);
-	} else if (strcmp(vendor, "azure") == 0) {
-		out = run_cmd(
-			"curl -fsS -m 1 -H 'Metadata: true' "
-			"'http://169.254.169.254/metadata/instance/network/interface/0/"
-			"ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text' 2>/dev/null");
-	} else if (strcmp(vendor, "gcp") == 0) {
-		out = run_cmd(
-			"curl -fsS -m 1 -H 'Metadata-Flavor: Google' "
-			"http://metadata.google.internal/computeMetadata/v1/instance/"
-			"network-interfaces/0/access-configs/0/external-ip 2>/dev/null");
-	}
-
+	char *out = fetch_cloud_metadata(
+		"public-ipv4",
+		"network/interface/0/ipv4/ipAddress/0/publicIpAddress",
+		"instance/network-interfaces/0/access-configs/0/external-ip");
 	if (!out)
 		return cJSON_CreateNull();
-	trim_inplace(out);
 	if (!*out) {
 		free(out);
 		return cJSON_CreateArray();
@@ -1932,14 +1931,8 @@ static int add_cpu_stat(cJSON *root)
 	free(content);
 
 	cJSON_AddItemToObject(root, "cpu_per_core", cores);
-	if (procs_running >= 0)
-		cJSON_AddNumberToObject(root, "procs_running", (double)procs_running);
-	else
-		cJSON_AddNullToObject(root, "procs_running");
-	if (procs_blocked >= 0)
-		cJSON_AddNumberToObject(root, "procs_blocked", (double)procs_blocked);
-	else
-		cJSON_AddNullToObject(root, "procs_blocked");
+	add_long_or_null(root, "procs_running", procs_running);
+	add_long_or_null(root, "procs_blocked", procs_blocked);
 	return 1;
 }
 
@@ -2032,12 +2025,12 @@ static int add_meminfo_full(cJSON *root)
 		return 0;
 
 	cJSON_AddNumberToObject(root, "mem_total_kb", (double)mem_total);
-	add_kb_or_null(root, "mem_free_kb",      mem_free);
-	add_kb_or_null(root, "mem_buffers_kb",   mem_buffers);
-	add_kb_or_null(root, "mem_cached_kb",    mem_cached);
-	add_kb_or_null(root, "swap_total_kb",    swap_total);
-	add_kb_or_null(root, "swap_free_kb",     swap_free);
-	add_kb_or_null(root, "mem_available_kb", mem_available);
+	add_long_or_null(root, "mem_free_kb",      mem_free);
+	add_long_or_null(root, "mem_buffers_kb",   mem_buffers);
+	add_long_or_null(root, "mem_cached_kb",    mem_cached);
+	add_long_or_null(root, "swap_total_kb",    swap_total);
+	add_long_or_null(root, "swap_free_kb",     swap_free);
+	add_long_or_null(root, "mem_available_kb", mem_available);
 	return 1;
 }
 
@@ -2079,12 +2072,9 @@ static void add_vmstat(cJSON *root)
 	}
 	/* pgmajfault 는 요청서 지침대로 발행하지 않는다 — 파일 mmap major fault 가 섞여
 	 * 대용량 파일 호스트(DB 등)를 메모리 압박으로 오판한다. */
-	if (pswpin >= 0)   cJSON_AddNumberToObject(root, "pswpin",  (double)pswpin);
-	else               cJSON_AddNullToObject(root, "pswpin");
-	if (pswpout >= 0)  cJSON_AddNumberToObject(root, "pswpout", (double)pswpout);
-	else               cJSON_AddNullToObject(root, "pswpout");
-	if (oom_kill >= 0) cJSON_AddNumberToObject(root, "oom_kill", (double)oom_kill);
-	else               cJSON_AddNullToObject(root, "oom_kill");
+	add_long_or_null(root, "pswpin",   pswpin);
+	add_long_or_null(root, "pswpout",  pswpout);
+	add_long_or_null(root, "oom_kill", oom_kill);
 }
 
 static cJSON *collect_disk_io(void)
@@ -2129,31 +2119,16 @@ static cJSON *collect_disk_io(void)
 		cJSON_AddStringToObject(item, "device", dev);
 		add_major_minor(item, (int)major, (int)minor);
 		cJSON_AddNumberToObject(item, "reads_completed",  (double)reads_completed);
-		if (n >= 8)
-			cJSON_AddNumberToObject(item, "writes_completed", (double)writes_completed);
-		else
-			cJSON_AddNullToObject(item, "writes_completed");
+		add_long_or_null(item, "writes_completed", n >= 8  ? writes_completed : -1);
 		cJSON_AddNumberToObject(item, "sectors_read",     (double)sectors_read);
-		if (n >= 10)
-			cJSON_AddNumberToObject(item, "sectors_written",  (double)sectors_written);
-		else
-			cJSON_AddNullToObject(item, "sectors_written");
+		add_long_or_null(item, "sectors_written",  n >= 10 ? sectors_written : -1);
 		/* await 원자료(엔진이 델타/완료수로 응답지연 산출) + %util·avgqu 참고값.
 		 * diskstats 필드: 7=time_reading(ms) 11=time_writing(ms) 13=io_ticks(ms)
 		 * 14=weighted(ms). n>=7 은 위 continue 로 보장, 그 외는 짧은 라인이면 null. */
 		cJSON_AddNumberToObject(item, "time_reading_ms", (double)time_reading);
-		if (n >= 11)
-			cJSON_AddNumberToObject(item, "time_writing_ms", (double)time_writing);
-		else
-			cJSON_AddNullToObject(item, "time_writing_ms");
-		if (n >= 13)
-			cJSON_AddNumberToObject(item, "io_ticks_ms", (double)time_io);
-		else
-			cJSON_AddNullToObject(item, "io_ticks_ms");
-		if (n >= 14)
-			cJSON_AddNumberToObject(item, "weighted_io_ms", (double)weighted_time);
-		else
-			cJSON_AddNullToObject(item, "weighted_io_ms");
+		add_long_or_null(item, "time_writing_ms", n >= 11 ? time_writing : -1);
+		add_long_or_null(item, "io_ticks_ms",     n >= 13 ? time_io : -1);
+		add_long_or_null(item, "weighted_io_ms",  n >= 14 ? weighted_time : -1);
 		cJSON_AddStringToObject(item, "kind", disk_kind(dev));
 		cJSON_AddItemToArray(arr, item);
 	}
@@ -2270,11 +2245,7 @@ static long snmp_tcp_retranssegs(void)
  * 파일 부재 -> null(skip). */
 static void add_net_quality(cJSON *root)
 {
-	long retrans = snmp_tcp_retranssegs();
-	if (retrans >= 0)
-		cJSON_AddNumberToObject(root, "tcp_retrans_segs", (double)retrans);
-	else
-		cJSON_AddNullToObject(root, "tcp_retrans_segs");
+	add_long_or_null(root, "tcp_retrans_segs", snmp_tcp_retranssegs());
 
 	long tcp_tw = -1;
 	char *ss = read_file_all("/proc/net/sockstat");
@@ -2287,25 +2258,12 @@ static void add_net_quality(cJSON *root)
 		}
 		free(ss);
 	}
-	if (tcp_tw >= 0)
-		cJSON_AddNumberToObject(root, "tcp_tw", (double)tcp_tw);
-	else
-		cJSON_AddNullToObject(root, "tcp_tw");
+	add_long_or_null(root, "tcp_tw", tcp_tw);
 
-	char *cc = read_file_all("/proc/sys/net/netfilter/nf_conntrack_count");
-	if (cc) {
-		cJSON_AddNumberToObject(root, "conntrack_count", (double)strtol(cc, NULL, 10));
-		free(cc);
-	} else {
-		cJSON_AddNullToObject(root, "conntrack_count");
-	}
-	char *cm = read_file_all("/proc/sys/net/netfilter/nf_conntrack_max");
-	if (cm) {
-		cJSON_AddNumberToObject(root, "conntrack_max", (double)strtol(cm, NULL, 10));
-		free(cm);
-	} else {
-		cJSON_AddNullToObject(root, "conntrack_max");
-	}
+	add_proc_long_file(root, "conntrack_count",
+	                   "/proc/sys/net/netfilter/nf_conntrack_count");
+	add_proc_long_file(root, "conntrack_max",
+	                   "/proc/sys/net/netfilter/nf_conntrack_max");
 }
 
 /* /proc/schedstat 의 runqueue 대기시간 누적(ns) 합 — 실행 대기 적분값이라
@@ -2337,10 +2295,7 @@ static void add_schedstat(cJSON *root)
 		if (found)
 			total_wait = acc;
 	}
-	if (total_wait >= 0)
-		cJSON_AddNumberToObject(root, "schedstat_run_wait_ns", (double)total_wait);
-	else
-		cJSON_AddNullToObject(root, "schedstat_run_wait_ns");
+	add_long_or_null(root, "schedstat_run_wait_ns", total_wait);
 }
 
 /* PSI (4.20+) — 관측·검증용(분류 미사용, 요청서). some total(us 누적)만 raw 발행.
@@ -2367,10 +2322,7 @@ static void add_psi(cJSON *root)
 			}
 			free(c);
 		}
-		if (total >= 0)
-			cJSON_AddNumberToObject(root, psi[i].key, (double)total);
-		else
-			cJSON_AddNullToObject(root, psi[i].key);
+		add_long_or_null(root, psi[i].key, total);
 	}
 }
 
@@ -2378,14 +2330,8 @@ static void add_psi(cJSON *root)
  * main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60)를 읽는다. */
 static int agent_interval_sec(void)
 {
-	const char *v = getenv("AGENT_INTERVAL_SEC");
-	if (v && *v) {
-		char *end;
-		long n = strtol(v, &end, 10);
-		if (end != v && n > 0 && n < 86400)
-			return (int)n;
-	}
-	return 60;
+	int n = getenv_int_or("AGENT_INTERVAL_SEC", 60);
+	return (n > 0 && n < 86400) ? n : 60;
 }
 
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
