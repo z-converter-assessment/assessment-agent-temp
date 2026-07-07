@@ -233,10 +233,8 @@ char *get_boot_time_iso8601(char *buf, size_t len)
 	return iso8601_utc(boot_sec, buf, len);
 }
 
-/* Machine-wide data root: CSIDL_COMMON_APPDATA resolves to %ProgramData%
- * on Vista+ and to "All Users\Application Data" on NT 5.x (2003/XP). A
- * LocalSystem service can always read/write it, so config + worker state
- * live here regardless of which account the service runs as. */
+/* Machine-wide data root: CSIDL_COMMON_APPDATA (%ProgramData% on Vista+,
+ * "All Users\Application Data" on NT 5.x) — LocalSystem-writable on all gens. */
 int agent_data_path_w(const wchar_t *suffix, wchar_t *out, size_t cap)
 {
 	wchar_t base[MAX_PATH];

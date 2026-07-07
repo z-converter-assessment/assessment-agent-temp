@@ -149,9 +149,7 @@ static int task_id_valid(const char *id)
 	return 1;
 }
 
-/* task.result 페이로드 구성의 단일 소스. task 처리 경로(build_result_json 래퍼, ctx 보유)와
- * emit dry-run(worker_emit_sample_result_json)이 모두 이걸 호출해 필드 셋 드리프트를 막는다.
- * machine_id/agent_version 만 호출자별로 다르다. */
+/* task.result 페이로드 구성의 단일 소스 — 발행 경로와 emit dry-run 이 공유해 필드 셋 드리프트를 막는다. */
 static char *build_result_json_raw(const char *machine_id, const char *agent_version,
                                    const char *task_id,
                                    const char *status,
@@ -170,8 +168,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	iso8601_utc(ts.tv_sec, now_buf, sizeof now_buf);
 
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
-	/* machine_id 부재 시 null — inventory/metrics/error(add_common_metadata)와 통일.
-	 * ""로 채우면 같은 호스트가 메시지별로 ""/null 로 갈려 감사/조인이 오염된다. */
+	/* machine_id 부재 시 null(다른 메시지와 통일) — ""로 채우면 같은 호스트가 메시지별로 ""/null 로 갈려 감사/조인이 오염된다. */
 	if (machine_id && *machine_id)
 		cJSON_AddStringToObject(root, "machine_id", machine_id);
 	else
@@ -204,8 +201,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 		cJSON_AddNullToObject(root, "failure_reason");
 	if (has_exit_code) cJSON_AddNumberToObject(root, "exit_code", exit_code);
 	else               cJSON_AddNullToObject(root, "exit_code");
-	/* exit_code 와 signal_no 는 상호배타(POSIX wait status): 정상 종료면 exit_code 실측
-	 * signal_no null, 시그널 종료면 그 반대, 상태 미포착이면 둘 다 null. */
+	/* exit_code 와 signal_no 는 상호배타(POSIX wait status): 정상종료=exit_code, 시그널종료=signal_no, 미포착=둘 다 null. */
 	if (signal_no > 0) cJSON_AddNumberToObject(root, "signal_no", signal_no);
 	else               cJSON_AddNullToObject(root, "signal_no");
 	cJSON_AddNumberToObject(root, "duration_ms", (double)duration_ms);
@@ -234,8 +230,7 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	                             stdout_tail, stderr_tail);
 }
 
-/* wire 계약 conformance(emit dry-run)용 대표 task.result. 실제 발행 경로와 동일한
- * build_result_json_raw 직렬화를 태운다(더미 task 값 — 값이 아니라 구조를 검증). */
+/* emit dry-run 계약 검증용 대표 task.result — 실제 발행과 동일 직렬화, 값이 아니라 구조를 검증. */
 char *worker_emit_sample_result_json(const char *machine_id, const char *agent_version)
 {
 	return build_result_json_raw(machine_id, agent_version,
@@ -324,18 +319,15 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 		const cJSON *ja  = cJSON_GetObjectItemCaseSensitive(jinstall, "args");
 		if (cJSON_IsString(jty) && *jty->valuestring) install_type = jty->valuestring;
 		if (cJSON_IsString(js)) script      = js->valuestring;
-		/* Non-positive timeout would disable both the wall-clock kill and the
-		 * RLIMIT_CPU cap in exec.c, hanging the single in-flight worker slot.
-		 * Ignore it and keep the default. */
+		/* Non-positive timeout disables both the wall-clock kill and exec.c's
+		 * RLIMIT_CPU cap, hanging the worker slot — keep the default. */
 		if (cJSON_IsNumber(jt) && jt->valuedouble > 0) timeout_sec = (int)jt->valuedouble;
 		if (cJSON_IsArray(ja)) {
 			int n = cJSON_GetArraySize(ja);
 			iargs = (const char **)calloc((size_t)n + 1, sizeof(char *));
 			if (iargs) {
-				/* Compact: keep only string args, in order. A non-string
-				 * element (argv can't carry it) is skipped rather than left
-				 * as a NULL hole that would truncate every later arg in
-				 * exec.c's NULL-terminated argv scan. */
+				/* Keep only string args, in order — a NULL hole would
+				 * truncate exec.c's NULL-terminated argv scan. */
 				int j = 0;
 				for (int i = 0; i < n; i++) {
 					const cJSON *e = cJSON_GetArrayItem(ja, i);
@@ -402,9 +394,8 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 
 	int success = (ds == DOWNLOAD_OK && es == EXTRACT_OK && xs == EXEC_OK);
 	const char *reason = success ? "" : reason_for_status(ds, es, xs);
-	/* exit_code is a real measurement only when the script exited normally.
-	 * A signal-killed child (timeout SIGKILL, or a crash) has signal_no>0 and
-	 * leaves exit_code at its -1 placeholder — emit null, not a fake -1. */
+	/* exit_code is real only on normal exit; a signal-killed child keeps the
+	 * -1 placeholder (signal_no>0) — emit null, not a fake -1. */
 	int has_exit = (xs != EXEC_ERR_SCRIPT_NOT_FOUND && xs != EXEC_ERR_SCRIPT_UNSAFE &&
 	                xs != EXEC_ERR_INTERNAL && er.signal_no == 0 &&
 	                ds == DOWNLOAD_OK && es == EXTRACT_OK);
@@ -692,13 +683,14 @@ worker_ctx_t *worker_init(const worker_config_t *cfg)
 
 	ctx->conn = publish_conn_open(&ctx->cfg.amqp);
 	if (!ctx->conn) {
-		fprintf(stderr, "[worker] AMQP connection (agent-worker) failed\n");
-		free(ctx);
-		return NULL;
+		/* 시작 시 브로커 다운이어도 worker 를 영구 비활성화하지 않고 tick 에서 재연결한다. */
+		fprintf(stderr, "[worker] AMQP connection deferred — broker unreachable at startup, will retry\n");
+		ctx->conn_dead = 1;
 	}
 
 	purge_stale_workspaces(ctx);
-	replay_pending_results(ctx);
+	if (ctx->conn && !ctx->conn_dead)
+		replay_pending_results(ctx);
 	recover_stale_running(ctx);
 	purge_expired_done(ctx);
 
@@ -790,8 +782,7 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 	                          &body, &blen, &tag);
 	if (rc == 1) return 0;
 	if (rc == 2) {
-		/* task 큐가 아직 없음(engine 이 첫 task 때 생성) — 정상 대기 상태다. 404 가 채널을
-		 * 닫았으니 채널만 조용히 재오픈하고, 실패하면 전체 reconnect 로 폴백한다. 경고 없음. */
+		/* task 큐 아직 없음(engine 이 첫 task 때 lazy 생성) — 정상 대기. 채널만 재오픈, 실패 시 전체 reconnect. */
 		if (publish_conn_recover_channel(ctx->conn) != 0)
 			ctx->conn_dead = 1;
 		return 0;
@@ -842,6 +833,27 @@ static int try_pick_new_task(worker_ctx_t *ctx)
 			return 0;
 		}
 		if (publish_conn_ack(ctx->conn, tag) != 0) ctx->conn_dead = 1;
+		cJSON_Delete(task);
+		free(body);
+		return 0;
+	}
+
+	/* results/ 에 대기 결과가 있으면 이미 실행됐고 발행만 미완 — done/marker 만 봐선 못 걸러
+	 * 재실행(이중 설치)한다. 재실행하지 말고 그 결과를 발행+ack 후 done 으로 옮긴다. */
+	char results_path[1024];
+	snprintf(results_path, sizeof results_path, "%s/%s.json", ctx->results_dir, task_id);
+	if (file_exists(results_path)) {
+		fprintf(stderr, "[worker] task %s has pending result on disk — publishing instead of re-running\n", task_id);
+		char *rbody = NULL;
+		int prc;
+		if (read_result_file(results_path, &rbody) == 0 && rbody)
+			prc = publish_result_and_ack(ctx, task_id, tag, rbody);
+		else
+			prc = publish_synth_failure(ctx, task_id, tag, "internal_error",
+			                            "pending result file unreadable on redelivery\n");
+		free(rbody);
+		if (prc != 0) ctx->conn_dead = 1;
+		else          clear_running_marker(ctx, task_id);
 		cJSON_Delete(task);
 		free(body);
 		return 0;

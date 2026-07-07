@@ -1,10 +1,8 @@
 #ifndef NT52_COMPAT_H
 #define NT52_COMPAT_H
 
-/* 단일 i686 바이너리는 NT5.2(2003/XP)를 하한으로 커버한다. 2003의 msvcrt.dll엔 secure-CRT
- * (strncpy_s/strtok_s/_putenv_s)가 없어, 이를 import하면 "진입점을 찾을 수 없음"으로 로드가 실패한다.
- * mingw는 _WIN32_WINNT>=0x0600에서 secure-CRT를 선언해 실물을 import하므로, agent를 0x0600으로 빌드하는
- * 이 트리에서는 _WIN32_WINNT와 무관하게 항상 로컬 구현으로 대체해 msvcrt secure-CRT import를 없앤다. */
+/* NT5.2(2003/XP) msvcrt.dll 엔 secure-CRT(strncpy_s/strtok_s/_putenv_s)가 없어, import 하면
+ * 로드가 실패한다. 항상 로컬 구현으로 대체해 msvcrt secure-CRT import 를 없앤다(0x0600 빌드 무관). */
 #if 1
 
 #include <string.h>

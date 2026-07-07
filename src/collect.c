@@ -24,6 +24,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -81,8 +82,7 @@ static void add_common_metadata(cJSON *obj,
                                 const char *agent_version)
 {
 	cJSON_AddStringToObject(obj, "message_type", message_type);
-	/* machine_id는 원시 머신 식별자다. 구할 수 없으면 억지로 채우지 않고 null(측정 불가).
-	 * 식별·라우팅은 agent_id로 하고, composite_id는 mac 기반으로 유니크가 유지된다. */
+	/* machine_id 없으면 null(측정 불가) — 식별·라우팅은 agent_id, 유니크는 mac 기반 composite_id. */
 	if (machine_id && *machine_id)
 		cJSON_AddStringToObject(obj, "machine_id", machine_id);
 	else
@@ -128,24 +128,21 @@ static cJSON *or_empty_array(cJSON *arr)
 	return arr ? arr : cJSON_CreateArray();
 }
 
-/* For fields with a legitimate "unmeasurable" state (services: no systemd and
- * no /var/lock/subsys), keep the key present as null instead of dropping it on
- * a C-NULL (e.g. alloc failure). cJSON silently ignores a NULL item add. */
+/* Keep a legitimately-unmeasurable field (e.g. services) present as null instead
+ * of dropping the key; cJSON silently ignores a NULL item add. */
 static cJSON *or_json_null(cJSON *v)
 {
 	return v ? v : cJSON_CreateNull();
 }
 
-/* 정수 metrics 를 발행하되 -1 센티넬(측정불가)이면 null. 카운터/kb 등 음수 불가
- * 값에 공통 적용 — 값=실측/null=측정불가 계약을 한 곳에서 강제한다. */
+/* -1 센티넬(측정불가)이면 null. 값=실측/null=측정불가 계약을 한 곳에서 강제. */
 static void add_long_or_null(cJSON *root, const char *key, long val)
 {
 	if (val < 0) cJSON_AddNullToObject(root, key);
 	else         cJSON_AddNumberToObject(root, key, (double)val);
 }
 
-/* /proc 파일 하나를 읽어 첫 정수를 발행한다. 파일 부재(모듈/기능 미탑재)면
- * null — conntrack 처럼 존재 자체가 조건부인 카운터용. */
+/* /proc 파일의 첫 정수 발행. 파일 부재(conntrack 등 조건부 카운터)면 null. */
 static void add_proc_long_file(cJSON *root, const char *key, const char *path)
 {
 	char *c = read_file_all(path);
@@ -185,8 +182,11 @@ static int parse_major_minor(const char *s, int *major, int *minor)
 
 static void add_major_minor(cJSON *obj, int major, int minor)
 {
+	/* schema 가 major/minor 를 required(int_or_null)로 강제 — 실패(-1)는 키 생략 말고 명시적 null. */
 	if (major >= 0) cJSON_AddNumberToObject(obj, "major", (double)major);
+	else            cJSON_AddNullToObject(obj, "major");
 	if (minor >= 0) cJSON_AddNumberToObject(obj, "minor", (double)minor);
+	else            cJSON_AddNullToObject(obj, "minor");
 }
 
 static int is_machine_id(const char *s)
@@ -245,9 +245,8 @@ static const char *detect_cloud_vendor(void)
 	return result;
 }
 
-/* 클라우드 IMDS 에서 metadata 값 하나를 페치한다. vendor 별 인증/헤더/경로 차이를
- * 흡수 — AWS 는 IMDSv2 토큰 선취득, azure/gcp 는 전용 헤더. vendor 가 아니거나
- * 페치 실패면 NULL, 200 이지만 빈 응답이면 빈 문자열(호출자가 null/빈배열 구분). */
+/* 클라우드 IMDS metadata 페치(AWS 는 IMDSv2 토큰 선취득). vendor 아님/실패면 NULL,
+ * 200+빈 응답이면 빈 문자열(호출자가 null/빈배열 구분). */
 static char *fetch_cloud_metadata(const char *aws_path, const char *azure_path,
                                   const char *gcp_path)
 {
@@ -407,12 +406,8 @@ static int add_redhat_release_fallback(cJSON *root)
 	return 1;
 }
 
-/* 구세대 SUSE(/etc/SuSE-release) 보완. os-release 는 SLES 12+·openSUSE 에만 있어
- * SLES 11 은 이 파일로만 OS 를 식별한다. 포맷:
- *   SUSE Linux Enterprise Server 11 (x86_64)
- *   VERSION = 11
- *   PATCHLEVEL = 3
- * -> os_id=sles, os_version="11.3"(PATCHLEVEL 없으면 VERSION 만), os_codename=null. */
+/* 구세대 SUSE(/etc/SuSE-release) 보완 — SLES11 은 os-release 가 없어 이 파일로만 식별.
+ * VERSION+PATCHLEVEL -> os_version="11.3"(PATCHLEVEL 없으면 VERSION 만). */
 static int add_suse_release_fallback(cJSON *root)
 {
 	char *content = read_file_all("/etc/SuSE-release");
@@ -474,8 +469,7 @@ static int add_suse_release_fallback(cJSON *root)
 	return 1;
 }
 
-/* /etc/lsb-release 보완(os-release 없는 lsb-only 구형 Ubuntu/Debian 등).
- * DISTRIB_ID/DISTRIB_RELEASE/DISTRIB_CODENAME -> os_id(소문자)/os_version/os_codename. */
+/* /etc/lsb-release 보완(os-release 없는 lsb-only 구형 배포). DISTRIB_* -> os_id(소문자)/os_version/os_codename. */
 static int add_lsb_release_fallback(cJSON *root)
 {
 	char *content = read_file_all("/etc/lsb-release");
@@ -571,7 +565,7 @@ static int add_kernel_version(cJSON *root)
 void collect_add_os_result_fields(cJSON *root)
 {
 	cJSON_AddStringToObject(root, "os_family", "linux");
-	add_os_release(root);   /* os_id, os_version, os_codename */
+	add_os_release(root);
 }
 
 static int add_cpu_cores(cJSON *root)
@@ -688,11 +682,9 @@ static const char *net_kind(const char *ifname)
 	if (access(p, F_OK) == 0) return "bond_member";
 	snprintf(p, sizeof p, "/sys/class/net/%s/tun_flags", ifname);
 	if (access(p, F_OK) == 0) return "tunnel";
-	/* uevent DEVTYPE is the kernel's own name for the virtual device type —
-	 * authoritative and general, so map every taxonomy-relevant type from it
-	 * rather than only vlan. Overlay/tunnel encaps all fold to "tunnel";
-	 * macvlan/ipvlan/macvtap have no dedicated kind and fall through to
-	 * "virtual" below. */
+	/* uevent DEVTYPE is the kernel's authoritative virtual-device type; map all
+	 * relevant types here. Tunnel encaps fold to "tunnel"; macvlan/ipvlan/macvtap
+	 * fall through to "virtual" below. */
 	snprintf(p, sizeof p, "/sys/class/net/%s/uevent", ifname);
 	char *ue = read_file_all(p);
 	if (ue) {
@@ -771,9 +763,8 @@ static cJSON *collect_disks_via_lsblk(void)
 		cJSON_AddStringToObject(item, "name", name->valuestring);
 		add_major_minor(item, major, minor);
 
-		/* size/type come straight from lsblk; if a field is absent or malformed
-		 * emit null rather than a fabricated 0 / "disk". The engine filters on
-		 * kind (below), not on the raw lsblk type. */
+		/* size/type absent or malformed -> null, not a fabricated 0/"disk"
+		 * (engine filters on kind below, not raw lsblk type). */
 		if (cJSON_IsNumber(size))
 			cJSON_AddNumberToObject(item, "size_bytes", size->valuedouble);
 		else if (cJSON_IsString(size) && *size->valuestring)
@@ -786,9 +777,8 @@ static cJSON *collect_disks_via_lsblk(void)
 			cJSON_AddStringToObject(item, "type", type->valuestring);
 		else
 			cJSON_AddNullToObject(item, "type");
-		/* disk_kind 는 sysfs 를 kernel 이름 키로 probe 하므로 KNAME(dm-0 등)을 쓴다 — lsblk
-		 * NAME(친화명 vg0-lv0)이면 sysfs miss 로 오분류(virtual). disk_io[](diskstats kernel
-		 * 이름)와 같은 키로 분류해 크로스메시지 kind 드리프트를 막는다. name 발행은 NAME 유지. */
+		/* disk_kind 는 sysfs 를 kernel 이름으로 probe -> KNAME(dm-0) 사용. NAME(vg0-lv0)이면
+		 * sysfs miss 로 오분류. disk_io[]와 같은 키로 크로스메시지 kind 드리프트 방지(name 발행은 NAME). */
 		const char *kn = (cJSON_IsString(kname) && *kname->valuestring)
 		                 ? kname->valuestring : name->valuestring;
 		cJSON_AddStringToObject(item, "kind", disk_kind(kn));
@@ -815,19 +805,16 @@ static cJSON *collect_disks_via_sysfs(void)
 		if (is_excluded_block_dev(e->d_name))
 			continue;
 
+		/* /device 심링크로 거르지 않는다 — dm-N/mdN 은 device 가 없어, 누락되면 disk_io[] 와
+		 * device 셋이 어긋난다. kind 는 disk_kind()가 sysfs 신호로 판별. */
 		char path[512];
-		snprintf(path, sizeof path, "/sys/block/%s/device", e->d_name);
-		if (access(path, F_OK) != 0)
-			continue;
-
 		snprintf(path, sizeof path, "/sys/block/%s/size", e->d_name);
 		char *content = read_file_all(path);
-		if (!content)
-			continue;
-		long sectors = strtol(content, NULL, 10);
-		free(content);
-		if (sectors <= 0)
-			continue;
+		long sectors = -1;
+		if (content) {
+			sectors = strtol(content, NULL, 10);
+			free(content);
+		}
 
 		int major = -1, minor = -1;
 		snprintf(path, sizeof path, "/sys/block/%s/dev", e->d_name);
@@ -841,8 +828,13 @@ static cJSON *collect_disks_via_sysfs(void)
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "name", e->d_name);
 		add_major_minor(item, major, minor);
-		cJSON_AddNumberToObject(item, "size_bytes", (double)sectors * 512.0);
-		cJSON_AddStringToObject(item, "type", "disk");
+		/* size 못 읽으면(-1) null. sectors==0 은 유효한 실측 0(비활성 dm)이라 그대로 싣는다. */
+		if (sectors >= 0)
+			cJSON_AddNumberToObject(item, "size_bytes", (double)sectors * 512.0);
+		else
+			cJSON_AddNullToObject(item, "size_bytes");
+		/* type 은 lsblk 의 실측 필드다 — sysfs 폴백은 알 수 없으므로 대체값 대신 null. */
+		cJSON_AddNullToObject(item, "type");
 		cJSON_AddStringToObject(item, "kind", disk_kind(e->d_name));
 		cJSON_AddItemToArray(arr, item);
 	}
@@ -878,13 +870,9 @@ static int is_excluded_fstype(const char *fstype)
 	return 0;
 }
 
-/* /proc/filesystems marks device-less filesystems with a leading "nodev" — the
- * kernel's own authority on what has no backing block device. Every pseudo/
- * virtual fs (proc, sysfs, cgroup, selinuxfs, usbfs, ...) is nodev; real block
- * filesystems (ext4, xfs, fuseblk/ntfs-3g) are not. This catches pseudo mounts
- * the static skip list above misses, on any kernel, without a growing denylist.
- * The registered set only lists currently-loaded fs, which always includes any
- * fs that is actually mounted — exactly the ones we classify. Result cached. */
+/* /proc/filesystems 의 leading "nodev" = backing block device 없는 fs (kernel's own
+ * authority). Catches pseudo mounts the static skip list misses, on any kernel,
+ * without a growing denylist. Result cached. */
 static int fstype_is_nodev(const char *fstype)
 {
 	static char nodev[2048] = "\n";
@@ -917,9 +905,8 @@ static int fstype_is_nodev(const char *fstype)
 	return strstr(nodev, needle) != NULL;
 }
 
-/* Device-less filesystems that nonetheless hold real (remote/user) data and so
- * must NOT be dropped as pseudo: network filesystems and FUSE mounts. fuseblk
- * (real block device, e.g. ntfs-3g) is not nodev and never reaches here. */
+/* nodev fs that still hold real data and must NOT be dropped as pseudo: network
+ * filesystems and FUSE. fuseblk (real block device) is not nodev, never reaches here. */
 static int is_kept_deviceless_fs(const char *fstype)
 {
 	if (!fstype) return 0;
@@ -1041,11 +1028,9 @@ static struct mount_entry *list_real_mounts(size_t *out_count)
 		char *mnt = NULL, *fst = NULL;
 		if (!parse_mountinfo_line(line, &mj, &mn, &mnt, &fst))
 			continue;
-		/* Drop pseudo/virtual mounts so mounts[] carries only real storage:
-		 * the static skip list (fast path) plus any device-less (nodev) fs the
-		 * kernel reports, except network/FUSE which hold real data. Without the
-		 * nodev net, fs missing from the skip list (selinuxfs, usbfs, ...) would
-		 * leak through and be mislabeled kind="data". */
+		/* Drop pseudo/virtual mounts: static skip list + nodev fs (except
+		 * network/FUSE). Without the nodev net, fs missing from the skip list
+		 * (selinuxfs, usbfs, ...) leak through mislabeled kind="data". */
 		if (is_excluded_fstype(fst) ||
 		    (fstype_is_nodev(fst) && !is_kept_deviceless_fs(fst))) {
 			free(mnt); free(fst);
@@ -1070,12 +1055,8 @@ static struct mount_entry *list_real_mounts(size_t *out_count)
 	return arr;
 }
 
-/* Split by role so the static inventory does not carry time-series data:
- *   with_usage=0 (inventory) -> structure: mount/major/minor/total_bytes/fstype/kind
- *   with_usage=1 (metrics)   -> usage:     mount/kind/fstype/total_bytes/free/avail
- * total_bytes stays in both (metrics needs it for %, like mem_total_kb); the
- * dynamic free/avail live only in metrics, so disk usage has one time-series
- * source instead of also being duplicated into every inventory snapshot. */
+/* Split by role: with_usage=0 (inventory) -> structure incl. major/minor;
+ * with_usage=1 (metrics) -> usage (free/avail). total_bytes in both (% calc). */
 static cJSON *collect_mounts(int with_usage)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1101,10 +1082,14 @@ static cJSON *collect_mounts(int with_usage)
 			double avail = (double)st.f_bavail * (double)st.f_frsize;
 			cJSON_AddNumberToObject(item, "free_bytes",  freeb);
 			cJSON_AddNumberToObject(item, "avail_bytes", avail);
-			/* inode: 작은 파일 폭증 시 바이트가 남아도 inode 가 먼저 소진돼
-			 * ENOSPC. 같은 statvfs 호출이라 공짜. inode 개념 없는 fs 는 f_files=0. */
-			cJSON_AddNumberToObject(item, "inodes_total", (double)st.f_files);
-			cJSON_AddNumberToObject(item, "inodes_free",  (double)st.f_ffree);
+			/* inode 개념 없는 fs(vfat 등)는 f_files=0 -> 실측 0 과 구분되게 null. */
+			if (st.f_files > 0) {
+				cJSON_AddNumberToObject(item, "inodes_total", (double)st.f_files);
+				cJSON_AddNumberToObject(item, "inodes_free",  (double)st.f_ffree);
+			} else {
+				cJSON_AddNullToObject(item, "inodes_total");
+				cJSON_AddNullToObject(item, "inodes_free");
+			}
 		} else {
 			add_major_minor(item, mounts[i].major, mounts[i].minor);
 		}
@@ -1134,8 +1119,7 @@ static int ipv6_netmask_prefix(const struct sockaddr_in6 *mask)
 	return prefix;
 }
 
-/* /proc/net/route의 default route(dest=0, mask=0) gateway를 iface->IP 문자열 맵으로.
- * 엔진 토폴로지 서브넷 disambiguation용. IPv4만 취득(엔진 용도는 사설 대역 중복 판별). */
+/* /proc/net/route default route(dest=0,mask=0) gateway 를 iface->IP 맵으로. 서브넷 disambiguation 용, IPv4 만. */
 static cJSON *build_default_gw_v4(void)
 {
 	cJSON *map = cJSON_CreateObject();
@@ -1363,10 +1347,8 @@ const char *cached_composite_id(const char *machine_id)
 	return hex_buf;
 }
 
-/* 첫 실행 시 UUIDv4 생성 -> state dir에 영구 저장 -> 재사용.
- * 저장 경로는 install이 잡아주는 WORKER_STATE_DIR(없으면 XDG_STATE_HOME/HOME
- * 폴백)을 재사용해 user-level/SysV 어느 설치 모델에서도 쓰기 가능하게 한다.
- * prep-image(image-prep.sh)가 이 파일을 지워 클론마다 새로 생성되게 한다. */
+/* 첫 실행 시 UUIDv4 생성 -> WORKER_STATE_DIR(폴백 XDG_STATE_HOME/HOME)에 영구 저장 -> 재사용.
+ * image-prep.sh 가 이 파일을 지워 클론마다 재생성. */
 const char *cached_agent_id(void)
 {
 	static char id_buf[64];
@@ -1413,11 +1395,21 @@ const char *cached_agent_id(void)
 		if (*p == '/') { *p = '\0'; mkdir(dir, 0700); *p = '/'; }
 	}
 	mkdir(dir, 0700);
-	FILE *f = fopen(path, "w");
-	if (f) {
-		fprintf(f, "%s\n", id_buf);
-		fclose(f);
-		chmod(path, 0600);
+	/* agent_id 불변 계약: 절단 파일이 남으면 UUID 재발급 -> temp+fsync+rename 원자적 쓰기. */
+	char tmp[640];
+	snprintf(tmp, sizeof tmp, "%s/agent-id.tmp.%ld", dir, (long)getpid());
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd >= 0) {
+		char line[80];
+		int n = snprintf(line, sizeof line, "%s\n", id_buf);
+		if (n > 0 && (size_t)n < sizeof line &&
+		    write(fd, line, (size_t)n) == (ssize_t)n && fsync(fd) == 0) {
+			close(fd);
+			if (rename(tmp, path) != 0) unlink(tmp);
+		} else {
+			close(fd);
+			unlink(tmp);
+		}
 	}
 	return id_buf;
 }
@@ -1459,9 +1451,7 @@ static cJSON *collect_external_ip(void)
 
 static int read_pid_comm(int pid, char *out, size_t out_len);
 
-/* SysV 서비스의 pid를 pid 파일에서 읽는다. 관례상 /var/run/<name>.pid, 일부는
- * /var/run/<name>/<name>.pid. 죽은 pid 파일(프로세스 종료 후 잔존)은 /proc/<pid>
- * 부재로 걸러 -1. 데몬이 아닌 서비스(iptables/network 등)는 pid 파일이 없어 -1. */
+/* SysV pid 파일에서 pid 읽기(/var/run/<name>.pid 또는 <name>/<name>.pid). 죽은 pid(/proc 부재)·pid 파일 없는 서비스는 -1. */
 static int read_sysv_pidfile(const char *name)
 {
 	char path[256];
@@ -1485,12 +1475,8 @@ static int read_sysv_pidfile(const char *name)
 	return pid;
 }
 
-/* systemd 없는 SysV 호스트(EL6 등): systemctl 부재로 collect_services()가 진입하지
- * 못하므로 여기로 폴백한다. RHEL init.d 스크립트가 start 시 touch 하는
- * /var/lock/subsys/<name> 로 실행 중 서비스를 열거하고, /var/run/<name>.pid 로 pid,
- * /proc/<pid>/comm 으로 exe 를 best-effort로 채운다. systemd 경로와 같은
- * {unit, sub, pid, exe} 스키마를 유지한다(pid 파일 없는 서비스는 pid/exe=null,
- * systemd의 MainPID 없는 unit과 동일). */
+/* systemd 없는 SysV 폴백(EL6 등). /var/lock/subsys/<name> 로 실행 서비스 열거,
+ * pid 파일/comm 으로 pid/exe. systemd 와 같은 {unit,sub,pid,exe} 스키마(없으면 null). */
 static cJSON *collect_services_sysv(void)
 {
 	DIR *d = opendir("/var/lock/subsys");
@@ -1525,9 +1511,8 @@ static cJSON *collect_services_sysv(void)
 	return arr;
 }
 
-/* services[]에 pid(MainPID)/exe(comm)를 붙여 listen_ports[].pid와 조인 가능하게 한다.
- * per-unit `systemctl show` 반복은 fork 비용이 커서, 실행 중 unit 전체를 한 번의
- * `systemctl show -p Id,MainPID <units...>`로 배치 조회해 unit명으로 매칭한다. */
+/* services[]에 pid/exe 를 붙여 listen_ports[].pid 와 조인. per-unit show 는 fork 비용 커서
+ * 실행 unit 전체를 한 번의 `systemctl show -p Id,MainPID`로 배치 조회. */
 static cJSON *collect_services(void)
 {
 	char *out = run_cmd(
@@ -1561,11 +1546,9 @@ static cJSON *collect_services(void)
 		cJSON_AddStringToObject(item, "sub",  sub);
 		cJSON_AddItemToArray(arr, item);
 
-		/* pid/exe 배치 조회(systemctl show)는 .service unit에만 한다. socket unit은
-		 * MainPID property가 없어(프로세스가 아니라 커널 소켓) show 가 exit!=0 을 내고,
-		 * run_cmd 는 exit!=0 이면 유효한 stdout까지 폐기하므로 같은 배치에 섞인 service
-		 * pid 까지 전부 유실된다. socket 은 pid=null 이 정확한 값이라 애초에 제외한다.
-		 * unit명은 systemctl 규칙상 공백/쉘 메타문자가 없어 bare로 이어붙인다. */
+		/* .service unit 만 배치 조회한다. socket 은 MainPID 가 없어 show 가 exit!=0 ->
+		 * run_cmd 가 stdout 을 폐기 -> 같은 배치의 service pid 까지 유실된다. socket 은
+		 * pid=null 이 정답이라 제외. unit명은 공백/쉘 메타문자 없어 bare 로 이어붙인다. */
 		size_t ul = strlen(unit);
 		int is_service = (ul > 8 && strcmp(unit + ul - 8, ".service") == 0);
 		if (is_service && units_len + ul + 2 < sizeof units_buf) {
@@ -1583,10 +1566,8 @@ static cJSON *collect_services(void)
 		         "systemctl show --property=Id,MainPID %s 2>/dev/null", units_buf);
 		char *show = run_cmd(cmd);
 		if (show) {
-			/* systemctl show는 --property 요청 순서를 지키지 않아(예: MainPID가
-			 * Id보다 먼저) 나오고, strtok_r는 블록 구분 빈 줄을 건너뛴다. 그래서
-			 * 순서에 의존하지 않고 Id/MainPID를 쌍으로 모아 둘 다 채워지면 매칭한다.
-			 * 한 unit 블록은 Id 1개 + MainPID 1개를 정확히 낸다. */
+			/* systemctl show 는 property 출력 순서를 안 지킨다 — 순서 의존 말고
+			 * Id/MainPID 쌍이 다 차면 매칭(한 unit 블록당 각 1개). */
 			char cur_id[256] = "";
 			int  cur_pid = -1, have_pid = 0;
 			char *s2 = NULL;
@@ -1885,9 +1866,8 @@ static int add_cpu_stat(cJSON *root)
 		free(content);
 		return 0;
 	}
-	/* sscanf fills left-to-right: fields [0,got) are measured, the rest weren't
-	 * present on this line — emit those as null, not a fabricated 0. Standard
-	 * /proc/stat on kernel 2.6.32+ always yields all 8. */
+	/* sscanf fills left-to-right: [0,got) measured, rest null (not a fabricated 0).
+	 * /proc/stat on 2.6.32+ always yields all 8. */
 	static const char *const keys[8] = {
 		"user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"
 	};
@@ -1900,9 +1880,8 @@ static int add_cpu_stat(cJSON *root)
 	}
 	cJSON_AddItemToObject(root, "cpu_stat", obj);
 
-	/* per-core 이용률 원자료(cpu0..N) + procs_running/procs_blocked.
-	 * 같은 /proc/stat 한 번 읽기로 공짜. per-core=단일스레드 병목 감지,
-	 * procs_running=CPU 포화 주신호, procs_blocked=IO발 로드 분리(근본원인 핵심). */
+	/* per-core(cpu0..N) + procs_running(CPU 포화)/procs_blocked(IO 로드 분리).
+	 * 같은 /proc/stat 한 번 읽기로 공짜. */
 	cJSON *cores = cJSON_CreateArray();
 	long procs_running = -1, procs_blocked = -1;
 	char *save = NULL;
@@ -2012,10 +1991,9 @@ static int add_meminfo_full(cJSON *root)
 	long swap_total    = meminfo_get_kb(content, "SwapTotal");
 	long swap_free     = meminfo_get_kb(content, "SwapFree");
 
-	/* MemAvailable is kernel 3.14+. On older kernels (EL6 2.6.32, EL7 3.10)
-	 * reproduce the kernel's si_mem_available() from zoneinfo watermarks. If
-	 * even that can't be computed, leave it unmeasured (null) — do not fall
-	 * back to a free+buffers+cached guess, which overstates reclaimability. */
+	/* MemAvailable is kernel 3.14+. On older kernels reproduce si_mem_available()
+	 * from zoneinfo watermarks; if that fails, null — no free+buffers+cached
+	 * guess (it overstates reclaimability). */
 	if (mem_available < 0)
 		mem_available = derive_mem_available_kb(content, mem_free);
 
@@ -2050,9 +2028,8 @@ static int add_loadavg(cJSON *root)
 	return 1;
 }
 
-/* /proc/vmstat 의 스왑 발생/OOM 카운터. pswpin/pswpout 은 메모리 포화 주신호이자
- * 메모리발 디스크 I/O 를 구분하는 근본원인 판별 신호. oom_kill 은 4.13+ 만 존재.
- * 실패해도 metrics 전체를 실패시키지 않는다(선택 신호 -> null). */
+/* /proc/vmstat 스왑/OOM 카운터. oom_kill 은 4.13+ 만 존재.
+ * 실패해도 metrics 실패시키지 않는다(선택 신호 -> null). */
 static void add_vmstat(cJSON *root)
 {
 	long pswpin = -1, pswpout = -1, oom_kill = -1;
@@ -2070,8 +2047,7 @@ static void add_vmstat(cJSON *root)
 		}
 		free(content);
 	}
-	/* pgmajfault 는 요청서 지침대로 발행하지 않는다 — 파일 mmap major fault 가 섞여
-	 * 대용량 파일 호스트(DB 등)를 메모리 압박으로 오판한다. */
+	/* pgmajfault 는 미발행 — 파일 mmap major fault 가 섞여 대용량 파일 호스트를 메모리 압박으로 오판. */
 	add_long_or_null(root, "pswpin",   pswpin);
 	add_long_or_null(root, "pswpout",  pswpout);
 	add_long_or_null(root, "oom_kill", oom_kill);
@@ -2112,9 +2088,8 @@ static cJSON *collect_disk_io(void)
 		if (access(path, F_OK) != 0)
 			continue;
 
-		/* n>=7 guarantees the read fields (cols 4,6). The write fields live at
-		 * cols 8 and 10 — emit null if this line was shorter than that rather
-		 * than a fabricated 0. Standard /proc/diskstats on 2.6.32+ has 14 cols. */
+		/* n>=7 guarantees read fields (cols 4,6); write fields (cols 8,10) ->
+		 * null if the line was shorter (not a fabricated 0). 2.6.32+ has 14 cols. */
 		cJSON *item = cJSON_CreateObject();
 		cJSON_AddStringToObject(item, "device", dev);
 		add_major_minor(item, (int)major, (int)minor);
@@ -2122,9 +2097,8 @@ static cJSON *collect_disk_io(void)
 		add_long_or_null(item, "writes_completed", n >= 8  ? writes_completed : -1);
 		cJSON_AddNumberToObject(item, "sectors_read",     (double)sectors_read);
 		add_long_or_null(item, "sectors_written",  n >= 10 ? sectors_written : -1);
-		/* await 원자료(엔진이 델타/완료수로 응답지연 산출) + %util·avgqu 참고값.
-		 * diskstats 필드: 7=time_reading(ms) 11=time_writing(ms) 13=io_ticks(ms)
-		 * 14=weighted(ms). n>=7 은 위 continue 로 보장, 그 외는 짧은 라인이면 null. */
+		/* diskstats 필드: 7=time_reading 11=time_writing 13=io_ticks 14=weighted(ms).
+		 * n>=7 은 위 continue 로 보장, 그 외는 짧은 라인이면 null. */
 		cJSON_AddNumberToObject(item, "time_reading_ms", (double)time_reading);
 		add_long_or_null(item, "time_writing_ms", n >= 11 ? time_writing : -1);
 		add_long_or_null(item, "io_ticks_ms",     n >= 13 ? time_io : -1);
@@ -2166,9 +2140,8 @@ static cJSON *collect_net_io(void)
 		long rx_bytes = 0, rx_packets = 0, rx_errors = 0, rx_drop = 0;
 		long tx_bytes = 0, tx_packets = 0, tx_errors = 0, tx_drop = 0;
 
-		/* /proc/net/dev — rx: bytes packets errs drop [fifo frame compressed
-		 * multicast], tx: bytes packets errs drop [...]. drop 은 포화 신호라
-		 * 이제 버리지 않고 파싱한다(errs 는 이미 발행 중). */
+		/* /proc/net/dev rx/tx 각각: bytes packets errs drop [+중간 필드 skip].
+		 * drop 은 포화 신호라 파싱한다. */
 		int n = sscanf(colon + 1,
 		               "%ld %ld %ld %ld %*d %*d %*d %*d "
 		               "%ld %ld %ld %ld",
@@ -2194,8 +2167,7 @@ static cJSON *collect_net_io(void)
 	return arr;
 }
 
-/* /proc/net/snmp 의 Tcp: RetransSegs — 헤더행에서 인덱스 찾아 값행 같은 위치.
- * 커널/버전마다 컬럼 수가 달라 고정 오프셋 대신 헤더 매칭. 없으면 -1. */
+/* /proc/net/snmp Tcp: RetransSegs — 컬럼 수가 커널마다 달라 헤더행 인덱스로 값행 매칭. 없으면 -1. */
 static long snmp_tcp_retranssegs(void)
 {
 	char *content = read_file_all("/proc/net/snmp");
@@ -2240,9 +2212,8 @@ static long snmp_tcp_retranssegs(void)
 	return result;
 }
 
-/* 네트워크 품질 신규 신호: TCP 재전송(재전송 품질) · TIME_WAIT 적체 · conntrack
- * 사용률(연결 고갈). 전부 raw 카운터(엔진이 비율 계산). conntrack 모듈 미로드면
- * 파일 부재 -> null(skip). */
+/* 네트워크 품질: TCP 재전송/TIME_WAIT 적체/conntrack 사용률. raw 카운터.
+ * conntrack 모듈 미로드면 파일 부재 -> null. */
 static void add_net_quality(cJSON *root)
 {
 	add_long_or_null(root, "tcp_retrans_segs", snmp_tcp_retranssegs());
@@ -2266,9 +2237,8 @@ static void add_net_quality(cJSON *root)
 	                   "/proc/sys/net/netfilter/nf_conntrack_max");
 }
 
-/* /proc/schedstat 의 runqueue 대기시간 누적(ns) 합 — 실행 대기 적분값이라
- * procs_running 스냅샷보다 표본 사이 스파이크를 안 놓친다. CONFIG_SCHEDSTATS
- * 없으면 파일 부재 -> null. cpuN 행 8번째 필드(0-idx 7)=runqueue wait time. */
+/* /proc/schedstat runqueue 대기 누적(ns) 합 — 적분값이라 procs_running 스냅샷보다
+ * 표본 사이 스파이크를 안 놓친다. cpuN 행 8번째(0-idx 7)=wait time. 없으면 null. */
 static void add_schedstat(cJSON *root)
 {
 	long total_wait = -1;
@@ -2298,8 +2268,7 @@ static void add_schedstat(cJSON *root)
 	add_long_or_null(root, "schedstat_run_wait_ns", total_wait);
 }
 
-/* PSI (4.20+) — 관측·검증용(분류 미사용, 요청서). some total(us 누적)만 raw 발행.
- * 커널에 없으면 파일 부재 -> null. */
+/* PSI (4.20+) — some total(us 누적)만 raw 발행, 관측용. 없으면 null. */
 static void add_psi(cJSON *root)
 {
 	static const struct {
@@ -2326,12 +2295,13 @@ static void add_psi(cJSON *root)
 	}
 }
 
-/* 설정된 수집 주기(초). 엔진 sample_sufficiency 하드코딩(1440/day) 대체 기준값.
- * main.c 루프와 동일 env(AGENT_INTERVAL_SEC, 기본 60)를 읽는다. */
+/* main.c 가 실제 sleep 하는 수집 주기(초)를 그대로 보고. interval>0 은 raw 값 그대로
+ * (상한 clamp 금지 — 접으면 엔진 표본 기준이 오염). interval<=0(one-shot)은 엔진의
+ * expected=86400/interval div-by-zero 회피로 기본 60 으로 보고. */
 static int agent_interval_sec(void)
 {
 	int n = getenv_int_or("AGENT_INTERVAL_SEC", 60);
-	return (n > 0 && n < 86400) ? n : 60;
+	return n > 0 ? n : 60;
 }
 
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)

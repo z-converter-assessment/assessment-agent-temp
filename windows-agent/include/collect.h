@@ -10,9 +10,8 @@ const char *cached_composite_id(const char *machine_id);
 /* 첫 실행 시 생성·영구 저장하는 안정 식별자(UUID). MAC/machine_id와 무관. */
 const char *cached_agent_id(void);
 
-/* OS 버전 문자열. display_out=os_version(DisplayVersion -> ReleaseId -> RtlGetVersion NT major.minor,
- * pre-Win10 은 6.3/5.2 등), build_out=CurrentBuildNumber[.UBR]. 못 채우면 빈 문자열.
- * inventory 와 task.result 가 공유해 os_version 이 어긋나지 않게 한다(단일 소스). */
+/* OS 버전 문자열(단일 소스 — inventory 와 task.result 가 공유해 os_version 불일치 방지).
+ * display_out=os_version, build_out=CurrentBuildNumber[.UBR]. 못 채우면 빈 문자열. */
 void os_version_info(char *display_out, size_t dsz, char *build_out, size_t bsz);
 
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version);

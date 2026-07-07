@@ -134,10 +134,8 @@ static int copy_self_to(const wchar_t *target)
     return 0;
 }
 
-/* ---- Windows service (SCM) registration --------------------------------
- * The agent runs as a LocalSystem auto-start service on every supported
- * generation (NT 5.2 / 2003 through NT 10). No args -> run_as_service()
- * (StartServiceCtrlDispatcher), so binPath carries no arguments. */
+/* Windows service (SCM) registration: LocalSystem auto-start. No args ->
+ * run_as_service(), so binPath carries no arguments. */
 
 static SC_HANDLE open_scm(DWORD access)
 {
