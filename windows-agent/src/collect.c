@@ -95,11 +95,43 @@ static void cache_process_times(void)
 	g_times_cached = 1;
 }
 
+/* --- v2 datapoint-array 빌더 (Linux 트리와 동형) --- */
+static cJSON *ns_get(cJSON *root, const char *ns)
+{
+	cJSON *o = cJSON_GetObjectItemCaseSensitive(root, ns);
+	if (!o) { o = cJSON_CreateObject(); cJSON_AddItemToObject(root, ns, o); }
+	return o;
+}
+static cJSON *metric_new(cJSON *ns, const char *name, const char *type, const char *unit)
+{
+	cJSON *m = cJSON_CreateObject();
+	cJSON_AddStringToObject(m, "type", type);
+	cJSON_AddStringToObject(m, "unit", unit);
+	cJSON_AddItemToObject(m, "points", cJSON_CreateArray());
+	cJSON_AddItemToObject(ns, name, m);
+	return m;
+}
+static cJSON *point_new(cJSON *metric)
+{
+	cJSON *p = cJSON_CreateObject();
+	cJSON_AddItemToObject(p, "attr", cJSON_CreateObject());
+	cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(metric, "points"), p);
+	return p;
+}
+static void point_attr(cJSON *point, const char *k, const char *v)
+{
+	if (v && *v)
+		cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(point, "attr"), k, v);
+}
+static void point_value(cJSON *point, double v) { cJSON_AddNumberToObject(point, "value", v); }
+static void point_value_null(cJSON *point) { cJSON_AddNullToObject(point, "value"); }
+
 static void add_common_metadata(cJSON *root, const char *msg_type,
                                 const char *machine_id, const char *agent_version)
 {
 	cache_process_times();
 
+	cJSON_AddStringToObject(root, "schema_version", "2.0");
 	cJSON_AddStringToObject(root, "message_type", msg_type);
 	/* machine_id 못 구하면 null(위조 금지). 식별·라우팅은 agent_id, 유니크는 mac 기반 composite_id가 유지. */
 	if (machine_id && *machine_id)
@@ -1509,15 +1541,20 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	if (cpu_brand[0]) cJSON_AddStringToObject(m, "cpu_model", cpu_brand);
 	else              cJSON_AddNullToObject  (m, "cpu_model");
 
-	fill_memory_inventory(m);
+	/* mem_total_bytes (base 단위). swap 은 block_devices type=swap(pagefile) 로(P4). */
+	MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+	if (GlobalMemoryStatusEx(&ms))
+		cJSON_AddNumberToObject(m, "mem_total_bytes", (double)ms.ullTotalPhys);
+	else
+		cJSON_AddNullToObject(m, "mem_total_bytes");
 
-	cJSON_AddItemToObject(m, "disks",        enumerate_physical_disks());
-	cJSON_AddItemToObject(m, "mounts",       enumerate_mounts(0));
 	cJSON_AddItemToObject(m, "services",     enumerate_running_services());
 	cJSON_AddItemToObject(m, "listen_ports", enumerate_listen_ports());
+	cJSON_AddItemToObject(m, "ip_external",  collect_external_ip());
 
-	fill_network_info(m);
-	cJSON_AddItemToObject(m, "ip_external", collect_external_ip());
+	/* v2 정규화 노드: 실내용은 P4. P1 은 required 배열 스텁. */
+	cJSON_AddItemToObject(m, "block_devices",  cJSON_CreateArray());
+	cJSON_AddItemToObject(m, "net_interfaces", cJSON_CreateArray());
 
 	return m;
 }
@@ -1580,6 +1617,76 @@ static int agent_interval_sec(void)
 	return n > 0 ? n : 60;
 }
 
+/* v2 system.disk: throughput=NtQuery(시스템 전역·diskperf 독립·단조, device PhysicalDrive0),
+ * saturation(io_time/operation_time/pending)=perflib PhysicalDisk per-disk + 유효성 게이트(raw!=0/idle>0, 가짜0 금지).
+ * NOTE(accept 게이트): perflib counter-type 수식(% Idle Time=100ns 역산, Avg.Disk sec=PERF_AVERAGE_TIMER raw/PerfFreq)의
+ * 값 정확성은 dp-win2016 raw-vs-cooked 대조로 검증 필요. divisor(PerfFreq vs 1e7)는 그 대조로 확정. */
+static void collect_v2_system_disk(cJSON *root)
+{
+	cJSON *ns    = ns_get(root, "system.disk");
+	cJSON *m_io  = metric_new(ns, "disk.io",             "counter", "By");
+	cJSON *m_ops = metric_new(ns, "disk.operations",     "counter", "operations");
+	cJSON *m_iot = metric_new(ns, "disk.io_time",        "counter", "s");
+	cJSON *m_opt = metric_new(ns, "disk.operation_time", "counter", "s");
+	cJSON *m_pnd = metric_new(ns, "disk.pending_operations", "gauge", "operations");
+
+	unsigned long long rop = 0, wop = 0, rby = 0, wby = 0;
+	if (query_system_io(&rop, &wop, &rby, &wby)) {
+		cJSON *p;
+		p = point_new(m_io);  point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "read");  point_value(p, (double)rby);
+		p = point_new(m_io);  point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "write"); point_value(p, (double)wby);
+		p = point_new(m_ops); point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "read");  point_value(p, (double)rop);
+		p = point_new(m_ops); point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "write"); point_value(p, (double)wop);
+	}
+
+	DWORD i_pd = perf_index("PhysicalDisk");
+	if (!i_pd) return;
+	char vn[16]; snprintf(vn, sizeof vn, "%lu", (unsigned long)i_pd);
+	BYTE *buf = perf_query(vn);
+	RegCloseKey(HKEY_PERFORMANCE_DATA);
+	if (!buf) return;
+	PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)buf;
+	long long perf_time = db->PerfTime100nSec.QuadPart;
+	long long perf_freq = db->PerfFreq.QuadPart;
+	PERF_OBJECT_TYPE *o = perf_object(db, i_pd);
+	if (o && o->NumInstances > 0) {
+		PERF_COUNTER_DEFINITION *c_idle = perf_counter(o, perf_index("% Idle Time"));
+		PERF_COUNTER_DEFINITION *c_rt   = perf_counter(o, perf_index("Avg. Disk sec/Read"));
+		PERF_COUNTER_DEFINITION *c_wt   = perf_counter(o, perf_index("Avg. Disk sec/Write"));
+		PERF_COUNTER_DEFINITION *c_q    = perf_counter(o, perf_index("Current Disk Queue Length"));
+		PERF_COUNTER_DEFINITION *c_ro   = perf_counter(o, perf_index("Disk Reads/sec"));
+		PERF_COUNTER_DEFINITION *c_wo   = perf_counter(o, perf_index("Disk Writes/sec"));
+		PERF_INSTANCE_DEFINITION *inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)o + o->DefinitionLength);
+		for (LONG i = 0; i < o->NumInstances; i++) {
+			wchar_t *wname = (wchar_t *)((BYTE *)inst + inst->NameOffset);
+			PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)inst + inst->ByteLength);
+			int drive = perf_disk_num(wname);
+			if (drive >= 0) {
+				char dev[32]; snprintf(dev, sizeof dev, "name:PhysicalDrive%d", drive);
+				cJSON *p;
+				unsigned long long idle = c_idle ? perf_read(cb, c_idle) : 0;
+				p = point_new(m_iot); point_attr(p, "device", dev);
+				if (c_idle && idle > 0 && perf_time > 0) {
+					double busy = ((double)perf_time - (double)idle) / 1e7;
+					point_value(p, busy < 0 ? 0.0 : busy);
+				} else point_value_null(p);
+				p = point_new(m_opt); point_attr(p, "device", dev); point_attr(p, "direction", "read");
+				if (c_rt && perf_freq > 0) point_value(p, (double)perf_read(cb, c_rt) / (double)perf_freq); else point_value_null(p);
+				p = point_new(m_opt); point_attr(p, "device", dev); point_attr(p, "direction", "write");
+				if (c_wt && perf_freq > 0) point_value(p, (double)perf_read(cb, c_wt) / (double)perf_freq); else point_value_null(p);
+				p = point_new(m_ops); point_attr(p, "device", dev); point_attr(p, "direction", "read");
+				if (c_ro) point_value(p, (double)perf_read(cb, c_ro)); else point_value_null(p);
+				p = point_new(m_ops); point_attr(p, "device", dev); point_attr(p, "direction", "write");
+				if (c_wo) point_value(p, (double)perf_read(cb, c_wo)); else point_value_null(p);
+				p = point_new(m_pnd); point_attr(p, "device", dev);
+				if (c_q) point_value(p, (double)perf_read(cb, c_q)); else point_value_null(p);
+			}
+			inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)cb + cb->ByteLength);
+		}
+	}
+	free(buf);
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *m = cJSON_CreateObject();
@@ -1587,24 +1694,11 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	add_common_metadata(m, "metrics", machine_id, agent_version);
 	cJSON_AddNumberToObject(m, "collection_interval_sec", agent_interval_sec());
 
-	fill_cpu_stat(m);
-	fill_memory_metrics(m);
-
-	cJSON_AddNullToObject(m, "load_1m");
-	cJSON_AddNullToObject(m, "load_5m");
-	cJSON_AddNullToObject(m, "load_15m");
-
-	cJSON_AddItemToObject(m, "disk_io", enumerate_disk_io());
-	cJSON_AddItemToObject(m, "mounts",  enumerate_mounts(1));
-	cJSON_AddItemToObject(m, "net_io",  enumerate_net_io());
-	fill_saturation(m);
-
-	/* TCP 재전송 — GetTcpStatistics.dwRetransSegs(Linux tcp_retrans_segs와 대칭, 실패 시 null). */
-	MIB_TCPSTATS ts;
-	if (GetTcpStatistics(&ts) == NO_ERROR)
-		cJSON_AddNumberToObject(m, "tcp_retrans_segs", (double)ts.dwRetransSegs);
-	else
-		cJSON_AddNullToObject(m, "tcp_retrans_segs");
+	/* P1: system.disk 채움. cpu/memory/network 는 후속 페이즈(키만 필수, null 허용). */
+	cJSON_AddNullToObject(m, "system.cpu");
+	cJSON_AddNullToObject(m, "system.memory");
+	cJSON_AddNullToObject(m, "system.network");
+	collect_v2_system_disk(m);
 
 	return m;
 }

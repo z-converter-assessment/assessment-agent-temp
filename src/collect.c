@@ -76,11 +76,52 @@ static const char *cached_agent_started_at_iso(void)
 	return buf;
 }
 
+/* --- v2 datapoint-array 빌더 --- system.<ns> -> metric{type,unit,points:[{attr,value}]}.
+ * 에이전트는 raw 누적/순간값만 싣고 delta/rate/util 은 엔진. base 단위(s/By/1/count). */
+static cJSON *ns_get(cJSON *root, const char *ns)
+{
+	cJSON *o = cJSON_GetObjectItemCaseSensitive(root, ns);
+	if (!o) { o = cJSON_CreateObject(); cJSON_AddItemToObject(root, ns, o); }
+	return o;
+}
+static cJSON *metric_new(cJSON *ns, const char *name, const char *type, const char *unit)
+{
+	cJSON *m = cJSON_CreateObject();
+	cJSON_AddStringToObject(m, "type", type);
+	cJSON_AddStringToObject(m, "unit", unit);
+	cJSON_AddItemToObject(m, "points", cJSON_CreateArray());
+	cJSON_AddItemToObject(ns, name, m);
+	return m;
+}
+static cJSON *point_new(cJSON *metric)
+{
+	cJSON *p = cJSON_CreateObject();
+	cJSON_AddItemToObject(p, "attr", cJSON_CreateObject());
+	cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(metric, "points"), p);
+	return p;
+}
+static void point_attr(cJSON *point, const char *k, const char *v)
+{
+	if (v && *v)
+		cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(point, "attr"), k, v);
+}
+static void point_value(cJSON *point, double v) { cJSON_AddNumberToObject(point, "value", v); }
+static void point_value_null(cJSON *point) { cJSON_AddNullToObject(point, "value"); }
+/* 단일 무-attr scalar point 발행 헬퍼(gauge/counter 공통). */
+static void metric_scalar(cJSON *ns, const char *name, const char *type,
+                          const char *unit, int have, double v)
+{
+	cJSON *m = metric_new(ns, name, type, unit);
+	cJSON *p = point_new(m);
+	if (have) point_value(p, v); else point_value_null(p);
+}
+
 static void add_common_metadata(cJSON *obj,
                                 const char *message_type,
                                 const char *machine_id,
                                 const char *agent_version)
 {
+	cJSON_AddStringToObject(obj, "schema_version", "2.0");
 	cJSON_AddStringToObject(obj, "message_type", message_type);
 	/* machine_id 없으면 null(측정 불가) — 식별·라우팅은 agent_id, 유니크는 mac 기반 composite_id. */
 	if (machine_id && *machine_id)
@@ -1835,17 +1876,23 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	if (!add_kernel_version(root))     ok = 0;
 	if (!add_cpu_cores(root))          ok = 0;
 	add_cpu_model(root);
-	if (!add_mem_total_swap_total(root)) ok = 0;
 
-	cJSON_AddItemToObject(root, "disks",       or_empty_array(collect_disks()));
-	cJSON_AddItemToObject(root, "mounts",      or_empty_array(collect_mounts(0)));
+	/* mem_total_bytes (base 단위). swap 은 block_devices type=swap 노드로(P4). */
+	{
+		char *mi = read_file_all("/proc/meminfo");
+		long kb = mi ? meminfo_get_kb(mi, "MemTotal") : -1;
+		if (mi) free(mi);
+		if (kb >= 0) cJSON_AddNumberToObject(root, "mem_total_bytes", (double)kb * 1024.0);
+		else         cJSON_AddNullToObject(root, "mem_total_bytes");
+	}
 
 	cJSON_AddItemToObject(root, "services",     or_json_null(collect_services()));
 	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
-	cJSON_AddItemToObject(root, "interfaces",    or_empty_array(collect_interfaces()));
-	cJSON_AddItemToObject(root, "mac_addresses", or_empty_array(collect_mac_addresses()));
+	cJSON_AddItemToObject(root, "ip_external",  collect_external_ip());
 
-	cJSON_AddItemToObject(root, "ip_external", collect_external_ip());
+	/* v2 정규화 노드: 실내용은 P4(block_devices/net_interfaces). P1 은 required 배열 스텁. */
+	cJSON_AddItemToObject(root, "block_devices",  cJSON_CreateArray());
+	cJSON_AddItemToObject(root, "net_interfaces", cJSON_CreateArray());
 
 	if (!ok) {
 		cJSON_Delete(root);
@@ -2304,6 +2351,99 @@ static int agent_interval_sec(void)
 	return n > 0 ? n : 60;
 }
 
+/* sysfs 단일값 읽어 trim. 성공 1. */
+static int read_sysfs_str(const char *path, char *out, size_t outsz)
+{
+	char *c = read_file_all(path);
+	if (!c) return 0;
+	size_t n = strlen(c);
+	while (n && (c[n-1] == '\n' || c[n-1] == '\r' || c[n-1] == ' ' || c[n-1] == '\t'))
+		c[--n] = '\0';
+	if (n == 0) { free(c); return 0; }
+	snprintf(out, outsz, "%s", c);
+	free(c);
+	return 1;
+}
+
+/* device 안정키: dm/uuid -> serial -> by-path -> name. '<scheme>:<value>'. */
+static void disk_device_id(const char *dev, char *out, size_t outsz)
+{
+	char path[300], val[256];
+	snprintf(path, sizeof path, "/sys/block/%s/dm/uuid", dev);
+	if (read_sysfs_str(path, val, sizeof val)) { snprintf(out, outsz, "dm:%s", val); return; }
+	snprintf(path, sizeof path, "/sys/block/%s/serial", dev);
+	if (read_sysfs_str(path, val, sizeof val)) { snprintf(out, outsz, "serial:%s", val); return; }
+	snprintf(path, sizeof path, "/sys/block/%s/device/serial", dev);
+	if (read_sysfs_str(path, val, sizeof val)) { snprintf(out, outsz, "serial:%s", val); return; }
+	DIR *d = opendir("/dev/disk/by-path");
+	if (d) {
+		struct dirent *e;
+		char lp[600], tgt[300];
+		while ((e = readdir(d))) {
+			if (e->d_name[0] == '.') continue;
+			snprintf(lp, sizeof lp, "/dev/disk/by-path/%s", e->d_name);
+			ssize_t r = readlink(lp, tgt, sizeof tgt - 1);
+			if (r <= 0) continue;
+			tgt[r] = '\0';
+			const char *base = strrchr(tgt, '/');
+			base = base ? base + 1 : tgt;
+			if (strcmp(base, dev) == 0) {
+				snprintf(out, outsz, "by-path:%s", e->d_name);
+				closedir(d);
+				return;
+			}
+		}
+		closedir(d);
+	}
+	snprintf(out, outsz, "name:%s", dev);
+}
+
+/* v2 system.disk: /proc/diskstats raw counters(base 단위). throughput+io_time(%util)+operation_time(await)+queue.
+ * diskstats(name 이후): f1 reads f2 rd_merge f3 sectors_rd f4 ms_rd | f5 writes f6 wr_merge f7 sectors_wr f8 ms_wr | f9 in_flight f10 io_ticks f11 weighted. */
+static void collect_v2_system_disk(cJSON *root)
+{
+	cJSON *ns    = ns_get(root, "system.disk");
+	cJSON *m_io  = metric_new(ns, "disk.io",             "counter", "By");
+	cJSON *m_ops = metric_new(ns, "disk.operations",     "counter", "operations");
+	cJSON *m_iot = metric_new(ns, "disk.io_time",        "counter", "s");
+	cJSON *m_opt = metric_new(ns, "disk.operation_time", "counter", "s");
+	cJSON *m_pnd = metric_new(ns, "disk.pending_operations", "gauge", "operations");
+
+	char *content = read_file_all("/proc/diskstats");
+	if (!content) return;
+	char *save = NULL;
+	for (char *line = strtok_r(content, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		long major = 0, minor = 0;
+		char dev[64] = { 0 };
+		long rc = 0, rm = 0, sr = 0, tr = 0, wc = 0, wm = 0, sw = 0, tw = 0,
+		     inflight = 0, ticks = 0, weighted = 0;
+		int n = sscanf(line, "%ld %ld %63s %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+		               &major, &minor, dev, &rc, &rm, &sr, &tr,
+		               &wc, &wm, &sw, &tw, &inflight, &ticks, &weighted);
+		if (n < 7) continue;
+		if (is_excluded_block_dev(dev)) continue;
+		char sp[256];
+		snprintf(sp, sizeof sp, "/sys/block/%s", dev);
+		if (access(sp, F_OK) != 0) continue;
+
+		char id[300];
+		disk_device_id(dev, id, sizeof id);
+		cJSON *p;
+		p = point_new(m_io);  point_attr(p, "device", id); point_attr(p, "direction", "read");  point_value(p, (double)sr * 512.0);
+		if (n >= 10) { p = point_new(m_io);  point_attr(p, "device", id); point_attr(p, "direction", "write"); point_value(p, (double)sw * 512.0); }
+		p = point_new(m_ops); point_attr(p, "device", id); point_attr(p, "direction", "read");  point_value(p, (double)rc);
+		if (n >= 8)  { p = point_new(m_ops); point_attr(p, "device", id); point_attr(p, "direction", "write"); point_value(p, (double)wc); }
+		p = point_new(m_iot); point_attr(p, "device", id);
+		if (n >= 13) point_value(p, (double)ticks / 1000.0); else point_value_null(p);
+		p = point_new(m_opt); point_attr(p, "device", id); point_attr(p, "direction", "read");  point_value(p, (double)tr / 1000.0);
+		if (n >= 11) { p = point_new(m_opt); point_attr(p, "device", id); point_attr(p, "direction", "write"); point_value(p, (double)tw / 1000.0); }
+		p = point_new(m_pnd); point_attr(p, "device", id);
+		if (n >= 12) point_value(p, (double)inflight); else point_value_null(p);
+	}
+	free(content);
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -2312,23 +2452,12 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	add_common_metadata(root, "metrics", machine_id, agent_version);
 	cJSON_AddNumberToObject(root, "collection_interval_sec", agent_interval_sec());
 
-	int ok = 1;
-	if (!add_cpu_stat(root))     ok = 0;
-	if (!add_meminfo_full(root)) ok = 0;
-	if (!add_loadavg(root))      ok = 0;
-	add_vmstat(root);      /* 스왑/OOM (근본원인) — 실패해도 null 로 싣고 계속 */
-	add_net_quality(root); /* TCP 재전송/TIME_WAIT/conntrack — 네트워크 품질 */
-	add_schedstat(root);   /* runqueue 대기 누적(적분값) */
-	add_psi(root);         /* PSI some total — 관측용(분류 미사용) */
+	/* P1: system.disk 채움. cpu/memory/network 는 후속 페이즈(스키마상 null 허용, 키만 필수). */
+	cJSON_AddNullToObject(root, "system.cpu");
+	cJSON_AddNullToObject(root, "system.memory");
+	cJSON_AddNullToObject(root, "system.network");
+	collect_v2_system_disk(root);
 
-	cJSON_AddItemToObject(root, "disk_io", or_empty_array(collect_disk_io()));
-	cJSON_AddItemToObject(root, "mounts",  or_empty_array(collect_mounts(1)));
-	cJSON_AddItemToObject(root, "net_io",  or_empty_array(collect_net_io()));
-
-	if (!ok) {
-		cJSON_Delete(root);
-		return NULL;
-	}
 	return root;
 }
 

@@ -212,6 +212,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 {
 	cJSON *root = cJSON_CreateObject();
 	if (!root) return NULL;
+	cJSON_AddStringToObject(root, "schema_version",   "2.0");
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	/* machine_id 부재 시 null — inventory/metrics/error(add_common_metadata)와 통일. */
 	if (machine_id && *machine_id)
@@ -254,6 +255,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	else
 		cJSON_AddNullToObject  (root, "exit_code");
 	cJSON_AddNullToObject  (root, "signal_no");   /* Windows 는 POSIX 시그널 개념 없음 — 항상 null */
+	cJSON_AddNullToObject  (root, "task_policy");  /* 정책 판정 로직 도입 전엔 null */
 
 	cJSON_AddNumberToObject(root, "duration_ms", duration_ms);
 	cJSON_AddStringToObject(root, "stdout_tail", stdout_tail ? stdout_tail : "");

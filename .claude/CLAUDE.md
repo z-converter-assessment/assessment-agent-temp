@@ -54,3 +54,14 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 - 결정과 제약은 이 문서 또는 `docs/`에 누적 기록한다. auto-memory는 쓰지 않는다(글로벌 정책).
 - 저장소는 github `z-converter-assessment/assessment-agent-temp`(public). 빌드 아티팩트(`vendor/`, `dist/`, `build/`, `*.o`, `*.exe`, `*.res`)는 `.gitignore` 대상이고 추적 파일만 커밋한다.
 - 릴리즈는 최신 단일 태그 하나로 유지한다(재릴리즈는 태그 덮어쓰기). 상세는 [docs/BUILD.md](../docs/BUILD.md).
+
+## v2 계약 마이그레이션 (feat/wire-v2, 진행 중)
+
+wire 계약이 v2로 락됐다 — `schema/wire.schema.json`이 v2 정본이다. USE Method 기반 재설계이며 양 트리 구현이 진행 중이다. 구현 계획·설계 정본·근거·예시는 `docs/temp/`의 v2-implementation-plan / unified-resource-data-model / classification-rationale / v2-example-messages / v2-lock-confirm 에 있다(P6 마감 시 payload-contract.md로 격상). 구현이 반드시 지키는 결정:
+
+- 인코딩: payload는 datapoint-array다. system.* 네임스페이스 -> metric `{type,unit,points:[{attr,value}]}`. envelope + `schema_version:"2.0"`. task.result/error는 v1 body 유지 + schema_version(task.result에 task_policy 추가).
+- 값: 에이전트는 raw 누적 카운터만 싣고 rate/delta/util/await는 엔진이 계산한다(stateless). base 단위 = seconds/bytes/ratio(0..1). jiffies/sectors/100ns/%를 에이전트에서 정규화한다.
+- device 안정키: 시계열 자연키는 이름이 아니라 안정 id다. 디스크 = dm/uuid -> partuuid -> wwid -> serial -> by-id -> by-path -> name(최후). 네트워크 = MAC(id_type mac). name은 표시용.
+- Windows 디스크 성능: throughput(io/operations)은 NtQuerySystemInformation(diskperf 독립·단조) 1차 + perflib 폴백을 유지한다. saturation(%util/await/queue)만 죽은 IOCTL_DISK_PERFORMANCE 대신 perflib PhysicalDisk로 뽑되, perflib는 diskperf 의존이라 raw!=0 & 단조일 때만 값·아니면 null(가짜 0 금지). EnableCounterForIoctl 등 시스템 레지스트리를 에이전트가 변경하지 않는다(관측 전용).
+- USE 축: U는 분모 있는 이용률(disk io_time, memory available, network link.speed), S는 PSI(14일 canonical = `pressure.stall.time` 적분) + run_queue/commit 폴백, E는 완전체로 파싱하되 사이징에 미반영(엔진 confidence 오염 게이트 + attention).
+- 커널/드라이버 하한 미달은 null(PSI 4.20+, MemAvailable 3.14+, oom_kill 4.13+, virtio-net link speed). 값 위조 없음.

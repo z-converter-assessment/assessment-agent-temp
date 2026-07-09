@@ -167,6 +167,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	char now_buf[32];
 	iso8601_utc(ts.tv_sec, now_buf, sizeof now_buf);
 
+	cJSON_AddStringToObject(root, "schema_version",   "2.0");
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	/* machine_id 부재 시 null(다른 메시지와 통일) — ""로 채우면 같은 호스트가 메시지별로 ""/null 로 갈려 감사/조인이 오염된다. */
 	if (machine_id && *machine_id)
@@ -204,6 +205,8 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	/* exit_code 와 signal_no 는 상호배타(POSIX wait status): 정상종료=exit_code, 시그널종료=signal_no, 미포착=둘 다 null. */
 	if (signal_no > 0) cJSON_AddNumberToObject(root, "signal_no", signal_no);
 	else               cJSON_AddNullToObject(root, "signal_no");
+	/* task_policy(bool|null, exit_code 보다 우선) — 정책 판정 로직 도입 전엔 null. */
+	cJSON_AddNullToObject(root, "task_policy");
 	cJSON_AddNumberToObject(root, "duration_ms", (double)duration_ms);
 	cJSON_AddStringToObject(root, "stdout_tail",  stdout_tail ? stdout_tail : "");
 	cJSON_AddStringToObject(root, "stderr_tail",  stderr_tail ? stderr_tail : "");

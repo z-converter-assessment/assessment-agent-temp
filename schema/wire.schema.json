@@ -1,342 +1,165 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://z-converter-assessment/agent/wire.schema.json",
-  "title": "assessment-agent wire payload contract",
-  "description": "에이전트(Linux musl / Windows i686) -> 엔진 RabbitMQ 발행 계약의 단일 진실. 2종 바이너리와 엔진이 모두 이 스키마에 conform 해야 한다. 산문 설명은 docs/payload-contract.md. 값 의미론: 값(0 포함)=실측, null=측정불가. additionalProperties:false 로 미선언 필드(오타/드리프트)를 거부한다.",
+  "$id": "https://z-converter-assessment/wire.schema.v2.json",
+  "title": "assessment-agent wire v2 (USE Method, OTel system.* aligned)",
+  "$comment": "메시지 4종. metrics/inventory 는 v2 재설계(envelope + system.* / block_devices, datapoint-array). task.result/error 는 v1 body 를 v2 envelope 아래 그대로 유지(system.* 재설계 대상 아님) + schema_version. counter=monotonic 누적(엔진 델타), gauge=순간. base 단위 s/By/bit/s/1(ratio)/count. null=측정불가(0과 구분).",
 
-  "oneOf": [
-    { "$ref": "#/$defs/inventory" },
-    { "$ref": "#/$defs/metrics" },
-    { "$ref": "#/$defs/task_result" },
-    { "$ref": "#/$defs/error" }
-  ],
-
+  "type": "object",
   "$defs": {
-    "iso8601": {
-      "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
-    },
-    "os_family": { "enum": ["linux", "windows"] },
-    "disk_kind": { "enum": ["physical", "partition", "lvm", "raid", "virtual"] },
-    "iface_kind": {
-      "enum": ["physical", "loopback", "bridge", "veth",
-               "bond_master", "bond_member", "vlan", "tunnel", "virtual"]
-    },
-    "mount_kind": { "enum": ["data", "virtual_fs", "boot", "image"] },
-    "proto": { "enum": ["tcp", "tcp6", "udp", "udp6"] },
-    "int_or_null": { "type": ["integer", "null"] },
-    "num_or_null": { "type": ["number", "null"] },
-    "str_or_null": { "type": ["string", "null"] },
-
-    "common_metadata": {
+    "iso8601": { "type": "string", "minLength": 1 },
+    "datapoint": {
       "type": "object",
+      "required": ["value"],
       "properties": {
-        "message_type": { "enum": ["inventory", "metrics", "error", "task.result"] },
-        "message_id":   { "type": "string", "minLength": 1 },
-        "hostname":     { "type": "string" },
-        "machine_id":   { "$ref": "#/$defs/str_or_null" },
-        "composite_id": { "type": "string" },
-        "agent_id":     { "type": "string", "minLength": 1 },
-        "agent_version":{ "type": "string", "minLength": 1 },
-        "boot_time":       { "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
-        "collected_at":    { "$ref": "#/$defs/iso8601" },
-        "agent_started_at":{ "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
-        "os_family":    { "$ref": "#/$defs/os_family" }
+        "attr": { "type": "object", "additionalProperties": { "type": ["string", "number"] } },
+        "value": { "type": ["number", "null"] }
       },
-      "required": ["message_type", "message_id", "hostname", "machine_id",
-                   "composite_id", "agent_id", "agent_version",
-                   "boot_time", "collected_at", "agent_started_at", "os_family"]
+      "additionalProperties": false
     },
-
-    "interface": {
+    "metric": {
       "type": "object",
-      "additionalProperties": false,
+      "required": ["type", "unit", "points"],
       "properties": {
-        "name":    { "type": "string" },
+        "type": { "enum": ["counter", "gauge"] },
+        "unit": { "type": "string" },
+        "points": { "type": "array", "items": { "$ref": "#/$defs/datapoint" } }
+      },
+      "additionalProperties": false
+    },
+    "namespace": {
+      "type": ["object", "null"],
+      "additionalProperties": { "$ref": "#/$defs/metric" }
+    },
+    "block_device": {
+      "type": "object",
+      "required": ["name", "type", "id", "id_type", "parent"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string", "$comment": "disk/part/lvm/crypt/raid/mpath/dynamic/volume/swap. swap=스왑 파티션/pagefile 노드(size_bytes=스왑 할당). unknown 문자열 pass-through" },
+        "size_bytes": { "type": ["integer", "null"] },
+        "fstype": { "type": ["string", "null"] },
+        "mountpoint": { "type": ["string", "null"], "$comment": "swap 노드는 [SWAP] 또는 pagefile 경로" },
+        "parent": { "type": ["string", "null"], "$comment": "부모의 id(불안정 name/dm-N 아님). root=null. 복수면 노드 반복" },
+        "id": { "type": ["string", "null"] },
+        "id_type": { "enum": ["dm", "partuuid", "wwid", "serial", "by-id", "by-path", "fsuuid", "gptid", "mbrsig", "volguid", "mac", "ifguid", "name", null] }
+      },
+      "additionalProperties": false
+    },
+    "net_address": {
+      "type": "object",
+      "required": ["address", "prefix", "family"],
+      "properties": {
         "address": { "type": "string", "minLength": 1 },
-        "prefix":  { "type": ["integer", "null"], "minimum": 0, "maximum": 128 },
-        "family":  { "enum": ["ipv4", "ipv6"] },
-        "kind":    { "$ref": "#/$defs/iface_kind" },
-        "gateway": { "$ref": "#/$defs/str_or_null" }
+        "prefix": { "type": ["integer", "null"], "minimum": 0, "maximum": 128 },
+        "family": { "enum": ["ipv4", "ipv6"] }
       },
-      "required": ["name", "address", "prefix", "family", "kind", "gateway"]
+      "additionalProperties": false
     },
-
-    "disk": {
+    "net_interface": {
       "type": "object",
-      "additionalProperties": false,
+      "required": ["name", "id", "id_type", "addresses", "gateway"],
       "properties": {
-        "name":       { "type": "string", "minLength": 1 },
-        "kind":       { "$ref": "#/$defs/disk_kind" },
-        "major":      { "$ref": "#/$defs/int_or_null" },
-        "minor":      { "$ref": "#/$defs/int_or_null" },
-        "size_bytes": { "$ref": "#/$defs/int_or_null" },
-        "type":       { "$ref": "#/$defs/str_or_null" }
+        "name": { "type": "string", "$comment": "표시용(ens3 / Ethernet). Windows name 은 불안정('tape...')이라 키 아님" },
+        "id": { "type": ["string", "null"], "$comment": "안정 키 = MAC(OpenStack 포트 MAC). 폴백 Windows ifguid / Linux by-path" },
+        "id_type": { "enum": ["mac", "ifguid", "by-path", "name", null] },
+        "kind": { "type": ["string", "null"], "$comment": "physical/loopback/bridge/veth/bond_master/bond_member/vlan/tunnel/virtual" },
+        "speed_mbps": { "type": ["integer", "null"], "$comment": "링크속도(util 분모). virtio 부재 -> null" },
+        "addresses": { "type": "array", "items": { "$ref": "#/$defs/net_address" }, "$comment": "인터페이스 IP 목록(토폴로지·표시·필터)" },
+        "gateway": { "type": ["string", "null"], "$comment": "default route gateway IP(없으면 null)" }
       },
-      "required": ["name", "kind", "major", "minor", "size_bytes", "type"]
+      "additionalProperties": false
     },
-
-    "mount_struct": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "mount":       { "type": "string", "minLength": 1 },
-        "kind":        { "$ref": "#/$defs/mount_kind" },
-        "fstype":      { "$ref": "#/$defs/str_or_null" },
-        "major":       { "$ref": "#/$defs/int_or_null" },
-        "minor":       { "$ref": "#/$defs/int_or_null" },
-        "total_bytes": { "$ref": "#/$defs/int_or_null" }
-      },
-      "required": ["mount", "kind", "fstype", "major", "minor", "total_bytes"]
-    },
-
-    "mount_usage": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "mount":       { "type": "string", "minLength": 1 },
-        "kind":        { "$ref": "#/$defs/mount_kind" },
-        "fstype":      { "$ref": "#/$defs/str_or_null" },
-        "total_bytes": { "$ref": "#/$defs/int_or_null" },
-        "free_bytes":  { "$ref": "#/$defs/int_or_null" },
-        "avail_bytes": { "$ref": "#/$defs/int_or_null" },
-        "inodes_total":{ "$ref": "#/$defs/int_or_null" },
-        "inodes_free": { "$ref": "#/$defs/int_or_null" }
-      },
-      "required": ["mount", "kind", "fstype", "total_bytes", "free_bytes", "avail_bytes"]
-    },
-
     "service": {
       "type": "object",
-      "additionalProperties": false,
+      "required": ["unit", "sub", "pid", "exe"],
       "properties": {
         "unit": { "type": "string", "minLength": 1 },
-        "sub":  { "type": "string" },
-        "pid":  { "$ref": "#/$defs/int_or_null" },
-        "exe":  { "$ref": "#/$defs/str_or_null" }
+        "sub": { "type": "string" },
+        "pid": { "type": ["integer", "null"] },
+        "exe": { "type": ["string", "null"] }
       },
-      "required": ["unit", "sub", "pid", "exe"]
+      "additionalProperties": false
     },
-
     "listen_port": {
       "type": "object",
-      "additionalProperties": false,
+      "required": ["proto", "addr", "port", "uid", "pid", "comm"],
       "properties": {
-        "proto": { "$ref": "#/$defs/proto" },
-        "addr":  { "type": "string" },
-        "port":  { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "uid":   { "$ref": "#/$defs/int_or_null" },
-        "pid":   { "$ref": "#/$defs/int_or_null" },
-        "comm":  { "$ref": "#/$defs/str_or_null" }
+        "proto": { "enum": ["tcp", "tcp6", "udp", "udp6"] },
+        "addr": { "type": "string" },
+        "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "uid": { "type": ["integer", "null"] },
+        "pid": { "type": ["integer", "null"] },
+        "comm": { "type": ["string", "null"] }
       },
-      "required": ["proto", "addr", "port", "uid", "pid", "comm"]
+      "additionalProperties": false
     },
-
-    "cpu_stat": {
+    "lvm_vg": {
       "type": "object",
-      "additionalProperties": false,
+      "required": ["name", "size_bytes", "free_bytes"],
       "properties": {
-        "user":    { "$ref": "#/$defs/int_or_null" },
-        "nice":    { "$ref": "#/$defs/int_or_null" },
-        "system":  { "$ref": "#/$defs/int_or_null" },
-        "idle":    { "$ref": "#/$defs/int_or_null" },
-        "iowait":  { "$ref": "#/$defs/int_or_null" },
-        "irq":     { "$ref": "#/$defs/int_or_null" },
-        "softirq": { "$ref": "#/$defs/int_or_null" },
-        "steal":   { "$ref": "#/$defs/int_or_null" }
+        "name": { "type": "string" },
+        "size_bytes": { "type": ["integer", "null"] },
+        "free_bytes": { "type": ["integer", "null"] },
+        "data_percent": { "type": ["number", "null"] },
+        "metadata_percent": { "type": ["number", "null"] }
       },
-      "required": ["user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"]
-    },
-
-    "disk_queue_entry": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "device": { "type": "string", "minLength": 1 },
-        "queue":  { "type": "integer", "minimum": 0 },
-        "read_time":   { "$ref": "#/$defs/int_or_null" },
-        "write_time":  { "$ref": "#/$defs/int_or_null" },
-        "idle_time":   { "$ref": "#/$defs/int_or_null" },
-        "read_count":  { "$ref": "#/$defs/int_or_null" },
-        "write_count": { "$ref": "#/$defs/int_or_null" },
-        "query_time":  { "$ref": "#/$defs/int_or_null" }
-      },
-      "required": ["device", "queue"]
-    },
-
-    "saturation": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "disk_queue":     { "type": "array", "items": { "$ref": "#/$defs/disk_queue_entry" } },
-        "cpu_run_queue":  { "$ref": "#/$defs/int_or_null" },
-        "mem_paging_rate":{ "$ref": "#/$defs/int_or_null" }
-      },
-      "required": ["disk_queue", "cpu_run_queue", "mem_paging_rate"]
-    },
-
-    "disk_io": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "device":          { "type": "string", "minLength": 1 },
-        "kind":            { "$ref": "#/$defs/disk_kind" },
-        "major":           { "$ref": "#/$defs/int_or_null" },
-        "minor":           { "$ref": "#/$defs/int_or_null" },
-        "reads_completed": { "$ref": "#/$defs/int_or_null" },
-        "writes_completed":{ "$ref": "#/$defs/int_or_null" },
-        "sectors_read":    { "$ref": "#/$defs/int_or_null" },
-        "sectors_written": { "$ref": "#/$defs/int_or_null" },
-        "time_reading_ms": { "$ref": "#/$defs/int_or_null" },
-        "time_writing_ms": { "$ref": "#/$defs/int_or_null" },
-        "io_ticks_ms":     { "$ref": "#/$defs/int_or_null" },
-        "weighted_io_ms":  { "$ref": "#/$defs/int_or_null" }
-      },
-      "required": ["device", "kind", "major", "minor",
-                   "reads_completed", "writes_completed", "sectors_read", "sectors_written"]
-    },
-
-    "net_io": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "interface":  { "type": "string", "minLength": 1 },
-        "kind":       { "$ref": "#/$defs/iface_kind" },
-        "rx_bytes":   { "$ref": "#/$defs/int_or_null" },
-        "tx_bytes":   { "$ref": "#/$defs/int_or_null" },
-        "rx_packets": { "$ref": "#/$defs/int_or_null" },
-        "tx_packets": { "$ref": "#/$defs/int_or_null" },
-        "rx_errors":  { "$ref": "#/$defs/int_or_null" },
-        "tx_errors":  { "$ref": "#/$defs/int_or_null" },
-        "rx_drops":   { "$ref": "#/$defs/int_or_null" },
-        "tx_drops":   { "$ref": "#/$defs/int_or_null" }
-      },
-      "required": ["interface", "kind", "rx_bytes", "tx_bytes",
-                   "rx_packets", "tx_packets", "rx_errors", "tx_errors"]
-    },
-
-    "inventory": {
-      "type": "object",
-      "unevaluatedProperties": false,
-      "allOf": [ { "$ref": "#/$defs/common_metadata" } ],
-      "properties": {
-        "message_type": { "const": "inventory" },
-        "os_id":         { "$ref": "#/$defs/str_or_null" },
-        "os_version":    { "$ref": "#/$defs/str_or_null" },
-        "os_codename":   { "$ref": "#/$defs/str_or_null" },
-        "kernel_version":{ "$ref": "#/$defs/str_or_null" },
-        "cpu_cores":     { "$ref": "#/$defs/int_or_null" },
-        "cpu_model":     { "$ref": "#/$defs/str_or_null" },
-        "mem_total_kb":  { "$ref": "#/$defs/int_or_null" },
-        "swap_total_kb": { "$ref": "#/$defs/int_or_null" },
-        "ip_external":   { "type": ["array", "null"], "items": { "type": "string" } },
-        "interfaces":    { "type": "array", "items": { "$ref": "#/$defs/interface" } },
-        "mac_addresses": { "type": "array", "items": { "type": "string" } },
-        "disks":         { "type": "array", "items": { "$ref": "#/$defs/disk" } },
-        "mounts":        { "type": "array", "items": { "$ref": "#/$defs/mount_struct" } },
-        "services":      { "type": ["array", "null"], "items": { "$ref": "#/$defs/service" } },
-        "listen_ports":  { "type": "array", "items": { "$ref": "#/$defs/listen_port" } }
-      },
-      "required": ["os_id", "os_version", "os_codename", "kernel_version",
-                   "cpu_cores", "cpu_model", "mem_total_kb", "swap_total_kb",
-                   "ip_external", "interfaces", "mac_addresses",
-                   "disks", "mounts", "services", "listen_ports"]
-    },
-
-    "metrics": {
-      "type": "object",
-      "unevaluatedProperties": false,
-      "allOf": [
-        { "$ref": "#/$defs/common_metadata" },
-        {
-          "$comment": "saturation 은 Windows 전용 실측 객체다. Linux 는 load/cpu_stat.iowait 를 쓰고 saturation 을 싣지 않는다(엔진이 os_family 로 정규화). 이 조건부가 그 분기를 계약으로 강제한다.",
-          "if":   { "properties": { "os_family": { "const": "windows" } } },
-          "then": { "required": ["saturation"] },
-          "else": { "not": { "required": ["saturation"] } }
-        }
-      ],
-      "properties": {
-        "message_type": { "const": "metrics" },
-        "collection_interval_sec": { "type": "integer", "minimum": 0 },
-        "load_1m":  { "$ref": "#/$defs/num_or_null" },
-        "load_5m":  { "$ref": "#/$defs/num_or_null" },
-        "load_15m": { "$ref": "#/$defs/num_or_null" },
-        "cpu_stat":         { "$ref": "#/$defs/cpu_stat" },
-        "mem_total_kb":     { "$ref": "#/$defs/int_or_null" },
-        "mem_free_kb":      { "$ref": "#/$defs/int_or_null" },
-        "mem_available_kb": { "$ref": "#/$defs/int_or_null" },
-        "mem_buffers_kb":   { "$ref": "#/$defs/int_or_null" },
-        "mem_cached_kb":    { "$ref": "#/$defs/int_or_null" },
-        "swap_total_kb":    { "$ref": "#/$defs/int_or_null" },
-        "swap_free_kb":     { "$ref": "#/$defs/int_or_null" },
-        "disk_io": { "type": "array", "items": { "$ref": "#/$defs/disk_io" } },
-        "net_io":  { "type": "array", "items": { "$ref": "#/$defs/net_io" } },
-        "mounts":  { "type": "array", "items": { "$ref": "#/$defs/mount_usage" } },
-        "procs_running":         { "$ref": "#/$defs/int_or_null" },
-        "procs_blocked":         { "$ref": "#/$defs/int_or_null" },
-        "cpu_per_core":          { "type": "array", "items": { "$ref": "#/$defs/cpu_stat" } },
-        "schedstat_run_wait_ns": { "$ref": "#/$defs/int_or_null" },
-        "pswpin":                { "$ref": "#/$defs/int_or_null" },
-        "pswpout":               { "$ref": "#/$defs/int_or_null" },
-        "oom_kill":              { "$ref": "#/$defs/int_or_null" },
-        "psi_cpu_some_total":    { "$ref": "#/$defs/int_or_null" },
-        "psi_mem_some_total":    { "$ref": "#/$defs/int_or_null" },
-        "psi_io_some_total":     { "$ref": "#/$defs/int_or_null" },
-        "tcp_retrans_segs":      { "$ref": "#/$defs/int_or_null" },
-        "tcp_tw":                { "$ref": "#/$defs/int_or_null" },
-        "conntrack_count":       { "$ref": "#/$defs/int_or_null" },
-        "conntrack_max":         { "$ref": "#/$defs/int_or_null" },
-        "mem_pages_input":       { "$ref": "#/$defs/int_or_null" },
-        "saturation": { "$ref": "#/$defs/saturation" }
-      },
-      "required": ["collection_interval_sec", "load_1m", "load_5m", "load_15m",
-                   "cpu_stat", "mem_total_kb", "mem_free_kb", "mem_available_kb",
-                   "mem_buffers_kb", "mem_cached_kb", "swap_total_kb", "swap_free_kb",
-                   "disk_io", "net_io", "mounts"]
+      "additionalProperties": false
     },
 
     "task_result": {
-      "$comment": "worker task 완료 result. add_common_metadata 경로를 타지 않고 필드를 직접 구성한다: composite_id 를 싣지 않고(task_id 로 매칭하므로 식별키 불필요), boot_time/agent_started_at 은 항상 null, os 식별은 os_family/os_id/os_version/os_codename(inventory 와 동일 4필드, Windows os_codename 은 null).",
+      "$comment": "v1 body 유지 + schema_version + task_policy. task_id 로 매칭(composite_id 불요). boot_time/agent_started_at 은 워커 컨텍스트라 nullable(수집 캐시와 분리). exit_code/signal_no 상호배타(정상종료=exit_code / 시그널종료=signal_no / 미포착 둘다 null; Windows signal_no 항상 null). task_policy(bool|null) 는 exit_code 보다 우선.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "schema_version":   { "const": "2.0" },
         "message_type":     { "const": "task.result" },
         "message_id":       { "type": "string", "minLength": 1 },
         "hostname":         { "type": "string" },
-        "machine_id":       { "$ref": "#/$defs/str_or_null" },
+        "machine_id":       { "type": ["string", "null"] },
         "agent_id":         { "type": "string", "minLength": 1 },
         "agent_version":    { "type": "string", "minLength": 1 },
-        "boot_time":        { "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
+        "boot_time":        { "type": ["string", "null"] },
         "collected_at":     { "$ref": "#/$defs/iso8601" },
-        "agent_started_at": { "oneOf": [ { "$ref": "#/$defs/iso8601" }, { "type": "null" } ] },
-        "os_family":        { "$ref": "#/$defs/os_family" },
-        "os_id":            { "$ref": "#/$defs/str_or_null" },
-        "os_version":       { "$ref": "#/$defs/str_or_null" },
-        "os_codename":      { "$ref": "#/$defs/str_or_null" },
+        "agent_started_at": { "type": ["string", "null"] },
+        "os_family":        { "enum": ["linux", "windows"] },
+        "os_id":            { "type": ["string", "null"] },
+        "os_version":       { "type": ["string", "null"] },
+        "os_codename":      { "type": ["string", "null"] },
         "task_id":          { "type": "string" },
         "status":           { "type": "string", "minLength": 1 },
-        "failure_reason":   { "$ref": "#/$defs/str_or_null" },
-        "exit_code":        { "$ref": "#/$defs/int_or_null" },
-        "signal_no":        { "$ref": "#/$defs/int_or_null" },
+        "failure_reason":   { "type": ["string", "null"] },
+        "exit_code":        { "type": ["integer", "null"] },
+        "signal_no":        { "type": ["integer", "null"] },
+        "task_policy":      { "type": ["boolean", "null"] },
         "duration_ms":      { "type": "integer", "minimum": 0 },
         "stdout_tail":      { "type": "string" },
         "stderr_tail":      { "type": "string" },
         "completed_at":     { "$ref": "#/$defs/iso8601" }
       },
-      "required": ["message_type", "message_id", "hostname", "machine_id",
-                   "agent_id", "agent_version", "boot_time", "collected_at",
-                   "agent_started_at", "os_family", "os_id", "os_version", "os_codename",
-                   "task_id", "status", "failure_reason", "exit_code", "signal_no", "duration_ms",
-                   "stdout_tail", "stderr_tail", "completed_at"]
+      "required": ["schema_version", "message_type", "message_id", "hostname", "machine_id",
+                   "agent_id", "agent_version", "boot_time", "collected_at", "agent_started_at",
+                   "os_family", "os_id", "os_version", "os_codename", "task_id", "status",
+                   "failure_reason", "exit_code", "signal_no", "duration_ms", "stdout_tail",
+                   "stderr_tail", "completed_at"]
     },
 
     "error": {
-      "$comment": "수집/발행 실패 이벤트. add_common_metadata 전체(composite_id 포함)를 그대로 싣고 error_code/error_message/failed_component 를 더한다. retry_count/first_failed_at/recovered_at 은 재시도·복구 맥락에서만 실리는 옵셔널. collected_at 은 common 과 동일 초 정밀도 iso8601(두 트리 통일).",
+      "$comment": "v1 body 유지 + schema_version. 수집/발행 실패 이벤트. envelope(composite_id 포함) + error_code/error_message/failed_component. retry_count/first_failed_at/recovered_at 옵셔널.",
       "type": "object",
-      "unevaluatedProperties": false,
-      "allOf": [ { "$ref": "#/$defs/common_metadata" } ],
+      "additionalProperties": false,
       "properties": {
+        "schema_version":   { "const": "2.0" },
         "message_type":     { "const": "error" },
+        "message_id":       { "type": "string", "minLength": 1 },
+        "hostname":         { "type": "string", "$comment": "add_common_metadata 공통 경로가 항상 발행(inventory/metrics/error)" },
+        "agent_id":         { "type": "string", "minLength": 1 },
+        "agent_version":    { "type": "string", "minLength": 1 },
+        "composite_id":     { "type": ["string", "null"] },
+        "machine_id":       { "type": ["string", "null"] },
+        "collected_at":     { "$ref": "#/$defs/iso8601" },
+        "boot_time":        { "type": ["string", "null"] },
+        "agent_started_at": { "type": ["string", "null"] },
+        "os_family":        { "enum": ["linux", "windows"] },
         "error_code":       { "type": "string", "minLength": 1 },
         "error_message":    { "type": "string" },
         "failed_component": { "type": "string", "minLength": 1 },
@@ -344,7 +167,68 @@
         "first_failed_at":  { "$ref": "#/$defs/iso8601" },
         "recovered_at":     { "$ref": "#/$defs/iso8601" }
       },
-      "required": ["error_code", "error_message", "failed_component"]
+      "required": ["schema_version", "message_type", "agent_id", "message_id", "hostname", "collected_at",
+                   "os_family", "error_code", "error_message", "failed_component"]
     }
-  }
+  },
+
+  "required": ["schema_version", "message_type"],
+  "properties": {
+    "schema_version": { "const": "2.0" },
+    "message_type": { "enum": ["inventory", "metrics", "task.result", "error"] }
+  },
+
+  "allOf": [
+    {
+      "$comment": "metrics/inventory: v2 envelope + system.* / block_devices.",
+      "if": { "properties": { "message_type": { "enum": ["metrics", "inventory"] } } },
+      "then": {
+        "required": ["agent_id", "message_id", "collected_at", "boot_time", "agent_started_at", "os_family"],
+        "properties": {
+          "agent_id": { "type": "string" },
+          "message_id": { "type": "string" },
+          "composite_id": { "type": ["string", "null"] },
+          "machine_id": { "type": ["string", "null"] },
+          "collected_at": { "$ref": "#/$defs/iso8601" },
+          "boot_time": { "type": ["string", "null"] },
+          "agent_started_at": { "type": ["string", "null"] },
+          "agent_version": { "type": "string" },
+          "os_family": { "enum": ["linux", "windows"] },
+          "hostname": { "type": "string", "$comment": "inventory 정적 서술자(host-only, 파생 불가). task.result 와 동형 top-level" },
+          "os_id": { "type": ["string", "null"] },
+          "os_version": { "type": ["string", "null"] },
+          "os_codename": { "type": ["string", "null"] },
+          "kernel_version": { "type": ["string", "null"] },
+          "cpu_model": { "type": ["string", "null"] },
+          "cpu_cores": { "type": ["integer", "null"], "$comment": "논리 코어 수(정적). metrics 는 system.cpu cpu.logical.count(gauge, unit cpu)로도 발행" },
+          "mem_total_bytes": { "type": ["integer", "null"], "$comment": "총 물리 메모리(By). metrics memory.limit 와 동치이나 inventory 시점 저장용" },
+          "ip_external": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "외부 공인 IP(IMDS best-effort, 없으면 null)" },
+          "services": { "type": ["array", "null"], "items": { "$ref": "#/$defs/service" }, "$comment": "서비스 카탈로그(service_classifier 뱃지). 열거 불가면 null(빈배열과 구분). v1 형태 유지" },
+          "listen_ports": { "type": "array", "items": { "$ref": "#/$defs/listen_port" }, "$comment": "리슨 소켓(포트 기반 서비스 분류). v1 형태 유지" },
+          "system.cpu":        { "$ref": "#/$defs/namespace", "$comment": "cpu.time(counter,s; attr cpu,state) | cpu.run_queue(gauge; source procs_running|processor_queue) | cpu.blocked(gauge; Linux, Windows null) | cpu.mce(counter,events) | cpu.logical.count(gauge,cpu)" },
+          "system.memory":     { "$ref": "#/$defs/namespace", "$comment": "memory.usage(gauge,By; state used/free/cached/available) | .limit | .commit.usage/.limit | .oom_kill(4.13+) | .hardware_corrupted | .edac(VM null)" },
+          "system.paging":     { "$ref": "#/$defs/namespace" },
+          "system.disk":       { "$ref": "#/$defs/namespace", "$comment": "device attr = '<scheme>:<value>' 안정 id(non-null). scheme 카탈로그(D4): gptid|mbrsig|serial|wwid|by-path|dm|partuuid(물리/파티션) + md|btrfsuuid|fsuuid(disk.errors 는 RAID 배열/fs 레벨 참조). io/operations/io_time(%util)/operation_time(await)/pending_operations(queue)/errors(mdraid/btrfs/ext4/ioerr)" },
+          "system.filesystem": { "$ref": "#/$defs/namespace" },
+          "system.network":    { "$ref": "#/$defs/namespace", "$comment": "device attr=안정 id=MAC(id_type mac; 폴백 ifguid/by-path). name 은 표시용 아님. io/packets/errors/dropped/link.speed/tcp.retransmits/conntrack" },
+          "system.pressure":   { "$ref": "#/$defs/namespace", "$comment": "pressure.stall.ratio(gauge,1; resource/scope/window) | pressure.stall.time(counter,s; 14일 saturation canonical). Linux 4.20+; else null" },
+          "system.cgroup":     { "$ref": "#/$defs/namespace" },
+          "block_devices":     { "type": "array", "items": { "$ref": "#/$defs/block_device" } },
+          "net_interfaces":    { "type": "array", "items": { "$ref": "#/$defs/net_interface" } },
+          "lvm_vgs":           { "type": "array", "items": { "$ref": "#/$defs/lvm_vg" } }
+        }
+      }
+    },
+    { "if": { "properties": { "message_type": { "const": "metrics" } } },
+      "then": { "required": ["system.cpu", "system.memory", "system.disk", "system.network"] } },
+    { "if": { "properties": { "message_type": { "const": "inventory" } } },
+      "then": { "required": ["hostname", "os_id", "os_version", "os_codename", "kernel_version", "cpu_model", "cpu_cores", "mem_total_bytes", "ip_external", "services", "listen_ports", "block_devices", "net_interfaces"] } },
+    { "if": { "allOf": [ { "properties": { "message_type": { "enum": ["metrics", "inventory"] } } }, { "properties": { "os_family": { "const": "windows" } } } ] },
+      "then": { "properties": { "system.pressure": { "type": "null" } }, "not": { "required": ["lvm_vgs"] } } },
+
+    { "if": { "properties": { "message_type": { "const": "task.result" } } },
+      "then": { "$ref": "#/$defs/task_result" } },
+    { "if": { "properties": { "message_type": { "const": "error" } } },
+      "then": { "$ref": "#/$defs/error" } }
+  ]
 }
