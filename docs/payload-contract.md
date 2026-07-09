@@ -173,7 +173,10 @@ parent(부모의 id 값; root=null; 부모 복수면 노드 반복), id + id_typ
 
 ### lvm_vgs[] (Linux 조건부; Windows 부재)
 
-{name, size_bytes, free_bytes} + 씬풀 {data_percent, metadata_percent}. lvm2 부재 시 미발행.
+{name, size_bytes, free_bytes} + 씬풀 {data_percent, metadata_percent}. VG size/free 와 thin data%/metadata%
+는 lvm2 툴(vgs/lvs) 또는 LVM 메타데이터 파싱이 필요한데, 정적 musl 에이전트는 이를 쓰지 않아 현재 미발행이다
+(testbed 실측에서 lvm_vgs=null 확인). LVM 토폴로지 자체는 block_devices 의 type=lvm 노드(dm/uuid parent 체인)로
+커버되며, VG 미할당 free(확장 여력) 신호만 빠진다 — 향후 과제(best-effort vgs 쉘 또는 메타데이터 파싱).
 
 ### net_interfaces[]
 
