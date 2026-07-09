@@ -1,5 +1,5 @@
 {
-  "_comment": "wire v2 canonical 예시. 값은 testbed 실측 기반(st-lvm/st-raid/dp-win2016/win2003·2008 엔진DB). wire.schema.v2.json 으로 검증됨. 4종: linux_metrics / windows_metrics / linux_inventory / windows_inventory.",
+  "_comment": "wire v2 canonical 예시. 값은 testbed 실측 기반(st-lvm/st-raid/dp-win2016/win2003·2008 엔진DB). wire.schema.json 으로 검증됨. 6종: linux/windows metrics + linux/windows inventory + task_result + error.",
 
   "linux_metrics": {
     "schema_version": "2.0", "message_type": "metrics",

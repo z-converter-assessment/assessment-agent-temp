@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://z-converter-assessment/wire.schema.v2.json",
+  "$id": "https://z-converter-assessment/wire.schema.json",
   "title": "assessment-agent wire v2 (USE Method, OTel system.* aligned)",
   "$comment": "메시지 4종. metrics/inventory 는 v2 재설계(envelope + system.* / block_devices, datapoint-array). task.result/error 는 v1 body 를 v2 envelope 아래 그대로 유지(system.* 재설계 대상 아님) + schema_version. counter=monotonic 누적(엔진 델타), gauge=순간. base 단위 s/By/bit/s/1(ratio)/count. null=측정불가(0과 구분).",
 
@@ -206,7 +206,7 @@
           "services": { "type": ["array", "null"], "items": { "$ref": "#/$defs/service" }, "$comment": "서비스 카탈로그(service_classifier 뱃지). 열거 불가면 null(빈배열과 구분). v1 형태 유지" },
           "listen_ports": { "type": "array", "items": { "$ref": "#/$defs/listen_port" }, "$comment": "리슨 소켓(포트 기반 서비스 분류). v1 형태 유지" },
           "system.cpu":        { "$ref": "#/$defs/namespace", "$comment": "cpu.time(counter,s; attr cpu,state) | cpu.run_queue(gauge; source procs_running|processor_queue) | cpu.blocked(gauge; Linux, Windows null) | cpu.logical.count(gauge,cpu)" },
-          "system.memory":     { "$ref": "#/$defs/namespace", "$comment": "memory.usage(gauge,By; state used/free/cached/available) | .limit | .commit.usage/.limit | .oom_kill(4.13+) | .hardware_corrupted | .edac(VM null)" },
+          "system.memory":     { "$ref": "#/$defs/namespace", "$comment": "memory.usage(gauge,By; state free/cached/buffers/available) | .limit | .commit.usage/.limit | .oom_kill(4.13+) | .hardware_corrupted | .edac(VM null)" },
           "system.paging":     { "$ref": "#/$defs/namespace" },
           "system.disk":       { "$ref": "#/$defs/namespace", "$comment": "device attr = '<scheme>:<value>' 안정 id(non-null). scheme 카탈로그(D4): gptid|mbrsig|serial|wwid|by-path|dm|partuuid(물리/파티션) + md|btrfsuuid|fsuuid(disk.errors 는 RAID 배열/fs 레벨 참조). io/operations/io_time(%util)/operation_time(await)/pending_operations(queue)/errors(mdraid/btrfs/ext4/ioerr)" },
           "system.filesystem": { "$ref": "#/$defs/namespace" },
