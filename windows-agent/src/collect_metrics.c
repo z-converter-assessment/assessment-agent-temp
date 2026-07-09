@@ -1,0 +1,359 @@
+#define WIN32_LEAN_AND_MEAN
+
+#include "collect.h"
+#include "util.h"
+#include "cJSON.h"
+#include <openssl/evp.h>
+#include "openssl_compat.h"
+#include <curl/curl.h>
+
+#include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <wchar.h>
+#include <intrin.h>
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <windows.h>
+#include <winioctl.h>
+#include <ntddstor.h>
+#include <tlhelp32.h>
+#include <winperf.h>
+#include "nt52_compat.h"
+#include "collect_internal.h"
+
+static void metrics_collect_cpu(cJSON *root);
+static void metrics_collect_disk(cJSON *root);
+static void metrics_collect_filesystem(cJSON *root);
+static void metrics_collect_memory(cJSON *root);
+static void metrics_collect_network(cJSON *root);
+
+cJSON *build_error_payload(const char *machine_id, const char *agent_version,
+                           const char *error_code, const char *error_message,
+                           const char *failed_component, int retry_count,
+                           const char *first_failed_at, const char *recovered_at)
+{
+	cJSON *m = cJSON_CreateObject();
+	if (!m) return NULL;
+	wire_add_envelope(m, "error", machine_id, agent_version);
+	cJSON_AddStringToObject(m, "error_code",       error_code       ? error_code       : "UNKNOWN");
+	cJSON_AddStringToObject(m, "error_message",    error_message    ? error_message    : "");
+	cJSON_AddStringToObject(m, "failed_component", failed_component ? failed_component : "agent");
+	if (retry_count >= 0)   cJSON_AddNumberToObject(m, "retry_count", retry_count);
+	if (first_failed_at)    cJSON_AddStringToObject(m, "first_failed_at", first_failed_at);
+	if (recovered_at)       cJSON_AddStringToObject(m, "recovered_at",    recovered_at);
+	return m;
+}
+
+/* P2 system.cpu: per-cpu = NtQuery(SystemProcessorPerformanceInformation, class 8) 동적버퍼(L2, 고코어 무음드롭 방지).
+ * run_queue = perflib System\Processor Queue Length. logical.count = GetNativeSystemInfo. blocked = Windows null. */
+static void metrics_collect_cpu(cJSON *root)
+{
+	cJSON *ns = wire_ns(root, "system.cpu");
+	cJSON *m_time = wire_metric(ns, "cpu.time", "counter", "s");
+	SYSTEM_INFO si; GetNativeSystemInfo(&si);
+	DWORD ncpu = si.dwNumberOfProcessors;
+
+	typedef LONG (WINAPI *NQSI)(ULONG, PVOID, ULONG, PULONG);
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	NQSI f = nt ? (NQSI)(void *)GetProcAddress(nt, "NtQuerySystemInformation") : NULL;
+	if (f) {
+		ULONG cap = ncpu * 64 + 512, ret = 0;
+		BYTE *buf = (BYTE *)malloc(cap);
+		if (buf) {
+			LONG st = f(8, buf, cap, &ret);
+			if (st == (LONG)0xC0000004UL && ret > cap) {   /* LENGTH_MISMATCH -> 동적 확장 */
+				BYTE *nb = (BYTE *)realloc(buf, ret);
+				if (nb) { buf = nb; cap = ret; st = f(8, buf, cap, &ret); }
+			}
+			if (st == 0) {
+				/* 엔트리(x86): IdleTime(8) KernelTime(8) UserTime(8) DpcTime(8) InterruptTime(8) InterruptCount(4)+pad -> 48B. */
+				const size_t ENT = 48;
+				DWORD have = (DWORD)(ret / ENT);
+				if (have > ncpu) have = ncpu;
+				for (DWORD i = 0; i < have; i++) {
+					BYTE *e = buf + (size_t)i * ENT;
+					long long idle   = *(long long *)(e + 0);
+					long long kernel = *(long long *)(e + 8);
+					long long user   = *(long long *)(e + 16);
+					long long sys    = kernel - idle;   /* Windows KernelTime 은 idle 포함 */
+					char idxs[16]; snprintf(idxs, sizeof idxs, "%lu", (unsigned long)i);
+					cJSON *p;
+					p = wire_point(m_time); wire_point_attr(p, "cpu", idxs); wire_point_attr(p, "state", "user");   wire_point_value(p, (double)user / 1e7);
+					p = wire_point(m_time); wire_point_attr(p, "cpu", idxs); wire_point_attr(p, "state", "system"); wire_point_value(p, (double)(sys < 0 ? 0 : sys) / 1e7);
+					p = wire_point(m_time); wire_point_attr(p, "cpu", idxs); wire_point_attr(p, "state", "idle");   wire_point_value(p, (double)idle / 1e7);
+				}
+			}
+			free(buf);
+		}
+	}
+
+	/* run_queue = perflib System\Processor Queue Length. */
+	int have_rq = 0; unsigned long long rq = 0;
+	DWORD i_sys = perf_index("System");
+	if (i_sys) {
+		char vn[16]; snprintf(vn, sizeof vn, "%lu", (unsigned long)i_sys);
+		BYTE *pb = perf_query(vn);
+		RegCloseKey(HKEY_PERFORMANCE_DATA);
+		if (pb) {
+			PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)pb;
+			PERF_OBJECT_TYPE *o = perf_object(db, i_sys);
+			if (o && o->NumInstances == PERF_NO_INSTANCES) {
+				PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)o + o->DefinitionLength);
+				PERF_COUNTER_DEFINITION *c = perf_counter(o, perf_index("Processor Queue Length"));
+				if (c) { rq = perf_read(cb, c); have_rq = 1; }
+			}
+			free(pb);
+		}
+	}
+	cJSON *m_rq = wire_metric(ns, "cpu.run_queue", "gauge", "tasks");
+	{ cJSON *p = wire_point(m_rq); wire_point_attr(p, "source", "processor_queue");
+	  if (have_rq) wire_point_value(p, (double)rq); else wire_point_null(p); }
+	/* blocked: Windows 개념 없음 -> null. */
+	cJSON *m_bl = wire_metric(ns, "cpu.blocked", "gauge", "tasks");
+	wire_point_null(wire_point(m_bl));
+	cJSON *m_lc = wire_metric(ns, "cpu.logical.count", "gauge", "cpu");
+	wire_point_value(wire_point(m_lc), (double)ncpu);
+}
+
+/* P2 system.memory + paging: GlobalMemoryStatusEx + perflib Memory(commit/pages). */
+static void metrics_collect_memory(cJSON *root)
+{
+	cJSON *ns = wire_ns(root, "system.memory");
+	cJSON *usage = wire_metric(ns, "memory.usage", "gauge", "By");
+	MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+	int okmem = GlobalMemoryStatusEx(&ms);
+	long long freek = query_free_kb();   /* 진짜 free(NT6+), 실패 -1 */
+	{ cJSON *p = wire_point(usage); wire_point_attr(p, "state", "available");
+	  if (okmem) wire_point_value(p, (double)ms.ullAvailPhys); else wire_point_null(p); }
+	{ cJSON *p = wire_point(usage); wire_point_attr(p, "state", "free");
+	  if (freek >= 0) wire_point_value(p, (double)freek * 1024.0); else wire_point_null(p); }
+	wire_metric_scalar(ns, "memory.limit", "gauge", "By", okmem, (double)ms.ullTotalPhys);
+
+	/* commit + paging: perflib Memory (단일 인스턴스). */
+	int have_cu = 0, have_cl = 0, have_pin = 0, have_pout = 0;
+	unsigned long long cu = 0, cl = 0, pin = 0, pout = 0;
+	DWORD i_mem = perf_index("Memory");
+	if (i_mem) {
+		char vn[16]; snprintf(vn, sizeof vn, "%lu", (unsigned long)i_mem);
+		BYTE *pb = perf_query(vn);
+		RegCloseKey(HKEY_PERFORMANCE_DATA);
+		if (pb) {
+			PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)pb;
+			PERF_OBJECT_TYPE *o = perf_object(db, i_mem);
+			if (o && o->NumInstances == PERF_NO_INSTANCES) {
+				PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)o + o->DefinitionLength);
+				PERF_COUNTER_DEFINITION *c;
+				if ((c = perf_counter(o, perf_index("Committed Bytes"))))   { cu = perf_read(cb, c); have_cu = 1; }
+				if ((c = perf_counter(o, perf_index("Commit Limit"))))      { cl = perf_read(cb, c); have_cl = 1; }
+				if ((c = perf_counter(o, perf_index("Pages Input/sec"))))   { pin = perf_read(cb, c); have_pin = 1; }
+				if ((c = perf_counter(o, perf_index("Pages Output/sec"))))  { pout = perf_read(cb, c); have_pout = 1; }
+			}
+			free(pb);
+		}
+	}
+	wire_metric_scalar(ns, "memory.commit.usage", "gauge", "By", have_cu, (double)cu);
+	wire_metric_scalar(ns, "memory.commit.limit", "gauge", "By", have_cl, (double)cl);
+	/* oom_kill/hardware_corrupted: Windows 개념 없음 -> null(WHEA 는 P5). */
+	wire_metric_scalar(ns, "memory.oom_kill", "counter", "events", 0, 0);
+	wire_metric_scalar(ns, "memory.hardware_corrupted", "gauge", "By", 0, 0);
+
+	cJSON *pns = wire_ns(root, "system.paging");
+	cJSON *po = wire_metric(pns, "paging.operations", "counter", "operations");
+	if (have_pin)  { cJSON *p = wire_point(po); wire_point_attr(p, "direction", "in");  wire_point_value(p, (double)pin); }
+	if (have_pout) { cJSON *p = wire_point(po); wire_point_attr(p, "direction", "out"); wire_point_value(p, (double)pout); }
+}
+
+/* v2 system.disk: throughput=NtQuery(시스템 전역·diskperf 독립·단조, device PhysicalDrive0),
+ * saturation(io_time/operation_time/pending)=perflib PhysicalDisk per-disk + 유효성 게이트(raw!=0/idle>0, 가짜0 금지).
+ * NOTE(accept 게이트): perflib counter-type 수식(% Idle Time=100ns 역산, Avg.Disk sec=PERF_AVERAGE_TIMER raw/PerfFreq)의
+ * 값 정확성은 dp-win2016 raw-vs-cooked 대조로 검증 필요. divisor(PerfFreq vs 1e7)는 그 대조로 확정. */
+static void metrics_collect_disk(cJSON *root)
+{
+	cJSON *ns    = wire_ns(root, "system.disk");
+	cJSON *m_io  = wire_metric(ns, "disk.io",             "counter", "By");
+	cJSON *m_ops = wire_metric(ns, "disk.operations",     "counter", "operations");
+	cJSON *m_iot = wire_metric(ns, "disk.io_time",        "counter", "s");
+	cJSON *m_opt = wire_metric(ns, "disk.operation_time", "counter", "s");
+	cJSON *m_pnd = wire_metric(ns, "disk.pending_operations", "gauge", "operations");
+
+	/* NtQuery 는 시스템 전역 집계(I/O 매니저) — 물리 디스크별 아님. perflib per-disk(PhysicalDriveN)와
+	 * device 키 충돌 방지 위해 'aggregate:system'. await 는 perflib per-disk operation_time/operations 로 페어. */
+	unsigned long long rop = 0, wop = 0, rby = 0, wby = 0;
+	if (query_system_io(&rop, &wop, &rby, &wby)) {
+		cJSON *p;
+		p = wire_point(m_io);  wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "read");  wire_point_value(p, (double)rby);
+		p = wire_point(m_io);  wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "write"); wire_point_value(p, (double)wby);
+		p = wire_point(m_ops); wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "read");  wire_point_value(p, (double)rop);
+		p = wire_point(m_ops); wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "write"); wire_point_value(p, (double)wop);
+	}
+
+	DWORD i_pd = perf_index("PhysicalDisk");
+	if (!i_pd) return;
+	char vn[16]; snprintf(vn, sizeof vn, "%lu", (unsigned long)i_pd);
+	BYTE *buf = perf_query(vn);
+	RegCloseKey(HKEY_PERFORMANCE_DATA);
+	if (!buf) return;
+	PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)buf;
+	long long perf_freq = db->PerfFreq.QuadPart;
+	PERF_OBJECT_TYPE *o = perf_object(db, i_pd);
+	if (o && o->NumInstances > 0) {
+		PERF_COUNTER_DEFINITION *c_idle = perf_counter(o, perf_index("% Idle Time"));
+		PERF_COUNTER_DEFINITION *c_rt   = perf_counter(o, perf_index("Avg. Disk sec/Read"));
+		PERF_COUNTER_DEFINITION *c_wt   = perf_counter(o, perf_index("Avg. Disk sec/Write"));
+		PERF_COUNTER_DEFINITION *c_q    = perf_counter(o, perf_index("Current Disk Queue Length"));
+		PERF_COUNTER_DEFINITION *c_ro   = perf_counter(o, perf_index("Disk Reads/sec"));
+		PERF_COUNTER_DEFINITION *c_wo   = perf_counter(o, perf_index("Disk Writes/sec"));
+		PERF_INSTANCE_DEFINITION *inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)o + o->DefinitionLength);
+		for (LONG i = 0; i < o->NumInstances; i++) {
+			wchar_t *wname = (wchar_t *)((BYTE *)inst + inst->NameOffset);
+			PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)inst + inst->ByteLength);
+			int drive = perf_disk_num(wname);
+			if (drive >= 0) {
+				char dev[32]; snprintf(dev, sizeof dev, "name:PhysicalDrive%d", drive);
+				cJSON *p;
+				/* io_time(busy s) = uptime(부팅기준 s) - idle(% Idle Time raw, 부팅기준 100ns->s). idle 누적기는
+				 * PDH % Idle Time raw 와 동일값임을 값검증에서 확인(idx=1482, agent idle==PDH RawValue, Δ 일치).
+				 * uptime 기준이라 재부팅 시 idle 과 함께 0 리셋 -> 엔진이 counter reset 로 깨끗이 감지(1601 기준
+				 * PerfTime100nSec 는 절대값 425년 + 재부팅 시 spike 라 안 씀). 게이트: idle>0(diskperf 수집중). */
+				unsigned long long idle = c_idle ? perf_read(cb, c_idle) : 0;
+				p = wire_point(m_iot); wire_point_attr(p, "device", dev);
+				if (c_idle && idle > 0) {
+					double busy = (double)monotonic_ms() / 1000.0 - (double)idle / 1e7;
+					wire_point_value(p, busy < 0 ? 0.0 : busy);
+				} else wire_point_null(p);
+				p = wire_point(m_opt); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "read");
+				if (c_rt && perf_freq > 0) wire_point_value(p, (double)perf_read(cb, c_rt) / (double)perf_freq); else wire_point_null(p);
+				p = wire_point(m_opt); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "write");
+				if (c_wt && perf_freq > 0) wire_point_value(p, (double)perf_read(cb, c_wt) / (double)perf_freq); else wire_point_null(p);
+				p = wire_point(m_ops); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "read");
+				if (c_ro) wire_point_value(p, (double)perf_read(cb, c_ro)); else wire_point_null(p);
+				p = wire_point(m_ops); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "write");
+				if (c_wo) wire_point_value(p, (double)perf_read(cb, c_wo)); else wire_point_null(p);
+				p = wire_point(m_pnd); wire_point_attr(p, "device", dev);
+				if (c_q) wire_point_value(p, (double)perf_read(cb, c_q)); else wire_point_null(p);
+			}
+			inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)cb + cb->ByteLength);
+		}
+	}
+	free(buf);
+}
+
+/* P3 system.network: GetIfTable2(NT6, GetProcAddress) / GetIfTable(NT5.2 폴백). device=MAC.
+ * io/packets/errors/dropped/link.speed + tcp.retransmits(GetTcpStatistics). conntrack 는 Windows 부재. */
+static void metrics_collect_network(cJSON *root)
+{
+	cJSON *ns   = wire_ns(root, "system.network");
+	cJSON *m_io = wire_metric(ns, "network.io",         "counter", "By");
+	cJSON *m_pk = wire_metric(ns, "network.packets",    "counter", "packets");
+	cJSON *m_er = wire_metric(ns, "network.errors",     "counter", "errors");
+	cJSON *m_dr = wire_metric(ns, "network.dropped",    "counter", "packets");
+	cJSON *m_sp = wire_metric(ns, "network.link.speed", "gauge",   "bit/s");
+
+	typedef DWORD (WINAPI *GetIfTable2_fn)(PMIB_IF_TABLE2 *);
+	typedef void  (WINAPI *FreeMibTable_fn)(PVOID);
+	static int resolved = 0; static GetIfTable2_fn p_get = NULL; static FreeMibTable_fn p_free = NULL;
+	if (!resolved) { resolved = 1; HMODULE ip = GetModuleHandleA("iphlpapi.dll");
+		if (ip) { p_get = (GetIfTable2_fn)(void *)GetProcAddress(ip, "GetIfTable2"); p_free = (FreeMibTable_fn)(void *)GetProcAddress(ip, "FreeMibTable"); } }
+
+	if (p_get && p_free) {
+		PMIB_IF_TABLE2 table = NULL;
+		if (p_get(&table) == NO_ERROR && table) {
+			for (ULONG i = 0; i < table->NumEntries; i++) {
+				MIB_IF_ROW2 *r = &table->Table[i];
+				if (r->Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+				if (r->OperStatus != IfOperStatusUp) continue;
+				if (r->InterfaceAndOperStatusFlags.FilterInterface) continue;
+				char alias[256]; WideCharToMultiByte(CP_UTF8,0,r->Alias,-1,alias,sizeof alias,NULL,NULL);
+				char id[80]; mac_to_devid(r->PhysicalAddress, r->PhysicalAddressLength, alias, id, sizeof id);
+				cJSON *p;
+				p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->InOctets);
+				p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->OutOctets);
+				p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)(r->InUcastPkts + r->InNUcastPkts));
+				p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)(r->OutUcastPkts + r->OutNUcastPkts));
+				p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->InErrors);
+				p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->OutErrors);
+				p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->InDiscards);
+				p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->OutDiscards);
+				p=wire_point(m_sp); wire_point_attr(p,"device",id);
+				ULONG64 spd = r->ReceiveLinkSpeed ? r->ReceiveLinkSpeed : r->TransmitLinkSpeed;
+				if (spd > 0 && spd != 0xFFFFFFFFFFFFFFFFULL) wire_point_value(p,(double)spd); else wire_point_null(p);
+			}
+			p_free(table);
+		}
+	} else {
+		ULONG sz = 0;
+		if (GetIfTable(NULL, &sz, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+			MIB_IFTABLE *t = (MIB_IFTABLE *)malloc(sz);
+			if (t && GetIfTable(t, &sz, FALSE) == NO_ERROR) {
+				for (DWORD i = 0; i < t->dwNumEntries; i++) {
+					MIB_IFROW *r = &t->table[i];
+					if (r->dwType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+					char nm[32]; snprintf(nm, sizeof nm, "if%lu", (unsigned long)r->dwIndex);
+					char id[80]; mac_to_devid(r->bPhysAddr, r->dwPhysAddrLen, nm, id, sizeof id);
+					cJSON *p;
+					p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->dwInOctets);
+					p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->dwOutOctets);
+					p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)((double)r->dwInUcastPkts + r->dwInNUcastPkts));
+					p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)((double)r->dwOutUcastPkts + r->dwOutNUcastPkts));
+					p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->dwInErrors);
+					p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->dwOutErrors);
+					p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->dwInDiscards);
+					p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->dwOutDiscards);
+					p=wire_point(m_sp); wire_point_attr(p,"device",id);
+					if (r->dwSpeed > 0) wire_point_value(p,(double)r->dwSpeed); else wire_point_null(p);
+				}
+			}
+			free(t);
+		}
+	}
+	MIB_TCPSTATS ts;
+	if (GetTcpStatistics(&ts) == NO_ERROR)
+		wire_metric_scalar(ns, "network.tcp.retransmits", "counter", "segments", 1, (double)ts.dwRetransSegs);
+	else
+		wire_metric_scalar(ns, "network.tcp.retransmits", "counter", "segments", 0, 0);
+}
+
+/* P4 system.filesystem: 고정 볼륨 usage(used/free). NTFS 는 inode 개념 부재 -> inodes null. */
+static void metrics_collect_filesystem(cJSON *root)
+{
+	cJSON *ns = wire_ns(root, "system.filesystem");
+	cJSON *m_use = wire_metric(ns, "filesystem.usage",  "gauge", "By");
+	cJSON *m_ino = wire_metric(ns, "filesystem.inodes", "gauge", "count");
+	wchar_t drives[256]; DWORD len = GetLogicalDriveStringsW(256, drives);
+	if (len == 0 || len > 256) return;
+	for (wchar_t *p = drives; *p; p += wcslen(p) + 1) {
+		if (GetDriveTypeW(p) != DRIVE_FIXED) continue;
+		char mount[16]; WideCharToMultiByte(CP_UTF8, 0, p, -1, mount, sizeof mount, NULL, NULL);
+		size_t ml = strlen(mount); if (ml && mount[ml-1] == '\\') mount[ml-1] = '\0';
+		ULARGE_INTEGER avail, total, tfree;
+		if (!GetDiskFreeSpaceExW(p, &avail, &total, &tfree)) continue;
+		cJSON *pt;
+		pt=wire_point(m_use); wire_point_attr(pt,"mountpoint",mount); wire_point_attr(pt,"state","used"); wire_point_value(pt,(double)total.QuadPart - (double)tfree.QuadPart);
+		pt=wire_point(m_use); wire_point_attr(pt,"mountpoint",mount); wire_point_attr(pt,"state","free"); wire_point_value(pt,(double)avail.QuadPart);
+		pt=wire_point(m_ino); wire_point_attr(pt,"mountpoint",mount); wire_point_attr(pt,"state","used"); wire_point_null(pt);
+	}
+}
+
+cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
+{
+	cJSON *m = cJSON_CreateObject();
+	if (!m) return NULL;
+	wire_add_envelope(m, "metrics", machine_id, agent_version);
+	cJSON_AddNumberToObject(m, "collection_interval_sec", agent_interval_sec());
+
+	metrics_collect_cpu(m);
+	metrics_collect_memory(m);   /* + system.paging */
+	metrics_collect_network(m);
+	metrics_collect_disk(m);
+	metrics_collect_filesystem(m);
+	cJSON_AddNullToObject(m, "system.pressure");   /* Windows: PSI 부재(스키마 강제 null) */
+	cJSON_AddNullToObject(m, "system.cgroup");     /* Windows: cgroup 부재 */
+
+	return m;
+}
