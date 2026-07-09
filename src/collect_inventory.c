@@ -786,7 +786,7 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	{
 		char *mi = read_file_all("/proc/meminfo");
 		long kb = mi ? meminfo_get_kb(mi, "MemTotal") : -1;
-		if (mi) free(mi);
+		free(mi);
 		if (kb >= 0) cJSON_AddNumberToObject(root, "mem_total_bytes", (double)kb * 1024.0);
 		else         cJSON_AddNullToObject(root, "mem_total_bytes");
 	}

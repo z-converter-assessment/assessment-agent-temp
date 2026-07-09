@@ -362,6 +362,19 @@ exec_status_t exec_install(void                *job_handle_in,
 			TerminateProcess(pi.hProcess, 1);
 			kill_sent = 1;
 		}
+		/* kill 후에도 안 죽으면(언킬러블 프로세스/WAIT_FAILED) 무한루프가 되어 worker 가 행한다.
+		 * 유예(5s) 후 bail-out — Linux exec.c 의 wait 에러 break 와 대칭. */
+		if (kill_sent && elapsed >= term_at_ms + 10000L) {
+			if (out_open) CloseHandle(out_r);
+			if (err_open) CloseHandle(err_r);
+			out->duration_ms = monotonic_ms_since(t0);
+			tail_finalize(&out_t, out->stdout_tail, sizeof out->stdout_tail);
+			tail_finalize(&err_t, out->stderr_tail, sizeof out->stderr_tail);
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			if (owns_job) CloseHandle(job);
+			return EXEC_ERR_INTERNAL;
+		}
 
 		DWORD wr = WaitForSingleObject(pi.hProcess, 200);
 		if (wr == WAIT_OBJECT_0) {

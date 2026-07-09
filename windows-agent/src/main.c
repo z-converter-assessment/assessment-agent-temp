@@ -280,7 +280,7 @@ int agent_run(void)
 			        worker ? "enabled" : "init failed — publish-only",
 			        wcfg.queue_name);
 		} else {
-			fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS 미설정)\n");
+			fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS unset)\n");
 		}
 	}
 

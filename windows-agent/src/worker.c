@@ -417,11 +417,6 @@ static void replay_pending_results(struct worker_ctx_s *ctx)
 	FindClose(h);
 }
 
-static char *build_result_json(const struct worker_ctx_s *ctx,
-                               const char *task_id, const char *status,
-                               const char *failure_reason,
-                               int has_exit_code, int exit_code, long duration_ms,
-                               const char *stdout_tail, const char *stderr_tail);
 
 static void recover_stale_running(struct worker_ctx_s *ctx)
 {

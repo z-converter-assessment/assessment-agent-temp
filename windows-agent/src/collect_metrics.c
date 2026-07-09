@@ -277,7 +277,7 @@ static void metrics_collect_network(cJSON *root)
 				if (r->Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
 				if (r->OperStatus != IfOperStatusUp) continue;
 				if (r->InterfaceAndOperStatusFlags.FilterInterface) continue;
-				char alias[256]; WideCharToMultiByte(CP_UTF8,0,r->Alias,-1,alias,sizeof alias,NULL,NULL);
+				char alias[256] = {0}; WideCharToMultiByte(CP_UTF8,0,r->Alias,-1,alias,sizeof alias,NULL,NULL);
 				char id[80]; mac_to_devid(r->PhysicalAddress, r->PhysicalAddressLength, alias, id, sizeof id);
 				cJSON *p;
 				wire_point_dev_dir(m_io, id, "receive", (double)r->InOctets);
@@ -337,7 +337,7 @@ static void metrics_collect_filesystem(cJSON *root)
 	if (len == 0 || len > 256) return;
 	for (wchar_t *p = drives; *p; p += wcslen(p) + 1) {
 		if (GetDriveTypeW(p) != DRIVE_FIXED) continue;
-		char mount[16]; WideCharToMultiByte(CP_UTF8, 0, p, -1, mount, sizeof mount, NULL, NULL);
+		char mount[16] = {0}; WideCharToMultiByte(CP_UTF8, 0, p, -1, mount, sizeof mount, NULL, NULL);
 		size_t ml = strlen(mount); if (ml && mount[ml-1] == '\\') mount[ml-1] = '\0';
 		ULARGE_INTEGER avail, total, tfree;
 		if (!GetDiskFreeSpaceExW(p, &avail, &total, &tfree)) continue;

@@ -181,7 +181,7 @@ static cJSON *inv_collect_services(void)
 		ENUM_SERVICE_STATUS_PROCESSW *es = (ENUM_SERVICE_STATUS_PROCESSW *)buf;
 		for (DWORD i = 0; i < services_returned; i++) {
 			if (es[i].ServiceStatusProcess.dwCurrentState != SERVICE_RUNNING) continue;
-			char name[256];
+			char name[256] = {0};
 			WideCharToMultiByte(CP_UTF8, 0, es[i].lpServiceName, -1,
 			                    name, sizeof name, NULL, NULL);
 			cJSON *o = cJSON_CreateObject();
@@ -447,7 +447,7 @@ static cJSON *inv_collect_block_devices(void)
 	HANDLE fv = FindFirstVolumeW(vol, MAX_PATH);
 	if (fv != INVALID_HANDLE_VALUE) {
 		do {
-			char volu[160]; WideCharToMultiByte(CP_UTF8, 0, vol, -1, volu, sizeof volu, NULL, NULL);
+			char volu[160] = {0}; WideCharToMultiByte(CP_UTF8, 0, vol, -1, volu, sizeof volu, NULL, NULL);
 			char guid[96] = {0}; char *b = strchr(volu, '{');
 			if (b) { char *e = strchr(b, '}'); if (e) { int n = (int)(e - b + 1); if (n < (int)sizeof guid) { memcpy(guid, b, n); guid[n] = '\0'; } } }
 			char idfull[128];
@@ -500,7 +500,7 @@ static cJSON *inv_collect_net_interfaces(void)
 	for (IP_ADAPTER_ADDRESSES *p = aa; p; p = p->Next) {
 		if (p->OperStatus != IfOperStatusUp) continue;
 		if (p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-		char ifname[256]; WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, ifname, sizeof ifname, NULL, NULL);
+		char ifname[256] = {0}; WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, ifname, sizeof ifname, NULL, NULL);
 		char fb[32]; snprintf(fb, sizeof fb, "if%lu", (unsigned long)p->IfIndex);
 		char idfull[80]; mac_to_devid(p->PhysicalAddress, p->PhysicalAddressLength, fb, idfull, sizeof idfull);
 		cJSON *o = cJSON_CreateObject();

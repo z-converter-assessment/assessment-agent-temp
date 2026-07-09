@@ -163,7 +163,7 @@ static void metrics_collect_memory(cJSON *root)
 	wire_metric_scalar(ns, "memory.commit.usage", "gauge", "By", committed >= 0, (double)committed * 1024.0);
 	wire_metric_scalar(ns, "memory.commit.limit", "gauge", "By", commitlim >= 0, (double)commitlim * 1024.0);
 	wire_metric_scalar(ns, "memory.hardware_corrupted", "gauge", "By", hwcorrupt >= 0, (double)hwcorrupt * 1024.0);
-	if (mi) free(mi);
+	free(mi);
 
 	/* vmstat: oom_kill(4.13+) + swap in/out + major fault. */
 	char *vm = read_file_all("/proc/vmstat");
