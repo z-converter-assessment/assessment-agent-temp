@@ -483,6 +483,64 @@ static cJSON *inv_collect_block_devices(void)
 		} while (FindNextVolumeW(fv, vol, MAX_PATH));
 		FindVolumeClose(fv);
 	}
+
+	/* pagefile(swap 노드): NtQuerySystemInformation SystemPageFileInformation(class 18). Linux swap 노드와
+	 * 필드셋 패리티. 관측 전용(레지스트리 미변경). id/id_type=null(볼륨 GUID 아닌 파일). 없으면 미발행. */
+	{
+		/* UNICODE_STRING(PageFileName)을 raw 필드로 인라인 — winternl.h 미포함 회피. */
+		typedef struct _AGENT_PAGEFILE_INFO {
+			ULONG  NextEntryOffset;
+			ULONG  TotalSize;      /* pages */
+			ULONG  TotalInUse;
+			ULONG  PeakUsage;
+			USHORT NameLength;     /* bytes */
+			USHORT NameMaxLength;
+			PWSTR  NameBuffer;
+		} AGENT_PAGEFILE_INFO;
+		typedef LONG (WINAPI *NQSI)(ULONG, PVOID, ULONG, PULONG);
+		HMODULE nt = GetModuleHandleA("ntdll.dll");
+		NQSI f = nt ? (NQSI)(void *)GetProcAddress(nt, "NtQuerySystemInformation") : NULL;
+		if (f) {
+			ULONG cap = 4096, ret = 0;
+			BYTE *buf = (BYTE *)malloc(cap);
+			if (buf) {
+				LONG st = f(18, buf, cap, &ret);
+				if (st == (LONG)0xC0000004UL && ret > cap) {   /* LENGTH_MISMATCH -> 동적 확장 */
+					BYTE *nb = (BYTE *)realloc(buf, ret);
+					if (nb) { buf = nb; cap = ret; st = f(18, buf, cap, &ret); }
+				}
+				if (st == 0 && ret >= sizeof(AGENT_PAGEFILE_INFO)) {
+					SYSTEM_INFO si; GetSystemInfo(&si);
+					DWORD page = si.dwPageSize ? si.dwPageSize : 4096;
+					BYTE *p = buf;
+					for (;;) {
+						AGENT_PAGEFILE_INFO *pf = (AGENT_PAGEFILE_INFO *)p;
+						long long size = (long long)pf->TotalSize * (long long)page;
+						char path[300] = {0};
+						if (pf->NameBuffer && pf->NameLength)
+							WideCharToMultiByte(CP_UTF8, 0, pf->NameBuffer,
+							                    pf->NameLength / 2, path, sizeof path - 1, NULL, NULL);
+						const char *disp = path;                       /* \??\C:\pagefile.sys -> C:\pagefile.sys */
+						if (strncmp(disp, "\\??\\", 4) == 0) disp += 4;
+						const char *base = strrchr(disp, '\\'); base = base ? base + 1 : disp;
+						cJSON *o = cJSON_CreateObject();
+						cJSON_AddStringToObject(o, "name", base[0] ? base : "pagefile");
+						cJSON_AddStringToObject(o, "type", "swap");
+						cJSON_AddNumberToObject(o, "size_bytes", (double)size);
+						cJSON_AddNullToObject(o, "fstype");
+						if (disp[0]) cJSON_AddStringToObject(o, "mountpoint", disp); else cJSON_AddNullToObject(o, "mountpoint");
+						cJSON_AddNullToObject(o, "parent");
+						cJSON_AddNullToObject(o, "id");
+						cJSON_AddNullToObject(o, "id_type");
+						cJSON_AddItemToArray(arr, o);
+						if (!pf->NextEntryOffset) break;
+						p += pf->NextEntryOffset;
+					}
+				}
+				free(buf);
+			}
+		}
+	}
 	return arr;
 }
 
