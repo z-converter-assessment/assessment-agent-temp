@@ -26,6 +26,24 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 
 빌드 방법과 툴체인 제약은 [docs/BUILD.md](../docs/BUILD.md).
 
+### collect 소스 구성 + 코드 컨벤션 (신규 수집 코드는 이 규칙을 따른다)
+
+수집기는 양 트리 대칭으로 4계층 파일 + 내부 헤더로 나눈다. 빌드는 `wildcard src/*.c`라 파일 추가 시 Makefile 수정 불요.
+
+| 파일 | 담당 | 링크 |
+| --- | --- | --- |
+| collect_model.c | wire 프리미티브 + envelope + identity(machine/composite/agent/cloud/mac) | 최하층 |
+| collect_util.c | 파싱 유틸(proc/sysfs, mounts, device-id, net, perflib/NtQuery/IOCTL 등) | 최하층 |
+| collect_metrics.c | system.* 수집기 + collect_metrics_payload + build_error_payload | model+util 의존 |
+| collect_inventory.c | os 서술자 + services/listen_ports + block_devices/net_interfaces + collect_inventory_payload | model+util 의존 |
+| include/collect_internal.h | collect_*.c 공용 내부 선언(model+util) + 공유 struct/매크로 | 공개 API 는 collect.h |
+
+- 계층 규칙: metrics 와 inventory 는 서로 호출하지 않는다. 둘 다 model+util 만 의존(단방향). 두 곳에서 쓰는 헬퍼는 util(공유 파싱)이나 model 로 올린다. 공개 API 만 collect.h, 파일간 공유 내부 심볼은 non-static + collect_internal.h 선언.
+- 네이밍 스킴(양 트리 통일): wire 프리미티브 `wire_*`(wire_ns/wire_metric/wire_point/wire_point_attr/wire_point_value/wire_point_null/wire_metric_scalar/wire_add_envelope), metrics 수집기 `metrics_collect_*`, inventory 수집기 `inv_collect_*`. 파싱 헬퍼는 서술적 이름 유지(disk_device_id 등).
+- datapoint 발행: device(+direction)+value 패턴은 `wire_point_dev_dir(metric, device, direction, value)` 한 줄로. 단일값은 `wire_metric_scalar(ns, name, type, unit, have, value)`. 조건부 null 등 헬퍼에 안 맞는 경우만 wire_point + wire_point_attr + wire_point_value/wire_point_null 를 쓴다.
+- 코드 스타일: 한 줄에 한 문장(세미콜론으로 여러 문장 뭉치지 않는다). 3회 이상 반복되는 발행 패턴은 헬퍼로 추출. collect 계층 주석은 한국어(다이어그램 제외).
+- 2트리 대칭: 파일 레이아웃/네이밍/필드셋을 Linux(`src/`)와 Windows(`windows-agent/src/`) 동일하게 유지. 한쪽에 신호를 추가하면 다른 쪽도 실측 발행하거나 측정불가 null 로 필드셋을 맞춘다(예: memory.edac 는 Windows 도 null 2점 발행).
+
 ## 불변식 (반드시 준수)
 
 ### wire 계약과 null 의미론
