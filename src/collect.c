@@ -2444,6 +2444,106 @@ static void collect_v2_system_disk(cJSON *root)
 	free(content);
 }
 
+/* P2 system.cpu: /proc/stat per-cpu jiffies(->s) + run_queue/blocked + logical.count. */
+static void collect_v2_system_cpu(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.cpu");
+	cJSON *m_time = metric_new(ns, "cpu.time", "counter", "s");
+	long clk = sysconf(_SC_CLK_TCK);
+	if (clk <= 0) clk = 100;
+	static const char *const st[8] = { "user","nice","system","idle","iowait","irq","softirq","steal" };
+
+	char *content = read_file_all("/proc/stat");
+	long procs_running = -1, procs_blocked = -1;
+	int ncpu = 0;
+	if (content) {
+		char *save = NULL;
+		for (char *line = strtok_r(content, "\n", &save); line;
+		     line = strtok_r(NULL, "\n", &save)) {
+			if (strncmp(line, "cpu", 3) == 0 && line[3] >= '0' && line[3] <= '9') {
+				int idx = (int)strtol(line + 3, NULL, 10);
+				long c[8] = { 0 };
+				const char *sp = line;
+				while (*sp && *sp != ' ') sp++;   /* skip "cpuN" */
+				int cn = sscanf(sp, "%ld %ld %ld %ld %ld %ld %ld %ld",
+				                &c[0],&c[1],&c[2],&c[3],&c[4],&c[5],&c[6],&c[7]);
+				if (cn < 4) continue;
+				ncpu++;
+				char idxs[16]; snprintf(idxs, sizeof idxs, "%d", idx);
+				for (int k = 0; k < cn; k++) {
+					cJSON *p = point_new(m_time);
+					point_attr(p, "cpu", idxs); point_attr(p, "state", st[k]);
+					point_value(p, (double)c[k] / (double)clk);
+				}
+			} else if (strncmp(line, "procs_running ", 14) == 0) {
+				procs_running = strtol(line + 14, NULL, 10);
+			} else if (strncmp(line, "procs_blocked ", 14) == 0) {
+				procs_blocked = strtol(line + 14, NULL, 10);
+			}
+		}
+		free(content);
+	}
+	metric_scalar(ns, "cpu.run_queue", "gauge", "tasks", procs_running >= 0, (double)procs_running);
+	/* run_queue point 에 source 라벨 */
+	{ cJSON *rq = cJSON_GetObjectItemCaseSensitive(ns, "cpu.run_queue");
+	  cJSON *pts = cJSON_GetObjectItemCaseSensitive(rq, "points");
+	  if (cJSON_GetArraySize(pts)) point_attr(cJSON_GetArrayItem(pts,0), "source", "procs_running"); }
+	metric_scalar(ns, "cpu.blocked", "gauge", "tasks", procs_blocked >= 0, (double)procs_blocked);
+	{ cJSON *bq = cJSON_GetObjectItemCaseSensitive(ns, "cpu.blocked");
+	  cJSON *pts = cJSON_GetObjectItemCaseSensitive(bq, "points");
+	  if (cJSON_GetArraySize(pts)) point_attr(cJSON_GetArrayItem(pts,0), "source", "procs_blocked"); }
+	metric_scalar(ns, "cpu.logical.count", "gauge", "cpu", ncpu > 0, (double)ncpu);
+}
+
+/* P2 system.memory + paging: /proc/meminfo + /proc/vmstat. base 단위 By. */
+static void collect_v2_system_memory(cJSON *root)
+{
+	char *mi = read_file_all("/proc/meminfo");
+	cJSON *ns = ns_get(root, "system.memory");
+	cJSON *usage = metric_new(ns, "memory.usage", "gauge", "By");
+	long total = mi ? meminfo_get_kb(mi, "MemTotal") : -1;
+	long avail = mi ? meminfo_get_kb(mi, "MemAvailable") : -1;
+	long freek = mi ? meminfo_get_kb(mi, "MemFree") : -1;
+	long cached = mi ? meminfo_get_kb(mi, "Cached") : -1;
+	long buffers = mi ? meminfo_get_kb(mi, "Buffers") : -1;
+	long committed = mi ? meminfo_get_kb(mi, "Committed_AS") : -1;
+	long commitlim = mi ? meminfo_get_kb(mi, "CommitLimit") : -1;
+	long hwcorrupt = mi ? meminfo_get_kb(mi, "HardwareCorrupted") : -1;
+	struct { const char *st; long kb; } states[] = {
+		{ "free", freek }, { "cached", cached }, { "buffers", buffers }, { "available", avail },
+	};
+	for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+		cJSON *p = point_new(usage); point_attr(p, "state", states[i].st);
+		if (states[i].kb >= 0) point_value(p, (double)states[i].kb * 1024.0); else point_value_null(p);
+	}
+	metric_scalar(ns, "memory.limit",        "gauge", "By", total >= 0,     (double)total * 1024.0);
+	metric_scalar(ns, "memory.commit.usage", "gauge", "By", committed >= 0, (double)committed * 1024.0);
+	metric_scalar(ns, "memory.commit.limit", "gauge", "By", commitlim >= 0, (double)commitlim * 1024.0);
+	metric_scalar(ns, "memory.hardware_corrupted", "gauge", "By", hwcorrupt >= 0, (double)hwcorrupt * 1024.0);
+	if (mi) free(mi);
+
+	/* vmstat: oom_kill(4.13+) + swap in/out + major fault. */
+	char *vm = read_file_all("/proc/vmstat");
+	long oom = -1, pin = -1, pout = -1, pmaj = -1;
+	if (vm) {
+		char *save = NULL;
+		for (char *line = strtok_r(vm, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			if      (!strncmp(line, "oom_kill ", 9))    oom  = strtol(line + 9, NULL, 10);
+			else if (!strncmp(line, "pswpin ", 7))      pin  = strtol(line + 7, NULL, 10);
+			else if (!strncmp(line, "pswpout ", 8))     pout = strtol(line + 8, NULL, 10);
+			else if (!strncmp(line, "pgmajfault ", 11)) pmaj = strtol(line + 11, NULL, 10);
+		}
+		free(vm);
+	}
+	metric_scalar(ns, "memory.oom_kill", "counter", "events", oom >= 0, (double)oom);
+
+	cJSON *pns = ns_get(root, "system.paging");
+	cJSON *po = metric_new(pns, "paging.operations", "counter", "operations");
+	if (pin >= 0)  { cJSON *p = point_new(po); point_attr(p, "direction", "in");  point_value(p, (double)pin); }
+	if (pout >= 0) { cJSON *p = point_new(po); point_attr(p, "direction", "out"); point_value(p, (double)pout); }
+	if (pmaj >= 0) { cJSON *p = point_new(po); point_attr(p, "direction", "in"); point_attr(p, "type", "major"); point_value(p, (double)pmaj); }
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -2452,10 +2552,9 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	add_common_metadata(root, "metrics", machine_id, agent_version);
 	cJSON_AddNumberToObject(root, "collection_interval_sec", agent_interval_sec());
 
-	/* P1: system.disk 채움. cpu/memory/network 는 후속 페이즈(스키마상 null 허용, 키만 필수). */
-	cJSON_AddNullToObject(root, "system.cpu");
-	cJSON_AddNullToObject(root, "system.memory");
-	cJSON_AddNullToObject(root, "system.network");
+	collect_v2_system_cpu(root);
+	collect_v2_system_memory(root);   /* + system.paging */
+	cJSON_AddNullToObject(root, "system.network");   /* P3 */
 	collect_v2_system_disk(root);
 
 	return root;

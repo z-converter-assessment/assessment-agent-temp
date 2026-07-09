@@ -125,6 +125,13 @@ static void point_attr(cJSON *point, const char *k, const char *v)
 }
 static void point_value(cJSON *point, double v) { cJSON_AddNumberToObject(point, "value", v); }
 static void point_value_null(cJSON *point) { cJSON_AddNullToObject(point, "value"); }
+static void metric_scalar_win(cJSON *ns, const char *name, const char *type,
+                              const char *unit, int have, double v)
+{
+	cJSON *m = metric_new(ns, name, type, unit);
+	cJSON *p = point_new(m);
+	if (have) point_value(p, v); else point_value_null(p);
+}
 
 static void add_common_metadata(cJSON *root, const char *msg_type,
                                 const char *machine_id, const char *agent_version)
@@ -1617,6 +1624,125 @@ static int agent_interval_sec(void)
 	return n > 0 ? n : 60;
 }
 
+/* P2 system.cpu: per-cpu = NtQuery(SystemProcessorPerformanceInformation, class 8) 동적버퍼(L2, 고코어 무음드롭 방지).
+ * run_queue = perflib System\Processor Queue Length. logical.count = GetNativeSystemInfo. blocked = Windows null. */
+static void collect_v2_system_cpu(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.cpu");
+	cJSON *m_time = metric_new(ns, "cpu.time", "counter", "s");
+	SYSTEM_INFO si; GetNativeSystemInfo(&si);
+	DWORD ncpu = si.dwNumberOfProcessors;
+
+	typedef LONG (WINAPI *NQSI)(ULONG, PVOID, ULONG, PULONG);
+	HMODULE nt = GetModuleHandleA("ntdll.dll");
+	NQSI f = nt ? (NQSI)(void *)GetProcAddress(nt, "NtQuerySystemInformation") : NULL;
+	if (f) {
+		ULONG cap = ncpu * 64 + 512, ret = 0;
+		BYTE *buf = (BYTE *)malloc(cap);
+		if (buf) {
+			LONG st = f(8, buf, cap, &ret);
+			if (st == (LONG)0xC0000004UL && ret > cap) {   /* LENGTH_MISMATCH -> 동적 확장 */
+				BYTE *nb = (BYTE *)realloc(buf, ret);
+				if (nb) { buf = nb; cap = ret; st = f(8, buf, cap, &ret); }
+			}
+			if (st == 0) {
+				/* 엔트리(x86): IdleTime(8) KernelTime(8) UserTime(8) DpcTime(8) InterruptTime(8) InterruptCount(4)+pad -> 48B. */
+				const size_t ENT = 48;
+				DWORD have = (DWORD)(ret / ENT);
+				if (have > ncpu) have = ncpu;
+				for (DWORD i = 0; i < have; i++) {
+					BYTE *e = buf + (size_t)i * ENT;
+					long long idle   = *(long long *)(e + 0);
+					long long kernel = *(long long *)(e + 8);
+					long long user   = *(long long *)(e + 16);
+					long long sys    = kernel - idle;   /* Windows KernelTime 은 idle 포함 */
+					char idxs[16]; snprintf(idxs, sizeof idxs, "%lu", (unsigned long)i);
+					cJSON *p;
+					p = point_new(m_time); point_attr(p, "cpu", idxs); point_attr(p, "state", "user");   point_value(p, (double)user / 1e7);
+					p = point_new(m_time); point_attr(p, "cpu", idxs); point_attr(p, "state", "system"); point_value(p, (double)(sys < 0 ? 0 : sys) / 1e7);
+					p = point_new(m_time); point_attr(p, "cpu", idxs); point_attr(p, "state", "idle");   point_value(p, (double)idle / 1e7);
+				}
+			}
+			free(buf);
+		}
+	}
+
+	/* run_queue = perflib System\Processor Queue Length. */
+	int have_rq = 0; unsigned long long rq = 0;
+	DWORD i_sys = perf_index("System");
+	if (i_sys) {
+		char vn[16]; snprintf(vn, sizeof vn, "%lu", (unsigned long)i_sys);
+		BYTE *pb = perf_query(vn);
+		RegCloseKey(HKEY_PERFORMANCE_DATA);
+		if (pb) {
+			PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)pb;
+			PERF_OBJECT_TYPE *o = perf_object(db, i_sys);
+			if (o && o->NumInstances == PERF_NO_INSTANCES) {
+				PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)o + o->DefinitionLength);
+				PERF_COUNTER_DEFINITION *c = perf_counter(o, perf_index("Processor Queue Length"));
+				if (c) { rq = perf_read(cb, c); have_rq = 1; }
+			}
+			free(pb);
+		}
+	}
+	cJSON *m_rq = metric_new(ns, "cpu.run_queue", "gauge", "tasks");
+	{ cJSON *p = point_new(m_rq); point_attr(p, "source", "processor_queue");
+	  if (have_rq) point_value(p, (double)rq); else point_value_null(p); }
+	/* blocked: Windows 개념 없음 -> null. */
+	cJSON *m_bl = metric_new(ns, "cpu.blocked", "gauge", "tasks");
+	point_value_null(point_new(m_bl));
+	cJSON *m_lc = metric_new(ns, "cpu.logical.count", "gauge", "cpu");
+	point_value(point_new(m_lc), (double)ncpu);
+}
+
+/* P2 system.memory + paging: GlobalMemoryStatusEx + perflib Memory(commit/pages). */
+static void collect_v2_system_memory(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.memory");
+	cJSON *usage = metric_new(ns, "memory.usage", "gauge", "By");
+	MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+	int okmem = GlobalMemoryStatusEx(&ms);
+	long long freek = query_free_kb();   /* 진짜 free(NT6+), 실패 -1 */
+	{ cJSON *p = point_new(usage); point_attr(p, "state", "available");
+	  if (okmem) point_value(p, (double)ms.ullAvailPhys); else point_value_null(p); }
+	{ cJSON *p = point_new(usage); point_attr(p, "state", "free");
+	  if (freek >= 0) point_value(p, (double)freek * 1024.0); else point_value_null(p); }
+	metric_scalar_win(ns, "memory.limit", "gauge", "By", okmem, (double)ms.ullTotalPhys);
+
+	/* commit + paging: perflib Memory (단일 인스턴스). */
+	int have_cu = 0, have_cl = 0, have_pin = 0, have_pout = 0;
+	unsigned long long cu = 0, cl = 0, pin = 0, pout = 0;
+	DWORD i_mem = perf_index("Memory");
+	if (i_mem) {
+		char vn[16]; snprintf(vn, sizeof vn, "%lu", (unsigned long)i_mem);
+		BYTE *pb = perf_query(vn);
+		RegCloseKey(HKEY_PERFORMANCE_DATA);
+		if (pb) {
+			PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)pb;
+			PERF_OBJECT_TYPE *o = perf_object(db, i_mem);
+			if (o && o->NumInstances == PERF_NO_INSTANCES) {
+				PERF_COUNTER_BLOCK *cb = (PERF_COUNTER_BLOCK *)((BYTE *)o + o->DefinitionLength);
+				PERF_COUNTER_DEFINITION *c;
+				if ((c = perf_counter(o, perf_index("Committed Bytes"))))   { cu = perf_read(cb, c); have_cu = 1; }
+				if ((c = perf_counter(o, perf_index("Commit Limit"))))      { cl = perf_read(cb, c); have_cl = 1; }
+				if ((c = perf_counter(o, perf_index("Pages Input/sec"))))   { pin = perf_read(cb, c); have_pin = 1; }
+				if ((c = perf_counter(o, perf_index("Pages Output/sec"))))  { pout = perf_read(cb, c); have_pout = 1; }
+			}
+			free(pb);
+		}
+	}
+	metric_scalar_win(ns, "memory.commit.usage", "gauge", "By", have_cu, (double)cu);
+	metric_scalar_win(ns, "memory.commit.limit", "gauge", "By", have_cl, (double)cl);
+	/* oom_kill/hardware_corrupted: Windows 개념 없음 -> null(WHEA 는 P5). */
+	metric_scalar_win(ns, "memory.oom_kill", "counter", "events", 0, 0);
+	metric_scalar_win(ns, "memory.hardware_corrupted", "gauge", "By", 0, 0);
+
+	cJSON *pns = ns_get(root, "system.paging");
+	cJSON *po = metric_new(pns, "paging.operations", "counter", "operations");
+	if (have_pin)  { cJSON *p = point_new(po); point_attr(p, "direction", "in");  point_value(p, (double)pin); }
+	if (have_pout) { cJSON *p = point_new(po); point_attr(p, "direction", "out"); point_value(p, (double)pout); }
+}
+
 /* v2 system.disk: throughput=NtQuery(시스템 전역·diskperf 독립·단조, device PhysicalDrive0),
  * saturation(io_time/operation_time/pending)=perflib PhysicalDisk per-disk + 유효성 게이트(raw!=0/idle>0, 가짜0 금지).
  * NOTE(accept 게이트): perflib counter-type 수식(% Idle Time=100ns 역산, Avg.Disk sec=PERF_AVERAGE_TIMER raw/PerfFreq)의
@@ -1630,13 +1756,15 @@ static void collect_v2_system_disk(cJSON *root)
 	cJSON *m_opt = metric_new(ns, "disk.operation_time", "counter", "s");
 	cJSON *m_pnd = metric_new(ns, "disk.pending_operations", "gauge", "operations");
 
+	/* NtQuery 는 시스템 전역 집계(I/O 매니저) — 물리 디스크별 아님. perflib per-disk(PhysicalDriveN)와
+	 * device 키 충돌 방지 위해 'aggregate:system'. await 는 perflib per-disk operation_time/operations 로 페어. */
 	unsigned long long rop = 0, wop = 0, rby = 0, wby = 0;
 	if (query_system_io(&rop, &wop, &rby, &wby)) {
 		cJSON *p;
-		p = point_new(m_io);  point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "read");  point_value(p, (double)rby);
-		p = point_new(m_io);  point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "write"); point_value(p, (double)wby);
-		p = point_new(m_ops); point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "read");  point_value(p, (double)rop);
-		p = point_new(m_ops); point_attr(p, "device", "name:PhysicalDrive0"); point_attr(p, "direction", "write"); point_value(p, (double)wop);
+		p = point_new(m_io);  point_attr(p, "device", "aggregate:system"); point_attr(p, "direction", "read");  point_value(p, (double)rby);
+		p = point_new(m_io);  point_attr(p, "device", "aggregate:system"); point_attr(p, "direction", "write"); point_value(p, (double)wby);
+		p = point_new(m_ops); point_attr(p, "device", "aggregate:system"); point_attr(p, "direction", "read");  point_value(p, (double)rop);
+		p = point_new(m_ops); point_attr(p, "device", "aggregate:system"); point_attr(p, "direction", "write"); point_value(p, (double)wop);
 	}
 
 	DWORD i_pd = perf_index("PhysicalDisk");
@@ -1646,7 +1774,6 @@ static void collect_v2_system_disk(cJSON *root)
 	RegCloseKey(HKEY_PERFORMANCE_DATA);
 	if (!buf) return;
 	PERF_DATA_BLOCK *db = (PERF_DATA_BLOCK *)buf;
-	long long perf_time = db->PerfTime100nSec.QuadPart;
 	long long perf_freq = db->PerfFreq.QuadPart;
 	PERF_OBJECT_TYPE *o = perf_object(db, i_pd);
 	if (o && o->NumInstances > 0) {
@@ -1664,10 +1791,14 @@ static void collect_v2_system_disk(cJSON *root)
 			if (drive >= 0) {
 				char dev[32]; snprintf(dev, sizeof dev, "name:PhysicalDrive%d", drive);
 				cJSON *p;
+				/* io_time(busy s) = uptime(부팅기준 s) - idle(% Idle Time raw, 부팅기준 100ns->s). idle 누적기는
+				 * PDH % Idle Time raw 와 동일값임을 값검증에서 확인(idx=1482, agent idle==PDH RawValue, Δ 일치).
+				 * uptime 기준이라 재부팅 시 idle 과 함께 0 리셋 -> 엔진이 counter reset 로 깨끗이 감지(1601 기준
+				 * PerfTime100nSec 는 절대값 425년 + 재부팅 시 spike 라 안 씀). 게이트: idle>0(diskperf 수집중). */
 				unsigned long long idle = c_idle ? perf_read(cb, c_idle) : 0;
 				p = point_new(m_iot); point_attr(p, "device", dev);
-				if (c_idle && idle > 0 && perf_time > 0) {
-					double busy = ((double)perf_time - (double)idle) / 1e7;
+				if (c_idle && idle > 0) {
+					double busy = (double)monotonic_ms() / 1000.0 - (double)idle / 1e7;
 					point_value(p, busy < 0 ? 0.0 : busy);
 				} else point_value_null(p);
 				p = point_new(m_opt); point_attr(p, "device", dev); point_attr(p, "direction", "read");
@@ -1694,10 +1825,9 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	add_common_metadata(m, "metrics", machine_id, agent_version);
 	cJSON_AddNumberToObject(m, "collection_interval_sec", agent_interval_sec());
 
-	/* P1: system.disk 채움. cpu/memory/network 는 후속 페이즈(키만 필수, null 허용). */
-	cJSON_AddNullToObject(m, "system.cpu");
-	cJSON_AddNullToObject(m, "system.memory");
-	cJSON_AddNullToObject(m, "system.network");
+	collect_v2_system_cpu(m);
+	collect_v2_system_memory(m);   /* + system.paging */
+	cJSON_AddNullToObject(m, "system.network");   /* P3 */
 	collect_v2_system_disk(m);
 
 	return m;
