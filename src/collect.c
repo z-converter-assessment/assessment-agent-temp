@@ -1864,6 +1864,9 @@ static cJSON *collect_listen_ports(void)
 	return arr;
 }
 
+static cJSON *collect_v2_block_devices(void);
+static cJSON *collect_v2_net_interfaces(void);
+
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -1890,9 +1893,8 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	cJSON_AddItemToObject(root, "listen_ports", or_empty_array(collect_listen_ports()));
 	cJSON_AddItemToObject(root, "ip_external",  collect_external_ip());
 
-	/* v2 정규화 노드: 실내용은 P4(block_devices/net_interfaces). P1 은 required 배열 스텁. */
-	cJSON_AddItemToObject(root, "block_devices",  cJSON_CreateArray());
-	cJSON_AddItemToObject(root, "net_interfaces", cJSON_CreateArray());
+	cJSON_AddItemToObject(root, "block_devices",  or_empty_array(collect_v2_block_devices()));
+	cJSON_AddItemToObject(root, "net_interfaces", or_empty_array(collect_v2_net_interfaces()));
 
 	if (!ok) {
 		cJSON_Delete(root);
@@ -2544,6 +2546,464 @@ static void collect_v2_system_memory(cJSON *root)
 	if (pmaj >= 0) { cJSON *p = point_new(po); point_attr(p, "direction", "in"); point_attr(p, "type", "major"); point_value(p, (double)pmaj); }
 }
 
+/* net device 안정키: MAC(mac:xx..) -> by-path(PCI 경로) -> name. '<scheme>:<value>'. */
+static void net_device_id(const char *iface, char *out, size_t outsz)
+{
+	char path[300], mac[64];
+	snprintf(path, sizeof path, "/sys/class/net/%s/address", iface);
+	if (read_sysfs_str(path, mac, sizeof mac) && strlen(mac) >= 17 &&
+	    strcmp(mac, "00:00:00:00:00:00") != 0) {
+		snprintf(out, outsz, "mac:%s", mac);
+		return;
+	}
+	snprintf(path, sizeof path, "/sys/class/net/%s/device", iface);
+	char lp[300];
+	ssize_t k = readlink(path, lp, sizeof lp - 1);
+	if (k > 0) {
+		lp[k] = '\0';
+		char *base = strrchr(lp, '/');
+		snprintf(out, outsz, "by-path:%s", base ? base + 1 : lp);
+		return;
+	}
+	snprintf(out, outsz, "name:%s", iface);
+}
+
+/* P3 system.network: /proc/net/dev per-iface(io/packets/errors/dropped) + link.speed(util 분모)
+ * + tcp.retransmits(전역) + conntrack. device attr=MAC 안정키. lo 제외. */
+static void collect_v2_system_network(cJSON *root)
+{
+	cJSON *ns   = ns_get(root, "system.network");
+	cJSON *m_io = metric_new(ns, "network.io",         "counter", "By");
+	cJSON *m_pk = metric_new(ns, "network.packets",    "counter", "packets");
+	cJSON *m_er = metric_new(ns, "network.errors",     "counter", "errors");
+	cJSON *m_dr = metric_new(ns, "network.dropped",    "counter", "packets");
+	cJSON *m_sp = metric_new(ns, "network.link.speed", "gauge",   "bit/s");
+
+	char *content = read_file_all("/proc/net/dev");
+	if (content) {
+		int line_no = 0; char *save = NULL;
+		for (char *line = strtok_r(content, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			if (++line_no <= 2) continue;
+			char *colon = strchr(line, ':'); if (!colon) continue;
+			*colon = '\0';
+			char *iface = line; while (*iface == ' ' || *iface == '\t') iface++;
+			if (strcmp(iface, "lo") == 0) continue;
+			long rb=0,rp=0,re=0,rd=0,tb=0,tp=0,te=0,td=0;
+			int n = sscanf(colon + 1, "%ld %ld %ld %ld %*d %*d %*d %*d %ld %ld %ld %ld",
+			               &rb,&rp,&re,&rd,&tb,&tp,&te,&td);
+			if (n < 8) continue;
+			char id[320]; net_device_id(iface, id, sizeof id);
+			cJSON *p;
+			p=point_new(m_io); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)rb);
+			p=point_new(m_io); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)tb);
+			p=point_new(m_pk); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)rp);
+			p=point_new(m_pk); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)tp);
+			p=point_new(m_er); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)re);
+			p=point_new(m_er); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)te);
+			p=point_new(m_dr); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)rd);
+			p=point_new(m_dr); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)td);
+			/* link.speed: /sys/class/net/<if>/speed(Mbps)->bit/s. virtio 부재/미지원 -> null(가짜 0 금지). */
+			char sp[300], spv[32]; snprintf(sp, sizeof sp, "/sys/class/net/%s/speed", iface);
+			p=point_new(m_sp); point_attr(p,"device",id);
+			if (read_sysfs_str(sp, spv, sizeof spv)) {
+				long mbps = strtol(spv, NULL, 10);
+				if (mbps > 0) point_value(p, (double)mbps * 1e6); else point_value_null(p);
+			} else point_value_null(p);
+		}
+		free(content);
+	}
+	long rt = snmp_tcp_retranssegs();
+	metric_scalar(ns, "network.tcp.retransmits", "counter", "segments", rt >= 0, (double)rt);
+	long ctc = -1, ctm = -1;
+	{ char *c = read_file_all("/proc/sys/net/netfilter/nf_conntrack_count"); if (c){ ctc=strtol(c,NULL,10); free(c);} }
+	{ char *c = read_file_all("/proc/sys/net/netfilter/nf_conntrack_max");   if (c){ ctm=strtol(c,NULL,10); free(c);} }
+	metric_scalar(ns, "network.conntrack.usage", "gauge", "entries", ctc >= 0, (double)ctc);
+	metric_scalar(ns, "network.conntrack.limit", "gauge", "entries", ctm >= 0, (double)ctm);
+}
+
+/* P3 system.pressure: PSI(4.20+) /proc/pressure/{cpu,memory,io}. stall.time(counter,s; total us->s,
+ * 14일 saturation canonical) + stall.ratio(gauge,1; avg10/60/300). 미지원 -> namespace null. */
+static void collect_v2_system_pressure(cJSON *root)
+{
+	static const struct { const char *path; const char *res; } psi[] = {
+		{ "/proc/pressure/cpu", "cpu" }, { "/proc/pressure/memory", "memory" }, { "/proc/pressure/io", "io" },
+	};
+	cJSON *ns = ns_get(root, "system.pressure");
+	cJSON *m_time  = metric_new(ns, "pressure.stall.time",  "counter", "s");
+	cJSON *m_ratio = metric_new(ns, "pressure.stall.ratio", "gauge",   "1");
+	int any = 0;
+	for (size_t i = 0; i < sizeof psi / sizeof psi[0]; i++) {
+		char *c = read_file_all(psi[i].path);
+		if (!c) continue;
+		any = 1;
+		char *save = NULL;
+		for (char *line = strtok_r(c, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			char scope[8] = {0}; double a10=0,a60=0,a300=0; long long total=0;
+			if (sscanf(line, "%7s avg10=%lf avg60=%lf avg300=%lf total=%lld", scope,&a10,&a60,&a300,&total) < 5) continue;
+			cJSON *p;
+			p=point_new(m_time); point_attr(p,"resource",psi[i].res); point_attr(p,"scope",scope); point_value(p,(double)total/1e6);
+			struct { const char *w; double v; } win[3] = {{"avg10",a10},{"avg60",a60},{"avg300",a300}};
+			for (int k=0;k<3;k++){ p=point_new(m_ratio); point_attr(p,"resource",psi[i].res); point_attr(p,"scope",scope); point_attr(p,"window",win[k].w); point_value(p, win[k].v/100.0); }
+		}
+		free(c);
+	}
+	if (!any) { cJSON_DeleteItemFromObject(root, "system.pressure"); cJSON_AddNullToObject(root, "system.pressure"); }
+}
+
+/* P4 system.filesystem: statvfs over 실 마운트. usage(gauge,By; used/free/reserved) + inodes(gauge,count). */
+static void collect_v2_system_filesystem(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.filesystem");
+	cJSON *m_use = metric_new(ns, "filesystem.usage",  "gauge", "By");
+	cJSON *m_ino = metric_new(ns, "filesystem.inodes", "gauge", "count");
+	size_t n = 0;
+	struct mount_entry *mounts = list_real_mounts(&n);
+	for (size_t i = 0; i < n; i++) {
+		struct statvfs st;
+		if (statvfs(mounts[i].mount, &st) != 0) continue;
+		double frsize = (double)st.f_frsize;
+		double total = (double)st.f_blocks * frsize;
+		double freeb = (double)st.f_bfree  * frsize;
+		double availb= (double)st.f_bavail * frsize;
+		cJSON *p;
+		p=point_new(m_use); point_attr(p,"mountpoint",mounts[i].mount); point_attr(p,"state","used");     point_value(p, total - freeb);
+		p=point_new(m_use); point_attr(p,"mountpoint",mounts[i].mount); point_attr(p,"state","free");     point_value(p, availb);
+		p=point_new(m_use); point_attr(p,"mountpoint",mounts[i].mount); point_attr(p,"state","reserved"); point_value(p, freeb - availb);
+		p=point_new(m_ino); point_attr(p,"mountpoint",mounts[i].mount); point_attr(p,"state","used");
+		if (st.f_files > 0) point_value(p, (double)(st.f_files - st.f_ffree)); else point_value_null(p);
+		p=point_new(m_ino); point_attr(p,"mountpoint",mounts[i].mount); point_attr(p,"state","free");
+		if (st.f_files > 0) point_value(p, (double)st.f_ffree); else point_value_null(p);
+	}
+	free_mount_entries(mounts, n);
+}
+
+/* P5 E축(disk): mdraid mismatch_cnt + ext4 errors_count. RAID 배열/fs 레벨 참조라 device 스킴 md:/name:. */
+static void collect_v2_disk_errors(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.disk");
+	cJSON *m_err = metric_new(ns, "disk.errors", "counter", "errors");
+	char val[64];
+	DIR *d = opendir("/sys/block");
+	if (d) {
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			if (strncmp(e->d_name, "md", 2) != 0) continue;
+			char pth[300]; snprintf(pth, sizeof pth, "/sys/block/%s/md/mismatch_cnt", e->d_name);
+			if (read_sysfs_str(pth, val, sizeof val)) {
+				cJSON *p = point_new(m_err);
+				char dev[80]; snprintf(dev, sizeof dev, "md:%s", e->d_name);
+				point_attr(p, "device", dev); point_attr(p, "type", "mismatch");
+				point_value(p, (double)strtoll(val, NULL, 10));
+			}
+		}
+		closedir(d);
+	}
+	d = opendir("/sys/fs/ext4");
+	if (d) {
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			if (e->d_name[0] == '.') continue;
+			char pth[300]; snprintf(pth, sizeof pth, "/sys/fs/ext4/%s/errors_count", e->d_name);
+			if (read_sysfs_str(pth, val, sizeof val)) {
+				cJSON *p = point_new(m_err);
+				char dev[80]; snprintf(dev, sizeof dev, "name:%s", e->d_name);
+				point_attr(p, "device", dev); point_attr(p, "type", "fs");
+				point_value(p, (double)strtoll(val, NULL, 10));
+			}
+		}
+		closedir(d);
+	}
+}
+
+/* P5 E축(memory): EDAC correctable/uncorrectable 누적. VM/가상칩셋은 EDAC 미노출 -> null(측정불가). */
+static void collect_v2_memory_errors(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.memory");
+	cJSON *m = metric_new(ns, "memory.edac", "counter", "errors");
+	long long ce = -1, ue = -1;
+	DIR *d = opendir("/sys/devices/system/edac/mc");
+	if (d) {
+		struct dirent *e; char val[64];
+		while ((e = readdir(d)) != NULL) {
+			if (strncmp(e->d_name, "mc", 2) != 0) continue;
+			char pth[320];
+			snprintf(pth, sizeof pth, "/sys/devices/system/edac/mc/%s/ce_count", e->d_name);
+			if (read_sysfs_str(pth, val, sizeof val)) { if (ce < 0) ce = 0; ce += strtoll(val, NULL, 10); }
+			snprintf(pth, sizeof pth, "/sys/devices/system/edac/mc/%s/ue_count", e->d_name);
+			if (read_sysfs_str(pth, val, sizeof val)) { if (ue < 0) ue = 0; ue += strtoll(val, NULL, 10); }
+		}
+		closedir(d);
+	}
+	cJSON *p;
+	p=point_new(m); point_attr(p,"type","correctable");   if (ce >= 0) point_value(p,(double)ce); else point_value_null(p);
+	p=point_new(m); point_attr(p,"type","uncorrectable"); if (ue >= 0) point_value(p,(double)ue); else point_value_null(p);
+}
+
+/* P6 system.cgroup: v2(unified) 우선 + v1 폴백. cpu throttling + memory usage/limit.
+ * fleet VM 은 대개 root cgroup(제한 없음) -> 있는 신호만 발행, 전무하면 namespace null. */
+static void collect_v2_system_cgroup(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.cgroup");
+	int any = 0;
+	char *cs = read_file_all("/sys/fs/cgroup/cpu.stat");           /* v2 */
+	if (!cs) cs = read_file_all("/sys/fs/cgroup/cpu/cpu.stat");    /* v1 */
+	if (cs) {
+		long long thr = -1, thr_usec = -1;
+		char *save = NULL;
+		for (char *line = strtok_r(cs, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			if      (!strncmp(line, "nr_throttled ", 13))   thr      = strtoll(line + 13, NULL, 10);
+			else if (!strncmp(line, "throttled_usec ", 15)) thr_usec = strtoll(line + 15, NULL, 10);
+			else if (!strncmp(line, "throttled_time ", 15)) thr_usec = strtoll(line + 15, NULL, 10) / 1000; /* v1 ns->us */
+		}
+		free(cs);
+		if (thr >= 0)      { metric_scalar(ns, "cgroup.cpu.throttled.count", "counter", "events", 1, (double)thr); any = 1; }
+		if (thr_usec >= 0) { metric_scalar(ns, "cgroup.cpu.throttled.time",  "counter", "s", 1, (double)thr_usec / 1e6); any = 1; }
+	}
+	{ char *c = read_file_all("/sys/fs/cgroup/memory.current");
+	  if (!c) c = read_file_all("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+	  if (c) { metric_scalar(ns, "cgroup.memory.usage", "gauge", "By", 1, (double)strtoll(c, NULL, 10)); free(c); any = 1; } }
+	{ char *c = read_file_all("/sys/fs/cgroup/memory.max");
+	  int v1 = 0; if (!c) { c = read_file_all("/sys/fs/cgroup/memory/memory.limit_in_bytes"); v1 = 1; }
+	  if (c) {
+		long long lim = strtoll(c, NULL, 10);
+		/* v2 "max"(무제한) / v1 초대형 sentinel 은 제한 없음 -> 생략. */
+		if (strncmp(c, "max", 3) != 0 && !(v1 && lim >= 0x7000000000000000LL))
+			{ metric_scalar(ns, "cgroup.memory.limit", "gauge", "By", 1, (double)lim); any = 1; }
+		free(c);
+	  } }
+	if (!any) { cJSON_DeleteItemFromObject(root, "system.cgroup"); cJSON_AddNullToObject(root, "system.cgroup"); }
+}
+
+/* id "scheme:value" -> id_type(scheme). block_device.id_type enum. */
+static const char *dev_id_type(const char *full)
+{
+	if (!strncmp(full, "dm:", 3))       return "dm";
+	if (!strncmp(full, "partuuid:", 9)) return "partuuid";
+	if (!strncmp(full, "wwid:", 5))     return "wwid";
+	if (!strncmp(full, "serial:", 7))   return "serial";
+	if (!strncmp(full, "by-path:", 8))  return "by-path";
+	if (!strncmp(full, "fsuuid:", 7))   return "fsuuid";
+	return "name";
+}
+static const char *dev_id_value(const char *full)
+{
+	const char *c = strchr(full, ':');
+	return c ? c + 1 : full;
+}
+
+/* 파티션 안정키: by-partuuid -> name. */
+static void part_device_id(const char *part, char *out, size_t outsz)
+{
+	DIR *d = opendir("/dev/disk/by-partuuid");
+	if (d) {
+		struct dirent *e; char lp[600], tgt[300];
+		while ((e = readdir(d))) {
+			if (e->d_name[0] == '.') continue;
+			snprintf(lp, sizeof lp, "/dev/disk/by-partuuid/%s", e->d_name);
+			ssize_t r = readlink(lp, tgt, sizeof tgt - 1);
+			if (r <= 0) continue;
+			tgt[r] = '\0';
+			const char *base = strrchr(tgt, '/'); base = base ? base + 1 : tgt;
+			if (strcmp(base, part) == 0) { snprintf(out, outsz, "partuuid:%s", e->d_name); closedir(d); return; }
+		}
+		closedir(d);
+	}
+	snprintf(out, outsz, "name:%s", part);
+}
+
+/* 슬레이브/PV 는 파티션일 수도 whole-disk 일 수도 -> 각각의 안정키로 해석. */
+static void resolve_block_id(const char *name, char *out, size_t outsz)
+{
+	char pth[320];
+	snprintf(pth, sizeof pth, "/sys/class/block/%s/partition", name);
+	if (access(pth, F_OK) == 0) part_device_id(name, out, outsz);
+	else                        disk_device_id(name, out, outsz);
+}
+
+/* /proc/mounts 에서 device basename 의 fstype/mountpoint. /dev/mapper 심볼릭은 realpath 로 dm-N 해석. */
+static int dev_mount_info(const char *name, char *fst, size_t fsz, char *mnt, size_t msz)
+{
+	FILE *f = fopen("/proc/mounts", "r");
+	if (!f) return 0;
+	char line[1200]; int found = 0;
+	while (fgets(line, sizeof line, f)) {
+		char src[300], m[300], t[80];
+		if (sscanf(line, "%299s %299s %79s", src, m, t) != 3) continue;
+		if (strncmp(src, "/dev/", 5) != 0) continue;
+		char rp[4100]; const char *base;
+		if (realpath(src, rp)) { base = strrchr(rp, '/'); base = base ? base + 1 : rp; }
+		else                   { base = strrchr(src, '/'); base = base ? base + 1 : src; }
+		if (strcmp(base, name) == 0) { snprintf(fst, fsz, "%s", t); snprintf(mnt, msz, "%s", m); found = 1; break; }
+	}
+	fclose(f);
+	return found;
+}
+
+static void bd_add(cJSON *arr, const char *name, const char *type, long long size,
+                   const char *fst, const char *mnt, const char *parent, const char *idfull)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "name", name);
+	cJSON_AddStringToObject(o, "type", type);
+	if (size >= 0) cJSON_AddNumberToObject(o, "size_bytes", (double)size); else cJSON_AddNullToObject(o, "size_bytes");
+	if (fst && *fst) cJSON_AddStringToObject(o, "fstype", fst); else cJSON_AddNullToObject(o, "fstype");
+	if (mnt && *mnt) cJSON_AddStringToObject(o, "mountpoint", mnt); else cJSON_AddNullToObject(o, "mountpoint");
+	if (parent) cJSON_AddStringToObject(o, "parent", parent); else cJSON_AddNullToObject(o, "parent");
+	cJSON_AddStringToObject(o, "id", dev_id_value(idfull));
+	cJSON_AddStringToObject(o, "id_type", dev_id_type(idfull));
+	cJSON_AddItemToArray(arr, o);
+}
+
+/* P4 block_devices: /sys/block whole-disk + partitions + dm(LVM/crypt/mpath)/md. parent=부모 id 값(복수면 노드 반복). swap=/proc/swaps. */
+static cJSON *collect_v2_block_devices(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	DIR *d = opendir("/sys/block");
+	if (d) {
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			const char *dev = e->d_name;
+			if (dev[0] == '.' || is_excluded_block_dev(dev)) continue;
+			char pth[320], v[256];
+			long long size = -1;
+			snprintf(pth, sizeof pth, "/sys/block/%s/size", dev);
+			if (read_sysfs_str(pth, v, sizeof v)) size = strtoll(v, NULL, 10) * 512;
+			char idfull[320]; disk_device_id(dev, idfull, sizeof idfull);
+			char dmuuid[256];
+			snprintf(pth, sizeof pth, "/sys/block/%s/dm/uuid", dev);
+			int is_dm = read_sysfs_str(pth, dmuuid, sizeof dmuuid);
+			int is_md = (strncmp(dev, "md", 2) == 0);
+			const char *type = "disk";
+			if (is_dm) {
+				if      (!strncmp(dmuuid, "LVM-", 4))   type = "lvm";
+				else if (!strncmp(dmuuid, "CRYPT-", 6)) type = "crypt";
+				else if (!strncmp(dmuuid, "mpath-", 6)) type = "mpath";
+				else                                     type = "dm";
+			} else if (is_md) type = "raid";
+			char fst[80] = {0}, mnt[300] = {0};
+			int hm = dev_mount_info(dev, fst, sizeof fst, mnt, sizeof mnt);
+			if (is_dm || is_md) {
+				/* parent = 각 슬레이브(PV/멤버)의 id 값. 복수면 노드 반복. */
+				char slp[320]; snprintf(slp, sizeof slp, "/sys/block/%s/slaves", dev);
+				DIR *sd = opendir(slp); int emitted = 0;
+				if (sd) {
+					struct dirent *se;
+					while ((se = readdir(sd))) {
+						if (se->d_name[0] == '.') continue;
+						char sid[320]; resolve_block_id(se->d_name, sid, sizeof sid);
+						char pval[300]; snprintf(pval, sizeof pval, "%s", dev_id_value(sid));
+						bd_add(arr, dev, type, size, hm ? fst : NULL, hm ? mnt : NULL, pval, idfull);
+						emitted = 1;
+					}
+					closedir(sd);
+				}
+				if (!emitted) bd_add(arr, dev, type, size, hm ? fst : NULL, hm ? mnt : NULL, NULL, idfull);
+			} else {
+				bd_add(arr, dev, "disk", size, hm ? fst : NULL, hm ? mnt : NULL, NULL, idfull);
+				/* 파티션 */
+				snprintf(pth, sizeof pth, "/sys/block/%s", dev);
+				DIR *pd = opendir(pth);
+				if (pd) {
+					struct dirent *pe;
+					while ((pe = readdir(pd))) {
+						if (strncmp(pe->d_name, dev, strlen(dev)) != 0) continue;
+						char ppth[420];
+						snprintf(ppth, sizeof ppth, "/sys/block/%s/%s/partition", dev, pe->d_name);
+						if (access(ppth, F_OK) != 0) continue;
+						long long psize = -1;
+						snprintf(ppth, sizeof ppth, "/sys/block/%s/%s/size", dev, pe->d_name);
+						if (read_sysfs_str(ppth, v, sizeof v)) psize = strtoll(v, NULL, 10) * 512;
+						char pidfull[320]; part_device_id(pe->d_name, pidfull, sizeof pidfull);
+						char pfst[80] = {0}, pmnt[300] = {0};
+						int phm = dev_mount_info(pe->d_name, pfst, sizeof pfst, pmnt, sizeof pmnt);
+						char parval[300]; snprintf(parval, sizeof parval, "%s", dev_id_value(idfull));
+						bd_add(arr, pe->d_name, "part", psize, phm ? pfst : NULL, phm ? pmnt : NULL, parval, pidfull);
+					}
+					closedir(pd);
+				}
+			}
+		}
+		closedir(d);
+	}
+	/* swap 노드(/proc/swaps): 파티션/파일 스왑. */
+	FILE *sw = fopen("/proc/swaps", "r");
+	if (sw) {
+		char line[600]; int ln = 0;
+		while (fgets(line, sizeof line, sw)) {
+			if (++ln == 1) continue;
+			char fname[300], stype[32]; long long ksize = -1;
+			if (sscanf(line, "%299s %31s %lld", fname, stype, &ksize) < 3) continue;
+			const char *base = strrchr(fname, '/'); base = base ? base + 1 : fname;
+			char idfull[320];
+			if (strcmp(stype, "partition") == 0) resolve_block_id(base, idfull, sizeof idfull);
+			else                                 snprintf(idfull, sizeof idfull, "name:%s", base);
+			bd_add(arr, base, "swap", ksize >= 0 ? ksize * 1024 : -1, "swap", "[SWAP]", NULL, idfull);
+		}
+		fclose(sw);
+	}
+	return arr;
+}
+
+/* P3 net_interfaces: /sys/class/net 열거 -> MAC id + kind + speed + addresses[](getifaddrs) + gateway(default route). */
+static cJSON *collect_v2_net_interfaces(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	cJSON *gw4 = build_default_gw_v4();
+	struct ifaddrs *ifap = NULL;
+	getifaddrs(&ifap);
+
+	DIR *d = opendir("/sys/class/net");
+	if (d) {
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			const char *iff = e->d_name;
+			if (iff[0] == '.' || strcmp(iff, "lo") == 0) continue;
+			char idfull[320]; net_device_id(iff, idfull, sizeof idfull);
+			const char *id_type = (!strncmp(idfull, "mac:", 4)) ? "mac"
+			                    : (!strncmp(idfull, "by-path:", 8)) ? "by-path" : "name";
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddStringToObject(o, "name", iff);
+			cJSON_AddStringToObject(o, "id", dev_id_value(idfull));
+			cJSON_AddStringToObject(o, "id_type", id_type);
+			cJSON_AddStringToObject(o, "kind", net_kind(iff));
+			char sp[320], spv[32];
+			snprintf(sp, sizeof sp, "/sys/class/net/%s/speed", iff);
+			if (read_sysfs_str(sp, spv, sizeof spv) && strtol(spv, NULL, 10) > 0)
+				cJSON_AddNumberToObject(o, "speed_mbps", (double)strtol(spv, NULL, 10));
+			else cJSON_AddNullToObject(o, "speed_mbps");
+			/* addresses[] */
+			cJSON *addrs = cJSON_CreateArray();
+			for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+				if (!ifa->ifa_addr || !ifa->ifa_name || strcmp(ifa->ifa_name, iff) != 0) continue;
+				int fam = ifa->ifa_addr->sa_family;
+				char ip[INET6_ADDRSTRLEN]; int prefix = 0; const char *family;
+				if (fam == AF_INET) {
+					if (!inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, ip, sizeof ip)) continue;
+					if (ifa->ifa_netmask) prefix = ipv4_netmask_prefix(((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr);
+					family = "ipv4";
+				} else if (fam == AF_INET6) {
+					if (!inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr, ip, sizeof ip)) continue;
+					if (ifa->ifa_netmask) prefix = ipv6_netmask_prefix((struct sockaddr_in6 *)ifa->ifa_netmask);
+					family = "ipv6";
+				} else continue;
+				cJSON *a = cJSON_CreateObject();
+				cJSON_AddStringToObject(a, "address", ip);
+				cJSON_AddNumberToObject(a, "prefix", (double)prefix);
+				cJSON_AddStringToObject(a, "family", family);
+				cJSON_AddItemToArray(addrs, a);
+			}
+			cJSON_AddItemToObject(o, "addresses", addrs);
+			cJSON *hit = cJSON_GetObjectItem(gw4, iff);
+			cJSON_AddItemToObject(o, "gateway", (hit && cJSON_IsString(hit)) ? cJSON_CreateString(hit->valuestring) : cJSON_CreateNull());
+			cJSON_AddItemToArray(arr, o);
+		}
+		closedir(d);
+	}
+	if (ifap) freeifaddrs(ifap);
+	cJSON_Delete(gw4);
+	return arr;
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -2554,8 +3014,13 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 
 	collect_v2_system_cpu(root);
 	collect_v2_system_memory(root);   /* + system.paging */
-	cJSON_AddNullToObject(root, "system.network");   /* P3 */
+	collect_v2_memory_errors(root);   /* memory.edac (E축) */
+	collect_v2_system_network(root);
 	collect_v2_system_disk(root);
+	collect_v2_disk_errors(root);      /* disk.errors (E축) */
+	collect_v2_system_pressure(root);
+	collect_v2_system_filesystem(root);
+	collect_v2_system_cgroup(root);
 
 	return root;
 }

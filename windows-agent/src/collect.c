@@ -1523,6 +1523,9 @@ cJSON *build_error_payload(const char *machine_id, const char *agent_version,
 	return m;
 }
 
+static cJSON *collect_v2_block_devices(void);
+static cJSON *collect_v2_net_interfaces(void);
+
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *m = cJSON_CreateObject();
@@ -1559,9 +1562,8 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	cJSON_AddItemToObject(m, "listen_ports", enumerate_listen_ports());
 	cJSON_AddItemToObject(m, "ip_external",  collect_external_ip());
 
-	/* v2 정규화 노드: 실내용은 P4. P1 은 required 배열 스텁. */
-	cJSON_AddItemToObject(m, "block_devices",  cJSON_CreateArray());
-	cJSON_AddItemToObject(m, "net_interfaces", cJSON_CreateArray());
+	cJSON_AddItemToObject(m, "block_devices",  collect_v2_block_devices());
+	cJSON_AddItemToObject(m, "net_interfaces", collect_v2_net_interfaces());
 
 	return m;
 }
@@ -1818,6 +1820,297 @@ static void collect_v2_system_disk(cJSON *root)
 	free(buf);
 }
 
+/* MAC 바이트 -> "mac:XX:.." device 안정키. 부재(가상 miniport)면 name: 폴백. */
+static void mac_to_devid(const unsigned char *mac, unsigned len, const char *fallback, char *out, size_t outsz)
+{
+	if (len >= 6 && (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]))
+		snprintf(out, outsz, "mac:%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+	else
+		snprintf(out, outsz, "name:%s", fallback ? fallback : "unknown");
+}
+
+/* P3 system.network: GetIfTable2(NT6, GetProcAddress) / GetIfTable(NT5.2 폴백). device=MAC.
+ * io/packets/errors/dropped/link.speed + tcp.retransmits(GetTcpStatistics). conntrack 는 Windows 부재. */
+static void collect_v2_system_network(cJSON *root)
+{
+	cJSON *ns   = ns_get(root, "system.network");
+	cJSON *m_io = metric_new(ns, "network.io",         "counter", "By");
+	cJSON *m_pk = metric_new(ns, "network.packets",    "counter", "packets");
+	cJSON *m_er = metric_new(ns, "network.errors",     "counter", "errors");
+	cJSON *m_dr = metric_new(ns, "network.dropped",    "counter", "packets");
+	cJSON *m_sp = metric_new(ns, "network.link.speed", "gauge",   "bit/s");
+
+	typedef DWORD (WINAPI *GetIfTable2_fn)(PMIB_IF_TABLE2 *);
+	typedef void  (WINAPI *FreeMibTable_fn)(PVOID);
+	static int resolved = 0; static GetIfTable2_fn p_get = NULL; static FreeMibTable_fn p_free = NULL;
+	if (!resolved) { resolved = 1; HMODULE ip = GetModuleHandleA("iphlpapi.dll");
+		if (ip) { p_get = (GetIfTable2_fn)(void *)GetProcAddress(ip, "GetIfTable2"); p_free = (FreeMibTable_fn)(void *)GetProcAddress(ip, "FreeMibTable"); } }
+
+	if (p_get && p_free) {
+		PMIB_IF_TABLE2 table = NULL;
+		if (p_get(&table) == NO_ERROR && table) {
+			for (ULONG i = 0; i < table->NumEntries; i++) {
+				MIB_IF_ROW2 *r = &table->Table[i];
+				if (r->Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+				if (r->OperStatus != IfOperStatusUp) continue;
+				if (r->InterfaceAndOperStatusFlags.FilterInterface) continue;
+				char alias[256]; WideCharToMultiByte(CP_UTF8,0,r->Alias,-1,alias,sizeof alias,NULL,NULL);
+				char id[80]; mac_to_devid(r->PhysicalAddress, r->PhysicalAddressLength, alias, id, sizeof id);
+				cJSON *p;
+				p=point_new(m_io); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)r->InOctets);
+				p=point_new(m_io); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)r->OutOctets);
+				p=point_new(m_pk); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)(r->InUcastPkts + r->InNUcastPkts));
+				p=point_new(m_pk); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)(r->OutUcastPkts + r->OutNUcastPkts));
+				p=point_new(m_er); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)r->InErrors);
+				p=point_new(m_er); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)r->OutErrors);
+				p=point_new(m_dr); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)r->InDiscards);
+				p=point_new(m_dr); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)r->OutDiscards);
+				p=point_new(m_sp); point_attr(p,"device",id);
+				ULONG64 spd = r->ReceiveLinkSpeed ? r->ReceiveLinkSpeed : r->TransmitLinkSpeed;
+				if (spd > 0 && spd != 0xFFFFFFFFFFFFFFFFULL) point_value(p,(double)spd); else point_value_null(p);
+			}
+			p_free(table);
+		}
+	} else {
+		ULONG sz = 0;
+		if (GetIfTable(NULL, &sz, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+			MIB_IFTABLE *t = (MIB_IFTABLE *)malloc(sz);
+			if (t && GetIfTable(t, &sz, FALSE) == NO_ERROR) {
+				for (DWORD i = 0; i < t->dwNumEntries; i++) {
+					MIB_IFROW *r = &t->table[i];
+					if (r->dwType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+					char nm[32]; snprintf(nm, sizeof nm, "if%lu", (unsigned long)r->dwIndex);
+					char id[80]; mac_to_devid(r->bPhysAddr, r->dwPhysAddrLen, nm, id, sizeof id);
+					cJSON *p;
+					p=point_new(m_io); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)r->dwInOctets);
+					p=point_new(m_io); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)r->dwOutOctets);
+					p=point_new(m_pk); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)((double)r->dwInUcastPkts + r->dwInNUcastPkts));
+					p=point_new(m_pk); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)((double)r->dwOutUcastPkts + r->dwOutNUcastPkts));
+					p=point_new(m_er); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)r->dwInErrors);
+					p=point_new(m_er); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)r->dwOutErrors);
+					p=point_new(m_dr); point_attr(p,"device",id); point_attr(p,"direction","receive");  point_value(p,(double)r->dwInDiscards);
+					p=point_new(m_dr); point_attr(p,"device",id); point_attr(p,"direction","transmit"); point_value(p,(double)r->dwOutDiscards);
+					p=point_new(m_sp); point_attr(p,"device",id);
+					if (r->dwSpeed > 0) point_value(p,(double)r->dwSpeed); else point_value_null(p);
+				}
+			}
+			free(t);
+		}
+	}
+	MIB_TCPSTATS ts;
+	if (GetTcpStatistics(&ts) == NO_ERROR)
+		metric_scalar_win(ns, "network.tcp.retransmits", "counter", "segments", 1, (double)ts.dwRetransSegs);
+	else
+		metric_scalar_win(ns, "network.tcp.retransmits", "counter", "segments", 0, 0);
+}
+
+/* P4 system.filesystem: 고정 볼륨 usage(used/free). NTFS 는 inode 개념 부재 -> inodes null. */
+static void collect_v2_system_filesystem(cJSON *root)
+{
+	cJSON *ns = ns_get(root, "system.filesystem");
+	cJSON *m_use = metric_new(ns, "filesystem.usage",  "gauge", "By");
+	cJSON *m_ino = metric_new(ns, "filesystem.inodes", "gauge", "count");
+	wchar_t drives[256]; DWORD len = GetLogicalDriveStringsW(256, drives);
+	if (len == 0 || len > 256) return;
+	for (wchar_t *p = drives; *p; p += wcslen(p) + 1) {
+		if (GetDriveTypeW(p) != DRIVE_FIXED) continue;
+		char mount[16]; WideCharToMultiByte(CP_UTF8, 0, p, -1, mount, sizeof mount, NULL, NULL);
+		size_t ml = strlen(mount); if (ml && mount[ml-1] == '\\') mount[ml-1] = '\0';
+		ULARGE_INTEGER avail, total, tfree;
+		if (!GetDiskFreeSpaceExW(p, &avail, &total, &tfree)) continue;
+		cJSON *pt;
+		pt=point_new(m_use); point_attr(pt,"mountpoint",mount); point_attr(pt,"state","used"); point_value(pt,(double)total.QuadPart - (double)tfree.QuadPart);
+		pt=point_new(m_use); point_attr(pt,"mountpoint",mount); point_attr(pt,"state","free"); point_value(pt,(double)avail.QuadPart);
+		pt=point_new(m_ino); point_attr(pt,"mountpoint",mount); point_attr(pt,"state","used"); point_value_null(pt);
+	}
+}
+
+static const char *win_id_type(const char *full)
+{
+	if (!strncmp(full, "gptid:", 6))   return "gptid";
+	if (!strncmp(full, "mbrsig:", 7))  return "mbrsig";
+	if (!strncmp(full, "serial:", 7))  return "serial";
+	if (!strncmp(full, "volguid:", 8)) return "volguid";
+	if (!strncmp(full, "wwid:", 5))    return "wwid";
+	return "name";
+}
+static const char *win_id_value(const char *full)
+{
+	const char *c = strchr(full, ':');
+	return c ? c + 1 : full;
+}
+
+/* Windows 디스크 안정키(D4 카탈로그): GPT DiskId(gptid) -> MBR Signature(mbrsig) -> serial -> name. */
+static void win_disk_id(int i, char *out, size_t outsz)
+{
+	HANDLE h = open_physical_drive(i);
+	if (h == INVALID_HANDLE_VALUE) { snprintf(out, outsz, "name:PhysicalDrive%d", i); return; }
+	DWORD ret = 0; BYTE buf[2048];
+	if (DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, buf, sizeof buf, &ret, NULL)) {
+		DRIVE_LAYOUT_INFORMATION_EX *dl = (DRIVE_LAYOUT_INFORMATION_EX *)buf;
+		if (dl->PartitionStyle == PARTITION_STYLE_GPT) {
+			GUID g = dl->Gpt.DiskId;
+			snprintf(out, outsz, "gptid:{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+			         (unsigned long)g.Data1, g.Data2, g.Data3,
+			         g.Data4[0],g.Data4[1],g.Data4[2],g.Data4[3],g.Data4[4],g.Data4[5],g.Data4[6],g.Data4[7]);
+			CloseHandle(h); return;
+		} else if (dl->PartitionStyle == PARTITION_STYLE_MBR && dl->Mbr.Signature) {
+			snprintf(out, outsz, "mbrsig:%lu", (unsigned long)dl->Mbr.Signature);
+			CloseHandle(h); return;
+		}
+	}
+	STORAGE_PROPERTY_QUERY q; memset(&q, 0, sizeof q); q.PropertyId = StorageDeviceProperty; q.QueryType = PropertyStandardQuery;
+	BYTE sbuf[2048];
+	if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, sbuf, sizeof sbuf, &ret, NULL)) {
+		STORAGE_DEVICE_DESCRIPTOR *sd = (STORAGE_DEVICE_DESCRIPTOR *)sbuf;
+		if (sd->SerialNumberOffset && sd->SerialNumberOffset < sizeof sbuf) {
+			char *ser = (char *)sbuf + sd->SerialNumberOffset;
+			while (*ser == ' ') ser++;
+			char trimmed[128]; snprintf(trimmed, sizeof trimmed, "%s", ser);
+			for (int k = (int)strlen(trimmed) - 1; k >= 0 && trimmed[k] == ' '; k--) trimmed[k] = '\0';
+			if (trimmed[0]) { snprintf(out, outsz, "serial:%s", trimmed); CloseHandle(h); return; }
+		}
+	}
+	CloseHandle(h);
+	snprintf(out, outsz, "name:PhysicalDrive%d", i);
+}
+
+static void bd_add_win(cJSON *arr, const char *name, const char *type, long long size,
+                       const char *fst, const char *mnt, const char *parent, const char *idfull)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "name", name);
+	cJSON_AddStringToObject(o, "type", type);
+	if (size >= 0) cJSON_AddNumberToObject(o, "size_bytes", (double)size); else cJSON_AddNullToObject(o, "size_bytes");
+	if (fst && *fst) cJSON_AddStringToObject(o, "fstype", fst); else cJSON_AddNullToObject(o, "fstype");
+	if (mnt && *mnt) cJSON_AddStringToObject(o, "mountpoint", mnt); else cJSON_AddNullToObject(o, "mountpoint");
+	if (parent) cJSON_AddStringToObject(o, "parent", parent); else cJSON_AddNullToObject(o, "parent");
+	cJSON_AddStringToObject(o, "id", win_id_value(idfull));
+	cJSON_AddStringToObject(o, "id_type", win_id_type(idfull));
+	cJSON_AddItemToArray(arr, o);
+}
+
+/* P4 block_devices: 물리디스크(disk, gptid/mbrsig/serial) + 볼륨(volume, volguid, parent=disk extents). */
+static cJSON *collect_v2_block_devices(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	char diskid[32][96]; int diskvalid[32] = {0};
+	for (int i = 0; i < 32; i++) {
+		HANDLE h = open_physical_drive(i);
+		if (h == INVALID_HANDLE_VALUE) continue;
+		GET_LENGTH_INFORMATION gli; DWORD ret = 0; long long size = -1;
+		if (DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &gli, sizeof gli, &ret, NULL)) size = (long long)gli.Length.QuadPart;
+		CloseHandle(h);
+		char idfull[96]; win_disk_id(i, idfull, sizeof idfull);
+		snprintf(diskid[i], sizeof diskid[i], "%s", win_id_value(idfull)); diskvalid[i] = 1;
+		char name[32]; snprintf(name, sizeof name, "PhysicalDrive%d", i);
+		bd_add_win(arr, name, "disk", size, NULL, NULL, NULL, idfull);
+	}
+	wchar_t vol[MAX_PATH];
+	HANDLE fv = FindFirstVolumeW(vol, MAX_PATH);
+	if (fv != INVALID_HANDLE_VALUE) {
+		do {
+			char volu[160]; WideCharToMultiByte(CP_UTF8, 0, vol, -1, volu, sizeof volu, NULL, NULL);
+			char guid[96] = {0}; char *b = strchr(volu, '{');
+			if (b) { char *e = strchr(b, '}'); if (e) { int n = (int)(e - b + 1); if (n < (int)sizeof guid) { memcpy(guid, b, n); guid[n] = '\0'; } } }
+			char idfull[128];
+			if (guid[0]) snprintf(idfull, sizeof idfull, "volguid:%s", guid); else snprintf(idfull, sizeof idfull, "name:%s", volu);
+			wchar_t fsw[16] = {0}; char fst[16] = {0};
+			GetVolumeInformationW(vol, NULL, 0, NULL, NULL, NULL, fsw, 16);
+			if (fsw[0]) { WideCharToMultiByte(CP_UTF8, 0, fsw, -1, fst, sizeof fst, NULL, NULL); for (char *q = fst; *q; q++) *q = (char)tolower((unsigned char)*q); }
+			wchar_t names[256] = {0}; DWORD cnt = 0; char mnt[64] = {0};
+			if (GetVolumePathNamesForVolumeNameW(vol, names, 256, &cnt) && names[0]) {
+				WideCharToMultiByte(CP_UTF8, 0, names, -1, mnt, sizeof mnt, NULL, NULL);
+				size_t l = strlen(mnt); if (l && mnt[l-1] == '\\') mnt[l-1] = '\0';
+			}
+			long long vsize = -1; ULARGE_INTEGER a, t, f;
+			if (GetDiskFreeSpaceExW(vol, &a, &t, &f)) vsize = (long long)t.QuadPart;
+			wchar_t volnb[MAX_PATH]; wcsncpy(volnb, vol, MAX_PATH); volnb[MAX_PATH-1] = L'\0';
+			size_t wl = wcslen(volnb); if (wl && volnb[wl-1] == L'\\') volnb[wl-1] = L'\0';
+			HANDLE vh = CreateFileW(volnb, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+			int emitted = 0;
+			if (vh != INVALID_HANDLE_VALUE) {
+				BYTE eb[4096]; DWORD ret = 0;
+				if (DeviceIoControl(vh, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, eb, sizeof eb, &ret, NULL)) {
+					VOLUME_DISK_EXTENTS *vde = (VOLUME_DISK_EXTENTS *)eb;
+					for (DWORD k = 0; k < vde->NumberOfDiskExtents; k++) {
+						int dn = (int)vde->Extents[k].DiskNumber;
+						const char *par = (dn >= 0 && dn < 32 && diskvalid[dn]) ? diskid[dn] : NULL;
+						bd_add_win(arr, mnt[0] ? mnt : volu, "volume", vsize, fst[0] ? fst : NULL, mnt[0] ? mnt : NULL, par, idfull);
+						emitted = 1;
+					}
+				}
+				CloseHandle(vh);
+			}
+			if (!emitted) bd_add_win(arr, mnt[0] ? mnt : volu, "volume", vsize, fst[0] ? fst : NULL, mnt[0] ? mnt : NULL, NULL, idfull);
+		} while (FindNextVolumeW(fv, vol, MAX_PATH));
+		FindVolumeClose(fv);
+	}
+	return arr;
+}
+
+/* P3 net_interfaces: GAA per-adapter -> MAC id + kind + speed + addresses[] + gateway. */
+static cJSON *collect_v2_net_interfaces(void)
+{
+	cJSON *arr = cJSON_CreateArray();
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+	if (agent_is_nt6()) flags |= GAA_FLAG_INCLUDE_GATEWAYS;
+	ULONG buf_len = 16 * 1024; IP_ADAPTER_ADDRESSES *aa = malloc(buf_len);
+	if (!aa) return arr;
+	ULONG ret = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, aa, &buf_len);
+	if (ret == ERROR_BUFFER_OVERFLOW) { free(aa); aa = malloc(buf_len); if (!aa) return arr; ret = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, aa, &buf_len); }
+	if (ret != NO_ERROR) { free(aa); return arr; }
+	for (IP_ADAPTER_ADDRESSES *p = aa; p; p = p->Next) {
+		if (p->OperStatus != IfOperStatusUp) continue;
+		if (p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+		char ifname[256]; WideCharToMultiByte(CP_UTF8, 0, p->FriendlyName, -1, ifname, sizeof ifname, NULL, NULL);
+		char fb[32]; snprintf(fb, sizeof fb, "if%lu", (unsigned long)p->IfIndex);
+		char idfull[80]; mac_to_devid(p->PhysicalAddress, p->PhysicalAddressLength, fb, idfull, sizeof idfull);
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "name", ifname);
+		cJSON_AddStringToObject(o, "id", win_id_value(idfull));
+		cJSON_AddStringToObject(o, "id_type", (!strncmp(idfull, "mac:", 4)) ? "mac" : "name");
+		DWORD if_idx = p->IfIndex ? p->IfIndex : p->Ipv6IfIndex;
+		cJSON_AddStringToObject(o, "kind", iface_is_hardware(if_idx) ? win_net_kind(p->IfType) : "virtual");
+		if (agent_is_nt6() && p->TransmitLinkSpeed && p->TransmitLinkSpeed != 0xFFFFFFFFFFFFFFFFULL)
+			cJSON_AddNumberToObject(o, "speed_mbps", (double)(p->TransmitLinkSpeed / 1000000ULL));
+		else cJSON_AddNullToObject(o, "speed_mbps");
+		cJSON *addrs = cJSON_CreateArray();
+		for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress; u; u = u->Next) {
+			if (!u->Address.lpSockaddr) continue;
+			char ip[INET6_ADDRSTRLEN] = {0}; const char *family = NULL; int prefix = -1;
+			int fam = u->Address.lpSockaddr->sa_family;
+			if (fam == AF_INET)  { inet_ntop(AF_INET, &((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr, ip, sizeof ip); family = "ipv4"; }
+			else if (fam == AF_INET6) { inet_ntop(AF_INET6, &((struct sockaddr_in6 *)u->Address.lpSockaddr)->sin6_addr, ip, sizeof ip); family = "ipv6"; }
+			if (!ip[0]) continue;
+			if (agent_is_nt6()) prefix = (int)u->OnLinkPrefixLength;
+			else if (fam == AF_INET) { unsigned ab = ((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.S_un.S_addr; int pfx; if (legacy_ipv4_prefix(p->IfIndex, ab, &pfx)) prefix = pfx; }
+			cJSON *ad = cJSON_CreateObject();
+			cJSON_AddStringToObject(ad, "address", ip);
+			if (prefix >= 0) cJSON_AddNumberToObject(ad, "prefix", (double)prefix); else cJSON_AddNullToObject(ad, "prefix");
+			cJSON_AddStringToObject(ad, "family", family);
+			cJSON_AddItemToArray(addrs, ad);
+		}
+		cJSON_AddItemToObject(o, "addresses", addrs);
+		cJSON *gw = NULL;
+		if (agent_is_nt6()) {
+			for (IP_ADAPTER_GATEWAY_ADDRESS_LH *g = p->FirstGatewayAddress; g; g = g->Next) {
+				if (!g->Address.lpSockaddr) continue;
+				int gf = g->Address.lpSockaddr->sa_family; char gb[INET6_ADDRSTRLEN] = {0};
+				if (gf == AF_INET) inet_ntop(AF_INET, &((struct sockaddr_in *)g->Address.lpSockaddr)->sin_addr, gb, sizeof gb);
+				else if (gf == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)g->Address.lpSockaddr)->sin6_addr, gb, sizeof gb);
+				if (gb[0]) { gw = cJSON_CreateString(gb); break; }
+			}
+		} else {
+			char gb[INET_ADDRSTRLEN]; if (legacy_ipv4_gateway(p->IfIndex, gb, sizeof gb)) gw = cJSON_CreateString(gb);
+		}
+		cJSON_AddItemToObject(o, "gateway", gw ? gw : cJSON_CreateNull());
+		cJSON_AddItemToArray(arr, o);
+	}
+	free(aa);
+	return arr;
+}
+
 cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *m = cJSON_CreateObject();
@@ -1827,8 +2120,11 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 
 	collect_v2_system_cpu(m);
 	collect_v2_system_memory(m);   /* + system.paging */
-	cJSON_AddNullToObject(m, "system.network");   /* P3 */
+	collect_v2_system_network(m);
 	collect_v2_system_disk(m);
+	collect_v2_system_filesystem(m);
+	cJSON_AddNullToObject(m, "system.pressure");   /* Windows: PSI 부재(스키마 강제 null) */
+	cJSON_AddNullToObject(m, "system.cgroup");     /* Windows: cgroup 부재 */
 
 	return m;
 }
