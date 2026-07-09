@@ -310,8 +310,11 @@ int main(int argc, char **argv)
 	}
 
 	worker_ctx_t *worker = NULL;
+	/* worker 활성은 USER+PASS 둘 다 요구 — 비번 없이는 브로커 인증이 어차피 실패하므로 조용한 연결
+	 * 실패 대신 명확히 비활성(Windows 트리와 동일 게이팅). */
 	const char *worker_user = getenv_default("RABBITMQ_WORKER_USER", "");
-	if (*worker_user) {
+	const char *worker_pass = getenv_default("RABBITMQ_WORKER_PASS", "");
+	if (*worker_user && *worker_pass) {
 
 		publish_config_t wcfg = make_worker_publish_config();
 
@@ -343,7 +346,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "[agent] worker init failed — running collector only\n");
 		}
 	} else {
-		fprintf(stderr, "[agent] RABBITMQ_WORKER_USER unset — worker disabled\n");
+		fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS unset)\n");
 	}
 
 	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds, worker=%s (Ctrl+C to exit)\n",
