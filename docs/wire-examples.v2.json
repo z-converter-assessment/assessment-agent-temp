@@ -17,7 +17,6 @@
         { "attr": { "cpu": "0", "state": "steal" }, "value": 1.1 } ] },
       "cpu.run_queue": { "type": "gauge", "unit": "tasks", "points": [ { "attr": { "source": "procs_running" }, "value": 1 } ] },
       "cpu.blocked":   { "type": "gauge", "unit": "tasks", "points": [ { "attr": { "source": "procs_blocked" }, "value": 0 } ] },
-      "cpu.mce":       { "type": "counter", "unit": "events", "points": [ { "attr": {}, "value": 0 } ] },
       "cpu.logical.count": { "type": "gauge", "unit": "cpu", "points": [ { "attr": {}, "value": 1 } ] }
     },
     "system.memory": {
@@ -102,7 +101,6 @@
         { "attr": { "cpu": "3", "state": "idle" }, "value": 59005.8 } ] },
       "cpu.run_queue": { "type": "gauge", "unit": "tasks", "points": [ { "attr": { "source": "processor_queue" }, "value": 2 } ] },
       "cpu.blocked":   { "type": "gauge", "unit": "tasks", "points": [ { "attr": {}, "value": null } ] },
-      "cpu.mce":       { "type": "counter", "unit": "events", "points": [ { "attr": { "source": "whea" }, "value": 0 } ] },
       "cpu.logical.count": { "type": "gauge", "unit": "cpu", "points": [ { "attr": {}, "value": 4 } ] }
     },
     "system.memory": {
