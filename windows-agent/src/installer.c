@@ -49,9 +49,10 @@ static const wchar_t *p_worker(void)
 
 #define SERVICE_DESC L"Resource assessment collector — publishes inventory/metrics/error to RabbitMQ."
 
+/* WORKER_DOWNLOAD_ALLOWED_HOSTS 는 사실상 고정이라 프롬프트하지 않고 agent.env.example 기본값을 그대로
+ * 쓴다(broker host/creds 와 동일 방식: env 는 config, 소스엔 안 박음). 바꿀 땐 agent.env 로 override. */
 static const char *const PROMPT_KEYS[] = {
     "RABBITMQ_HOST",
-    "WORKER_DOWNLOAD_ALLOWED_HOSTS",
     NULL,
 };
 static const char *const SECRET_KEYS[] = {

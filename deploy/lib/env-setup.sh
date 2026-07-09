@@ -31,8 +31,10 @@ LOCAL="${3:?usage: env-setup.sh EXAMPLE TARGET LOCAL}"
 # friction at install time.
 #
 # RABBITMQ_HOST                  broker address (always site-specific)
-# WORKER_DOWNLOAD_ALLOWED_HOSTS  task.install whitelist; empty = worker dies
-PROMPT_KEYS="RABBITMQ_HOST WORKER_DOWNLOAD_ALLOWED_HOSTS"
+# WORKER_DOWNLOAD_ALLOWED_HOSTS  task.install whitelist — 사실상 고정이라 프롬프트하지 않고 agent.env.example
+#                                기본값을 그대로 쓴다(broker host/creds 와 동일 방식: env 는 config, 소스엔 안 박음).
+#                                바꿀 땐 agent.env 로 override.
+PROMPT_KEYS="RABBITMQ_HOST"
 
 SECRET_KEYS="RABBITMQ_PASS RABBITMQ_WORKER_PASS"
 
