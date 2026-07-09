@@ -33,7 +33,7 @@ static int check_rpc(amqp_rpc_reply_t r, const char *ctx)
 	return -1;
 }
 
-static int wait_confirm(amqp_connection_state_t conn)
+static int wait_confirm(amqp_connection_state_t conn, uint64_t expected_tag)
 {
 	int t = getenv_int_or("RABBITMQ_CONFIRM_TIMEOUT_SEC", 5);
 	long limit_ms = (long)(t > 0 ? t : 5) * 1000;
@@ -64,19 +64,29 @@ static int wait_confirm(amqp_connection_state_t conn)
 		}
 		if (frame.frame_type != AMQP_FRAME_METHOD || frame.channel != 1)
 			continue;
-		if (frame.payload.method.id == AMQP_BASIC_ACK_METHOD)
-			return 0;
+		/* expected_tag 의 ack(또는 multiple 누적 ack)만 성공으로 본다 — 이전 메시지의 지각
+		 * ack 를 이번 confirm 으로 오인해 유실을 놓치지 않도록. */
+		if (frame.payload.method.id == AMQP_BASIC_ACK_METHOD) {
+			amqp_basic_ack_t *ack = (amqp_basic_ack_t *)frame.payload.method.decoded;
+			if (ack && (ack->delivery_tag == expected_tag ||
+			            (ack->multiple && ack->delivery_tag >= expected_tag)))
+				return 0;
+			continue;  /* 이전 메시지의 ack — 우리 것 계속 대기 */
+		}
 		if (frame.payload.method.id == AMQP_BASIC_NACK_METHOD) {
-			fprintf(stderr, "[publish] confirm: broker NACK'd the message\n");
-			return -1;
+			amqp_basic_nack_t *nack = (amqp_basic_nack_t *)frame.payload.method.decoded;
+			if (nack && (nack->delivery_tag == expected_tag ||
+			             (nack->multiple && nack->delivery_tag >= expected_tag))) {
+				fprintf(stderr, "[publish] confirm: broker NACK'd the message\n");
+				return -1;
+			}
+			continue;  /* 이전 메시지의 nack */
 		}
 	}
 }
 
-/* AMQP 연결 + (TLS)소켓 + open + login + 채널 1 open + confirm.select.
- * oneshot 발행(publish_message)과 worker 상시 연결(open_amqp_connection)이 이 하나를 공유해
- * TLS verify/cacert/cert 설정이 두 경로에서 동일함을 보장한다 — 한쪽에만 하드닝 옵션을 더해
- * 보안 스탠스가 갈리는 드리프트를 막는다. who 는 로그 접두사. 성공 시 *out_conn, 실패 시 -1. */
+/* AMQP 연결 + (TLS)소켓 + login + 채널 1 + confirm.select. oneshot 발행과 worker 상시 연결이
+ * 공유해 TLS verify/cacert/cert 설정이 두 경로에서 동일함을 보장한다(보안 스탠스 드리프트 방지). */
 static int amqp_connect_open(const publish_config_t *cfg, const char *who,
                             amqp_connection_state_t *out_conn)
 {
@@ -197,7 +207,8 @@ int publish_message(const publish_config_t *cfg,
 		goto out_close_channel;
 	}
 
-	if (wait_confirm(conn) != 0)
+	/* 새 연결의 첫(유일) 발행이라 confirm seqno 는 1. */
+	if (wait_confirm(conn, 1) != 0)
 		goto out_close_channel;
 
 	rc = 0;
@@ -211,6 +222,7 @@ out_close_channel:
 
 struct publish_conn_s {
 	amqp_connection_state_t conn;
+	uint64_t next_publish_seqno;   /* confirm 모드 발행 seqno(채널 confirm.select 마다 1 부터) */
 };
 
 static int open_amqp_connection(const publish_config_t *cfg,
@@ -271,13 +283,13 @@ int publish_conn_publish(publish_conn_t *c,
 		        amqp_error_string2(pub));
 		return -1;
 	}
-	return wait_confirm(c->conn);
+	/* confirm seqno 는 basic.publish 성공분만 1 부터 증가(실패분은 소비 안 함). */
+	uint64_t tag = ++c->next_publish_seqno;
+	return wait_confirm(c->conn, tag);
 }
 
-/* basic.get 이 존재하지 않는 큐를 폴링하면 브로커가 404 NOT_FOUND 로 채널을 닫는다. task 큐
- * (agent.tasks.{agent_id})는 engine 이 첫 task 발행 시점에 lazy 생성하고 worker 는 declare 권한이
- * 없어, 그 전까지는 이 404 가 정상적으로 뜬다 — 에러가 아니라 "큐 아직 없음(대기)" 상태다.
- * 이 특정 채널 예외만 가려내 조용히 처리한다(다른 서버 예외는 그대로 에러). */
+/* 없는 큐를 basic.get 하면 브로커가 404 로 채널을 닫는다. task 큐는 engine 이 첫 task 때 lazy
+ * 생성하고 worker 는 declare 권한이 없어 그 전엔 404 가 정상(큐 아직 없음). 이 예외만 걸러낸다. */
 static int is_queue_not_found(amqp_rpc_reply_t r)
 {
 	if (r.reply_type != AMQP_RESPONSE_SERVER_EXCEPTION) return 0;
@@ -336,15 +348,16 @@ int publish_conn_get(publish_conn_t *c,
 int publish_conn_recover_channel(publish_conn_t *c)
 {
 	if (!c || !c->conn) return -1;
-	/* 채널 레벨 예외(큐 404 등) 후 채널 1 을 다시 연다. 연결은 살아있으므로 전체 reconnect
-	 * 없이 폴링을 이어간다. worker result 발행이 confirm 모드라 confirm.select 재적용.
-	 * 조용히(로그 없이) 판정 — 실패하면 호출자가 전체 reconnect 로 폴백한다. */
+	/* 채널 레벨 예외(큐 404 등) 후 채널 1 을 재오픈해 전체 reconnect 없이 이어간다.
+	 * result 발행이 confirm 모드라 confirm.select 재적용. */
 	amqp_channel_open(c->conn, 1);
 	if (amqp_get_rpc_reply(c->conn).reply_type != AMQP_RESPONSE_NORMAL)
 		return -1;
 	amqp_confirm_select(c->conn, 1);
 	if (amqp_get_rpc_reply(c->conn).reply_type != AMQP_RESPONSE_NORMAL)
 		return -1;
+	/* 채널 재오픈으로 broker confirm seqno 가 1 로 리셋 — 클라이언트 카운터도 맞춰 리셋. */
+	c->next_publish_seqno = 0;
 	return 0;
 }
 

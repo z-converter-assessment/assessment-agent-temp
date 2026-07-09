@@ -77,8 +77,8 @@ static worker_config_t make_worker_config(const publish_config_t *pcfg,
 	wcfg.amqp.password  = wpass;
 	wcfg.amqp.exchange  = getenv_default("WORKER_TASK_EXCHANGE", "assessment.tasks");
 
-	/* 식별·라우팅은 안정 agent_id 기준(cutover). composite_id/machine_id는
-	 * 감사용으로 payload에만 실린다. 엔진은 agent.tasks.{agent_id}를 declare/route. */
+	/* 식별·라우팅은 agent_id 기준(엔진이 agent.tasks.{agent_id} declare/route).
+	 * composite_id/machine_id 는 감사용으로 payload 에만 실린다. */
 	const char *aid = cached_agent_id();
 	snprintf(queue_name_buf, qbuf_sz, "%s.%s",
 	         getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks"),
@@ -196,12 +196,9 @@ int agent_run(void)
 		freopen(dbg_path, "w", stderr);
 		setvbuf(stderr, NULL, _IONBF, 0);
 	} else {
-		/* As a service there is no console, so stderr's underlying handle is
-		 * invalid. The many unconditional fprintf(stderr, ...) diagnostics then
-		 * FAULT on NT5.2 (2003/XP) msvcrt — NT6+ msvcrt tolerates it — killing the
-		 * agent right after machine_id resolution, before it ever collects. Point
-		 * stderr at NUL so those writes are safe no-ops. The service is the real
-		 * deployment; a console operator who wants output sets AGENT_DEBUG_LOG. */
+		/* As a service there is no console -> stderr's handle is invalid, and
+		 * unconditional fprintf(stderr) FAULTs on NT5.2 (2003/XP) msvcrt (NT6+
+		 * tolerates it), killing the agent. Point stderr at NUL so writes no-op. */
 		freopen("NUL", "w", stderr);
 	}
 #define DBG(...) do { if (g_dbg) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -283,7 +280,7 @@ int agent_run(void)
 			        worker ? "enabled" : "init failed — publish-only",
 			        wcfg.queue_name);
 		} else {
-			fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS 미설정)\n");
+			fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS unset)\n");
 		}
 	}
 
@@ -385,10 +382,8 @@ static void print_usage(void)
 	    "  --console, -c, run        foreground run (for manual testing)\n");
 }
 
-/* dry-run: 한 페이로드를 수집해 stdout 으로 pretty-print 하고 종료한다(발행/MQ/TLS 없음).
- * wire 계약 conformance(schema/wire.schema.json) 검증의 입력원 — 실제 직렬화 코드를 태워
- * 필드/타입/null 의미론이 스키마와 일치하는지 CI 가 두 바이너리 모두에 강제한다. 콘솔 경로라
- * stderr 가 유효하다. WSAStartup 은 fill_network_info(GetAdaptersAddresses/inet_ntop)에 필요. */
+/* dry-run: 한 페이로드를 수집해 stdout 으로 출력(발행 없음). wire 계약(schema/wire.schema.json)
+ * 검증 입력원 — 실제 직렬화 코드를 태워 필드/타입/null 이 스키마와 일치하는지 CI 가 강제한다. */
 static int emit_payload(const char *which)
 {
 	WSADATA wsa;

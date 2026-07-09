@@ -4,6 +4,7 @@
 #include "util.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -11,7 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -259,11 +262,6 @@ int jitter_seconds(int base_sec, double frac)
 	double v = (double)base_sec * (1.0 + u);
 	return (int)v;
 }
-
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/resource.h>
-#include <sys/syscall.h>
 
 static int sweep_via_proc_self_fd(void)
 {

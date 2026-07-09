@@ -103,13 +103,11 @@ static int child_bootstrap(const char *extract_dir,
 	signal(SIGPIPE, SIG_DFL);
 
 	if (clearenv() != 0) return -1;
-	/* root 로 시스템 서비스를 설치하므로 sbin 계열(chkconfig/service/ldconfig/setenforce
-	 * 등)을 PATH 에 포함한다 — SysV 호스트 install 이 이 도구들을 호출한다. 빠지면
-	 * command not found 로 스크립트가 죽는다(systemd 호스트는 systemctl 이 /usr/bin 이라 비치명). */
+	/* root install 이라 sbin 계열(chkconfig/service/ldconfig 등)을 PATH 에 포함한다 —
+	 * SysV install 이 이 도구들을 호출하고, 빠지면 command not found 로 스크립트가 죽는다. */
 	setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin", 1);
 	setenv("LANG", "C.UTF-8", 1);
-	/* clearenv 로 지워진 TERM 복구 — install 스크립트의 tput 이 graceful degrade 하도록.
-	 * 없으면 tput 경고 스팸이 stderr_tail(4KB) 을 채워 실제 에러 라인을 밀어낸다. */
+	/* TERM 복구 — 없으면 tput 경고 스팸이 stderr_tail(4KB) 을 채워 실제 에러 라인을 밀어낸다. */
 	setenv("TERM", "dumb", 1);
 	setenv("HOME", "/tmp", 1);
 	setenv("USER", "agent", 1);
@@ -170,9 +168,8 @@ exec_status_t exec_install_script(const char  *extract_dir,
 	memset(out, 0, sizeof *out);
 	out->exit_code = -1;
 
-	/* script must stay inside the extracted package. extract_path_safe rejects
-	 * absolute paths and any ".." component, so "../../bin/sh" can't escape the
-	 * workspace via the "%s/%s" join below or the "./%s" execve target. */
+	/* script must stay inside the package — extract_path_safe rejects absolute
+	 * paths and any ".." so it can't escape via the join or the "./%s" execve target. */
 	if (!extract_path_safe(script))
 		return EXEC_ERR_SCRIPT_UNSAFE;
 

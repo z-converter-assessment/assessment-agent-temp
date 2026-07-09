@@ -56,10 +56,8 @@ static void tail_finalize(tail_buf_t *t, char *out, size_t out_sz)
 	out[kept] = '\0';
 }
 
-/* env 블록에 "NAME=VAL\0" 한 엔트리를 경계 안전하게 덧붙인다. 먼저 필요 길이를 재고
- * NUL 구분자까지 들어갈 때만 쓴다 — pos 가 cap 을 넘어 (cap - pos) 가 size_t 언더플로로
- * 버퍼 밖 쓰기가 되는 것을 막고, 부분 엔트리도 남기지 않는다. 정상(env 합계 < cap) 경로는
- * 기존과 동일하게 전 엔트리가 다 들어간다. */
+/* env 블록에 "NAME=VAL\0" 엔트리를 덧붙인다. NUL 까지 다 들어갈 때만 써서 (cap - pos)
+ * size_t 언더플로에 의한 버퍼 밖 쓰기와 부분 엔트리 잔존을 막는다. */
 static void env_append(char *blk, size_t cap, int *pos, const char *fmt, ...)
 {
 	va_list ap;
@@ -363,6 +361,19 @@ exec_status_t exec_install(void                *job_handle_in,
 
 			TerminateProcess(pi.hProcess, 1);
 			kill_sent = 1;
+		}
+		/* kill 후에도 안 죽으면(언킬러블 프로세스/WAIT_FAILED) 무한루프가 되어 worker 가 행한다.
+		 * 유예(5s) 후 bail-out — Linux exec.c 의 wait 에러 break 와 대칭. */
+		if (kill_sent && elapsed >= term_at_ms + 10000L) {
+			if (out_open) CloseHandle(out_r);
+			if (err_open) CloseHandle(err_r);
+			out->duration_ms = monotonic_ms_since(t0);
+			tail_finalize(&out_t, out->stdout_tail, sizeof out->stdout_tail);
+			tail_finalize(&err_t, out->stderr_tail, sizeof out->stderr_tail);
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			if (owns_job) CloseHandle(job);
+			return EXEC_ERR_INTERNAL;
 		}
 
 		DWORD wr = WaitForSingleObject(pi.hProcess, 200);

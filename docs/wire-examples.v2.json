@@ -1,0 +1,225 @@
+{
+  "_comment": "wire v2 canonical 예시. 값은 testbed 실측 기반(st-lvm/st-raid/dp-win2016/win2003·2008 엔진DB). wire.schema.json 으로 검증됨. 6종: linux/windows metrics + linux/windows inventory + task_result + error.",
+
+  "linux_metrics": {
+    "schema_version": "2.0", "message_type": "metrics",
+    "agent_id": "c1a2b3c4-0000-0000-0000-000000000001", "message_id": "9f3b0000-0000-0000-0000-000000000002",
+    "composite_id": "sha256hex...", "machine_id": "…",
+    "collected_at": "2026-07-09T06:40:00Z", "boot_time": "2026-07-08T07:23:10Z",
+    "agent_started_at": "2026-07-08T07:24:01Z", "agent_version": "2.0.0", "os_family": "linux",
+
+    "system.cpu": {
+      "cpu.time": { "type": "counter", "unit": "s", "points": [
+        { "attr": { "cpu": "0", "state": "user" }, "value": 812.34 },
+        { "attr": { "cpu": "0", "state": "system" }, "value": 211.09 },
+        { "attr": { "cpu": "0", "state": "idle" }, "value": 58121.7 },
+        { "attr": { "cpu": "0", "state": "iowait" }, "value": 33.2 },
+        { "attr": { "cpu": "0", "state": "steal" }, "value": 1.1 } ] },
+      "cpu.run_queue": { "type": "gauge", "unit": "tasks", "points": [ { "attr": { "source": "procs_running" }, "value": 1 } ] },
+      "cpu.blocked":   { "type": "gauge", "unit": "tasks", "points": [ { "attr": { "source": "procs_blocked" }, "value": 0 } ] },
+      "cpu.logical.count": { "type": "gauge", "unit": "cpu", "points": [ { "attr": {}, "value": 1 } ] }
+    },
+    "system.memory": {
+      "memory.usage": { "type": "gauge", "unit": "By", "points": [
+        { "attr": { "state": "free" }, "value": 128442368 },
+        { "attr": { "state": "cached" }, "value": 1206984704 },
+        { "attr": { "state": "available" }, "value": 1624768512 } ] },
+      "memory.limit":        { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": 2062008320 } ] },
+      "memory.commit.usage": { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": 355819520 } ] },
+      "memory.commit.limit": { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": 1029660672 } ] },
+      "memory.oom_kill":     { "type": "counter", "unit": "events", "points": [ { "attr": {}, "value": 0 } ] },
+      "memory.hardware_corrupted": { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": 0 } ] }
+    },
+    "system.paging": {
+      "paging.operations": { "type": "counter", "unit": "operations", "points": [
+        { "attr": { "direction": "in" }, "value": 0 },
+        { "attr": { "direction": "out" }, "value": 0 },
+        { "attr": { "direction": "in", "type": "major" }, "value": 2161 } ] }
+    },
+    "system.pressure": {
+      "pressure.stall.ratio": { "type": "gauge", "unit": "1", "points": [
+        { "attr": { "resource": "cpu", "scope": "some", "window": "10" }, "value": 0.0108 },
+        { "attr": { "resource": "io", "scope": "some", "window": "10" }, "value": 0.0 },
+        { "attr": { "resource": "memory", "scope": "full", "window": "10" }, "value": 0.0 } ] },
+      "pressure.stall.time": { "type": "counter", "unit": "s", "points": [
+        { "attr": { "resource": "cpu", "scope": "some" }, "value": 68.45 },
+        { "attr": { "resource": "io", "scope": "some" }, "value": 41.3 } ] }
+    },
+    "system.disk": {
+      "disk.io":            { "type": "counter", "unit": "By", "points": [
+        { "attr": { "device": "serial:897bb3a7-77a3-48ed", "direction": "read" }, "value": 10485760 },
+        { "attr": { "device": "serial:897bb3a7-77a3-48ed", "direction": "write" }, "value": 734003200 } ] },
+      "disk.operations":    { "type": "counter", "unit": "operations", "points": [
+        { "attr": { "device": "serial:897bb3a7-77a3-48ed", "direction": "write" }, "value": 3072 } ] },
+      "disk.io_time":       { "type": "counter", "unit": "s", "points": [ { "attr": { "device": "serial:897bb3a7-77a3-48ed" }, "value": 12.44 } ] },
+      "disk.operation_time":{ "type": "counter", "unit": "s", "points": [ { "attr": { "device": "serial:897bb3a7-77a3-48ed", "direction": "write" }, "value": 9.21 } ] },
+      "disk.pending_operations": { "type": "gauge", "unit": "operations", "points": [ { "attr": { "device": "serial:897bb3a7-77a3-48ed" }, "value": 1 } ] },
+      "disk.errors":        { "type": "counter", "unit": "errors", "points": [
+        { "attr": { "device": "md:md5", "kind": "mdraid", "class": "member_errors", "member": "vdf" }, "value": 0 },
+        { "attr": { "device": "md:md5", "kind": "mdraid", "class": "degraded" }, "value": 0 },
+        { "attr": { "device": "btrfsuuid:0578dc74", "kind": "btrfs", "class": "corruption" }, "value": 0 },
+        { "attr": { "device": "serial:897bb3a7-77a3-48ed", "kind": "ext4", "class": "errors_count" }, "value": 0 } ] }
+    },
+    "system.filesystem": {
+      "filesystem.usage": { "type": "gauge", "unit": "By", "points": [
+        { "attr": { "device": "partuuid:3fdc7fad", "mountpoint": "/", "type": "ext4", "state": "used" }, "value": 8123456789 },
+        { "attr": { "device": "partuuid:3fdc7fad", "mountpoint": "/", "state": "free" }, "value": 2000000000 } ] },
+      "filesystem.inodes.usage": { "type": "gauge", "unit": "inodes", "points": [
+        { "attr": { "device": "partuuid:3fdc7fad", "mountpoint": "/", "state": "used" }, "value": 103956 },
+        { "attr": { "device": "partuuid:3fdc7fad", "mountpoint": "/", "state": "free" }, "value": 1186284 } ] }
+    },
+    "system.network": {
+      "network.io":     { "type": "counter", "unit": "By", "points": [
+        { "attr": { "device": "mac:fa:16:3e:4c:3b:62", "direction": "receive" }, "value": 58231234 },
+        { "attr": { "device": "mac:fa:16:3e:4c:3b:62", "direction": "transmit" }, "value": 9123456 } ] },
+      "network.errors": { "type": "counter", "unit": "errors", "points": [
+        { "attr": { "device": "mac:fa:16:3e:4c:3b:62", "direction": "receive" }, "value": 0 },
+        { "attr": { "device": "mac:fa:16:3e:4c:3b:62", "direction": "transmit" }, "value": 0 } ] },
+      "network.dropped":{ "type": "counter", "unit": "packets", "points": [
+        { "attr": { "device": "mac:fa:16:3e:4c:3b:62", "direction": "receive" }, "value": 0 } ] },
+      "network.link.speed": { "type": "gauge", "unit": "bit/s", "points": [ { "attr": { "device": "mac:fa:16:3e:4c:3b:62" }, "value": null } ] },
+      "network.tcp.retransmits": { "type": "counter", "unit": "segments", "points": [ { "attr": {}, "value": 1 } ] },
+      "network.conntrack.usage": { "type": "gauge", "unit": "connections", "points": [ { "attr": {}, "value": null } ] },
+      "network.conntrack.limit": { "type": "gauge", "unit": "connections", "points": [ { "attr": {}, "value": null } ] }
+    }
+  },
+
+  "windows_metrics": {
+    "schema_version": "2.0", "message_type": "metrics",
+    "agent_id": "dd37cfb0-8cb5-4bc7-8f1c-5674b50cd37f", "message_id": "9f3b0000-0000-0000-0000-000000000003",
+    "composite_id": null, "machine_id": "…",
+    "collected_at": "2026-07-09T08:10:36Z", "boot_time": "2026-07-08T22:00:00Z",
+    "agent_started_at": "2026-07-08T22:01:10Z", "agent_version": "2.0.0", "os_family": "windows",
+
+    "system.cpu": {
+      "cpu.time": { "type": "counter", "unit": "s", "points": [
+        { "attr": { "cpu": "0", "state": "user" }, "value": 1203.1 },
+        { "attr": { "cpu": "0", "state": "system" }, "value": 402.7 },
+        { "attr": { "cpu": "0", "state": "idle" }, "value": 58880.2 },
+        { "attr": { "cpu": "1", "state": "idle" }, "value": 59001.5 },
+        { "attr": { "cpu": "2", "state": "idle" }, "value": 59010.0 },
+        { "attr": { "cpu": "3", "state": "idle" }, "value": 59005.8 } ] },
+      "cpu.run_queue": { "type": "gauge", "unit": "tasks", "points": [ { "attr": { "source": "processor_queue" }, "value": 2 } ] },
+      "cpu.blocked":   { "type": "gauge", "unit": "tasks", "points": [ { "attr": {}, "value": null } ] },
+      "cpu.logical.count": { "type": "gauge", "unit": "cpu", "points": [ { "attr": {}, "value": 4 } ] }
+    },
+    "system.memory": {
+      "memory.usage": { "type": "gauge", "unit": "By", "points": [ { "attr": { "state": "available" }, "value": 6442450944 } ] },
+      "memory.limit":        { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": 8589934592 } ] },
+      "memory.commit.usage": { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": 3221225472 } ] },
+      "memory.commit.limit": { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": 10307921920 } ] },
+      "memory.oom_kill":     { "type": "counter", "unit": "events", "points": [ { "attr": {}, "value": null } ] },
+      "memory.hardware_corrupted": { "type": "gauge", "unit": "By", "points": [ { "attr": {}, "value": null } ] }
+    },
+    "system.paging": {
+      "paging.operations": { "type": "counter", "unit": "operations", "points": [ { "attr": { "direction": "in" }, "value": 84814 } ] }
+    },
+    "system.pressure": null,
+    "system.disk": {
+      "disk.io":            { "type": "counter", "unit": "By", "points": [ { "attr": { "device": "gptid:{3484c6ca-d135-4483-a716-9207f855c8db}", "direction": "write" }, "value": 719876096 } ] },
+      "disk.io_time":       { "type": "counter", "unit": "s", "points": [ { "attr": { "device": "gptid:{3484c6ca-d135-4483-a716-9207f855c8db}" }, "value": 9.83 } ] },
+      "disk.operation_time":{ "type": "counter", "unit": "s", "points": [ { "attr": { "device": "gptid:{3484c6ca-d135-4483-a716-9207f855c8db}", "direction": "write" }, "value": 2.34 } ] },
+      "disk.pending_operations": { "type": "gauge", "unit": "operations", "points": [ { "attr": { "device": "gptid:{3484c6ca-d135-4483-a716-9207f855c8db}" }, "value": 1 } ] },
+      "disk.errors":        { "type": "counter", "unit": "errors", "points": [ { "attr": { "device": "gptid:{3484c6ca-d135-4483-a716-9207f855c8db}", "kind": "eventlog" }, "value": 0 } ] }
+    },
+    "system.filesystem": {
+      "filesystem.usage": { "type": "gauge", "unit": "By", "points": [ { "attr": { "device": "volguid:{86c0d2cb-c087-4dd4-aafb-671200504e25}", "mountpoint": "C:", "type": "ntfs", "state": "used" }, "value": 9500000000 } ] },
+      "filesystem.inodes.usage": { "type": "gauge", "unit": "inodes", "points": [ { "attr": { "mountpoint": "C:" }, "value": null } ] }
+    },
+    "system.network": {
+      "network.io":     { "type": "counter", "unit": "By", "points": [ { "attr": { "device": "mac:FA:16:3E:FA:9B:A7", "direction": "receive" }, "value": 12000000 } ] },
+      "network.errors": { "type": "counter", "unit": "errors", "points": [ { "attr": { "device": "mac:FA:16:3E:FA:9B:A7", "direction": "receive" }, "value": 0 } ] },
+      "network.dropped":{ "type": "counter", "unit": "packets", "points": [ { "attr": { "device": "mac:FA:16:3E:FA:9B:A7", "direction": "receive" }, "value": 16 } ] },
+      "network.link.speed": { "type": "gauge", "unit": "bit/s", "points": [ { "attr": { "device": "mac:FA:16:3E:FA:9B:A7" }, "value": null } ] },
+      "network.tcp.retransmits": { "type": "counter", "unit": "segments", "points": [ { "attr": {}, "value": 2 } ] },
+      "network.conntrack.usage": { "type": "gauge", "unit": "connections", "points": [ { "attr": {}, "value": null } ] }
+    }
+  },
+
+  "linux_inventory": {
+    "schema_version": "2.0", "message_type": "inventory",
+    "agent_id": "c1a2b3c4-0000-0000-0000-000000000001", "message_id": "9f3b0000-0000-0000-0000-000000000004",
+    "composite_id": "sha256hex...", "machine_id": "…",
+    "collected_at": "2026-07-09T06:40:00Z", "boot_time": "2026-07-08T07:23:10Z",
+    "agent_started_at": "2026-07-08T07:24:01Z", "agent_version": "2.0.0", "os_family": "linux",
+    "hostname": "vm-st-lvm", "os_id": "ubuntu", "os_version": "22.04", "os_codename": "jammy",
+    "kernel_version": "5.15.0-135-generic", "cpu_model": "Intel Xeon (QEMU)", "cpu_cores": 1,
+    "mem_total_bytes": 2062008320,
+    "ip_external": null,
+    "services": [
+      { "unit": "ssh.service", "sub": "running", "pid": 812, "exe": "/usr/sbin/sshd" },
+      { "unit": "nginx.service", "sub": "running", "pid": 1033, "exe": "/usr/sbin/nginx" }
+    ],
+    "listen_ports": [
+      { "proto": "tcp", "addr": "0.0.0.0", "port": 22, "uid": 0, "pid": 812, "comm": "sshd" },
+      { "proto": "tcp", "addr": "0.0.0.0", "port": 80, "uid": 0, "pid": 1033, "comm": "nginx" }
+    ],
+    "block_devices": [
+      { "name": "vdb", "type": "disk", "size_bytes": 2147483648, "fstype": null, "mountpoint": null, "parent": null, "id": "897bb3a7-77a3-48ed-8", "id_type": "serial" },
+      { "name": "vg_stripe-lv_stripe", "type": "lvm", "size_bytes": 2147483648, "fstype": "xfs", "mountpoint": "/mnt/lv_stripe", "parent": "bea56389-625e-4631-a", "id": "LVM-F9oAuGTCdYRuF573uygTKaeV", "id_type": "dm" },
+      { "name": "vg_stripe-lv_stripe", "type": "lvm", "size_bytes": 2147483648, "fstype": "xfs", "mountpoint": "/mnt/lv_stripe", "parent": "0ce6b70f-edb1-4038-a", "id": "LVM-F9oAuGTCdYRuF573uygTKaeV", "id_type": "dm" },
+      { "name": "vda2", "type": "swap", "size_bytes": 1073741824, "fstype": "swap", "mountpoint": "[SWAP]", "parent": "1b6f14de-59e2-4c47-b", "id": "swap-uuid-abcd", "id_type": "fsuuid" }
+    ],
+    "lvm_vgs": [
+      { "name": "vg_linear", "size_bytes": 2143289344, "free_bytes": 532676608 },
+      { "name": "vg_thin", "size_bytes": 2143289344, "free_bytes": 1061158912, "data_percent": 4.76, "metadata_percent": 11.82 }
+    ],
+    "net_interfaces": [
+      { "name": "ens3", "id": "fa:16:3e:4c:3b:62", "id_type": "mac", "kind": "physical", "speed_mbps": null,
+        "addresses": [ { "address": "10.50.60.126", "prefix": 24, "family": "ipv4" } ], "gateway": "10.50.60.1" }
+    ]
+  },
+
+  "windows_inventory": {
+    "schema_version": "2.0", "message_type": "inventory",
+    "agent_id": "dd37cfb0-8cb5-4bc7-8f1c-5674b50cd37f", "message_id": "9f3b0000-0000-0000-0000-000000000005",
+    "composite_id": null, "machine_id": "…",
+    "collected_at": "2026-07-09T08:10:36Z", "boot_time": "2026-07-08T22:00:00Z",
+    "agent_started_at": "2026-07-08T22:01:10Z", "agent_version": "2.0.0", "os_family": "windows",
+    "hostname": "dp-win2016", "os_id": "windows", "os_version": "10.0.14393", "os_codename": null,
+    "kernel_version": "14393", "cpu_model": "Intel Xeon (QEMU)", "cpu_cores": 4,
+    "mem_total_bytes": 8589934592,
+    "ip_external": null,
+    "services": [
+      { "unit": "TermService", "sub": "running", "pid": 1120, "exe": "C:\\Windows\\System32\\svchost.exe" }
+    ],
+    "listen_ports": [
+      { "proto": "tcp", "addr": "0.0.0.0", "port": 3389, "uid": null, "pid": 1120, "comm": "svchost.exe" },
+      { "proto": "tcp", "addr": "0.0.0.0", "port": 5985, "uid": null, "pid": 4, "comm": "System" }
+    ],
+    "block_devices": [
+      { "name": "Disk0", "type": "disk", "size_bytes": 42949672960, "fstype": null, "mountpoint": null, "parent": null, "id": "{3484c6ca-d135-4483-a716-9207f855c8db}", "id_type": "gptid" },
+      { "name": "Disk1", "type": "disk", "size_bytes": 2147483648, "fstype": null, "mountpoint": null, "parent": null, "id": "2579770672", "id_type": "mbrsig" },
+      { "name": "Disk11", "type": "disk", "size_bytes": 8589934592, "fstype": null, "mountpoint": null, "parent": null, "id": "ac0a4557-3ed5-4baa-9", "id_type": "serial" },
+      { "name": "H:", "type": "volume", "size_bytes": 10737418240, "fstype": "ntfs", "mountpoint": "H:", "parent": "{stripe-member-disk-a}", "id": "{stripe-vol-guid}", "id_type": "volguid" },
+      { "name": "pagefile", "type": "swap", "size_bytes": 2147483648, "fstype": null, "mountpoint": "C:\\pagefile.sys", "parent": "{3484c6ca-d135-4483-a716-9207f855c8db}", "id": null, "id_type": null }
+    ],
+    "net_interfaces": [
+      { "name": "tape7c53f38-86", "id": "FA:16:3E:FA:9B:A7", "id_type": "mac", "kind": "physical", "speed_mbps": null,
+        "addresses": [ { "address": "10.50.50.174", "prefix": 24, "family": "ipv4" } ], "gateway": "10.50.50.1" }
+    ]
+  },
+
+  "task_result": {
+    "schema_version": "2.0", "message_type": "task.result",
+    "message_id": "9f3b0000-0000-0000-0000-000000000006", "hostname": "vm-alma9",
+    "machine_id": "…", "agent_id": "c1a2b3c4-0000-0000-0000-000000000001", "agent_version": "2.0.0",
+    "boot_time": null, "collected_at": "2026-07-09T09:00:00Z", "agent_started_at": null,
+    "os_family": "linux", "os_id": "almalinux", "os_version": "9.4", "os_codename": null,
+    "task_id": "task-abc123", "status": "success", "failure_reason": null,
+    "exit_code": 0, "signal_no": null, "task_policy": null,
+    "duration_ms": 4213, "stdout_tail": "install ok", "stderr_tail": "",
+    "completed_at": "2026-07-09T09:00:04Z"
+  },
+
+  "error": {
+    "schema_version": "2.0", "message_type": "error",
+    "message_id": "9f3b0000-0000-0000-0000-000000000007", "hostname": "vm-st-lvm",
+    "agent_id": "c1a2b3c4-0000-0000-0000-000000000001", "agent_version": "2.0.0",
+    "composite_id": "sha256hex...", "machine_id": "…",
+    "collected_at": "2026-07-09T09:05:00Z", "boot_time": "2026-07-08T07:23:10Z",
+    "agent_started_at": "2026-07-08T07:24:01Z", "os_family": "linux",
+    "error_code": "AMQP_PUBLISH_FAILED", "error_message": "broker unreachable",
+    "failed_component": "publisher", "retry_count": 3
+  }
+}

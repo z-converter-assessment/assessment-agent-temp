@@ -184,9 +184,8 @@ static void print_usage(void)
 	    "  (no args)                run the collector + worker (used by systemd)\n");
 }
 
-/* dry-run: 한 페이로드를 수집해 stdout 으로 pretty-print 하고 종료한다(발행/MQ/TLS 없음).
- * wire 계약 conformance(schema/wire.schema.json) 검증의 입력원 — 실제 직렬화 코드를 태워
- * 필드/타입/null 의미론이 스키마와 일치하는지 CI 가 두 바이너리 모두에 강제한다. */
+/* dry-run: 페이로드 하나를 stdout 에 pretty-print(발행 없음) — 실제 직렬화 코드를 태워
+ * 필드/타입/null 이 스키마(schema/wire.schema.json)와 일치하는지 CI 가 검증하는 입력원. */
 static int emit_payload(const char *which)
 {
 	load_env_file(".env");
@@ -311,15 +310,18 @@ int main(int argc, char **argv)
 	}
 
 	worker_ctx_t *worker = NULL;
+	/* worker 활성은 USER+PASS 둘 다 요구 — 비번 없이는 브로커 인증이 어차피 실패하므로 조용한 연결
+	 * 실패 대신 명확히 비활성(Windows 트리와 동일 게이팅). */
 	const char *worker_user = getenv_default("RABBITMQ_WORKER_USER", "");
-	if (*worker_user) {
+	const char *worker_pass = getenv_default("RABBITMQ_WORKER_PASS", "");
+	if (*worker_user && *worker_pass) {
 
 		publish_config_t wcfg = make_worker_publish_config();
 
 		const char *queue_prefix = getenv_default("WORKER_TASK_QUEUE_PREFIX", "agent.tasks");
 
-		/* 식별·라우팅은 안정 agent_id 기준(cutover). composite_id/machine_id는
-		 * 감사용으로 payload에만 실린다. 엔진은 agent.tasks.{agent_id}를 declare/route. */
+		/* 식별·라우팅은 안정 agent_id 기준 — 엔진이 agent.tasks.{agent_id}를 declare/route.
+		 * composite_id/machine_id는 payload 감사용. */
 		const char *aid = cached_agent_id();
 		char queue_name[256];
 		snprintf(queue_name, sizeof queue_name, "%s.%s", queue_prefix, aid);
@@ -344,7 +346,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "[agent] worker init failed — running collector only\n");
 		}
 	} else {
-		fprintf(stderr, "[agent] RABBITMQ_WORKER_USER unset — worker disabled\n");
+		fprintf(stderr, "[agent] worker disabled (RABBITMQ_WORKER_USER/PASS unset)\n");
 	}
 
 	fprintf(stderr, "[agent] loop mode: interval=%ds, inventory_refresh=%ds, worker=%s (Ctrl+C to exit)\n",

@@ -57,6 +57,7 @@ struct worker_ctx_s {
 	int             conn_dead;
 
 	worker_state_t  state;
+	int             draining;   /* drain 시작됨 — 진행 중 task 는 끝내되 신규 pick 금지 */
 
 	HANDLE          install_thread;
 	HANDLE          install_job;
@@ -199,9 +200,7 @@ static char *iso8601_now(void)
 }
 
 
-/* task.result 페이로드 구성의 단일 소스. task 처리 경로(build_result_json 래퍼, ctx 보유)와
- * install 스레드(install_thread_arg_t 보유)가 모두 이걸 호출해, 정상 완료 result 와 synth/복구
- * result 의 필드 셋이 갈리는 드리프트를 막는다. machine_id/agent_version 만 호출자별로 다르다. */
+/* task.result 직렬화 단일 소스 — 정상/synth/복구 result 필드 셋 드리프트 방지. */
 static char *build_result_json_raw(const char *machine_id, const char *agent_version,
                                const char *task_id,
                                const char *status,
@@ -213,6 +212,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 {
 	cJSON *root = cJSON_CreateObject();
 	if (!root) return NULL;
+	cJSON_AddStringToObject(root, "schema_version",   "2.0");
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	/* machine_id 부재 시 null — inventory/metrics/error(add_common_metadata)와 통일. */
 	if (machine_id && *machine_id)
@@ -222,7 +222,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	cJSON_AddStringToObject(root, "agent_id",         cached_agent_id());
 	cJSON_AddStringToObject(root, "os_family",        "windows");
 	cJSON_AddStringToObject(root, "os_id",            "windows");
-	char os_ver_b[64], os_build_b[64];   /* inventory 와 동일 크기 — DisplayVersion 이 길어도 두 경로가 갈리지 않게 */
+	char os_ver_b[64], os_build_b[64];   /* inventory 와 동일 크기(경로 간 os_version 불일치 방지) */
 	os_version_info(os_ver_b, sizeof os_ver_b, os_build_b, sizeof os_build_b);
 	if (os_ver_b[0])
 		cJSON_AddStringToObject(root, "os_version", os_ver_b);
@@ -255,6 +255,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	else
 		cJSON_AddNullToObject  (root, "exit_code");
 	cJSON_AddNullToObject  (root, "signal_no");   /* Windows 는 POSIX 시그널 개념 없음 — 항상 null */
+	cJSON_AddNullToObject  (root, "task_policy");  /* 정책 판정 로직 도입 전엔 null */
 
 	cJSON_AddNumberToObject(root, "duration_ms", duration_ms);
 	cJSON_AddStringToObject(root, "stdout_tail", stdout_tail ? stdout_tail : "");
@@ -266,7 +267,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	return s;
 }
 
-/* ctx 편의 래퍼 — task 처리 경로(child_run_task 등)가 쓴다. 필드 구성은 _raw 단일 소스. */
+/* ctx 편의 래퍼 — 필드 구성은 _raw 단일 소스. */
 static char *build_result_json(const worker_ctx_t *ctx,
                                const char *task_id,
                                const char *status,
@@ -282,8 +283,7 @@ static char *build_result_json(const worker_ctx_t *ctx,
 	                             stdout_tail, stderr_tail);
 }
 
-/* wire 계약 conformance(emit dry-run)용 대표 task.result. 실제 발행 경로와 동일한
- * build_result_json_raw 직렬화를 태운다(더미 task 값 — 값이 아니라 구조를 검증). */
+/* wire 계약 conformance(emit dry-run)용 대표 task.result — 실제 발행 경로와 동일 직렬화. */
 char *worker_emit_sample_result_json(const char *machine_id, const char *agent_version)
 {
 	return build_result_json_raw(machine_id, agent_version,
@@ -417,11 +417,6 @@ static void replay_pending_results(struct worker_ctx_s *ctx)
 	FindClose(h);
 }
 
-static char *build_result_json(const struct worker_ctx_s *ctx,
-                               const char *task_id, const char *status,
-                               const char *failure_reason,
-                               int has_exit_code, int exit_code, long duration_ms,
-                               const char *stdout_tail, const char *stderr_tail);
 
 static void recover_stale_running(struct worker_ctx_s *ctx)
 {
@@ -530,9 +525,8 @@ static unsigned __stdcall install_thread_main(void *arg)
 	long duration_ms = (long)(monotonic_ms() - t0);
 	int success = (ds == DOWNLOAD_OK && xs == EXEC_OK);
 	const char *reason = success ? "" : reason_for_status(ds, xs);
-	/* exit_code is a real result only when the process exited on its own. On
-	 * timeout exec.c force-terminates it (TerminateProcess code 1), so that 1
-	 * is our kill code, not the installer's result -> emit null, not a fake 1. */
+	/* exit_code is real only if the process exited on its own; on timeout exec.c
+	 * force-terminates (code 1), so emit null rather than a fake 1. */
 	int has_exit = (ds == DOWNLOAD_OK && xs != EXEC_ERR_SCRIPT_NOT_FOUND &&
 	                xs != EXEC_ERR_SCRIPT_TIMEOUT && xs != EXEC_ERR_INTERNAL);
 
@@ -638,6 +632,9 @@ static int ensure_connection(worker_ctx_t *ctx)
 	}
 	ctx->conn_dead = 0;
 	ctx->reconnect_backoff_sec = 0;
+	/* 이전 채널 delivery tag 는 새 채널에서 무효 — 그대로 ack 하면 PRECONDITION_FAILED 로
+	 * 채널이 닫힌다. 0 리셋하면 result 는 발행되고(tag 0 은 ack 스킵) 미ack task 는 재전송된다. */
+	ctx->inflight_delivery_tag = 0;
 	return 0;
 }
 
@@ -673,9 +670,8 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		const cJSON *jty = cJSON_GetObjectItemCaseSensitive(jinstall, "type");
 		const cJSON *jt  = cJSON_GetObjectItemCaseSensitive(jinstall, "timeout_sec");
 		if (cJSON_IsString(jty) && *jty->valuestring) install_type_s = jty->valuestring;
-		/* Non-positive timeout would disable the wall-clock kill in exec.c
-		 * (term_at_ms=-1), letting a hung installer occupy the single worker
-		 * slot forever. Ignore it and keep the default. */
+		/* Non-positive timeout disables exec.c wall-clock kill -> hung installer
+		 * holds the single worker slot forever. Ignore, keep default. */
 		if (cJSON_IsNumber(jt) && jt->valuedouble > 0) timeout_sec = (int)jt->valuedouble;
 	}
 
@@ -896,14 +892,17 @@ int worker_tick(worker_ctx_t *ctx)
 
 	if (ctx->state != WSTATE_IDLE) return 0;
 
+	/* drain 중 신규 task pick 금지 — 새 install 을 시작하면 grace 내 TerminateJobObject 로
+	 * 설치 중간에 죽어 반쯤 설치된 시스템이 된다. */
+	if (ctx->draining) return 0;
+
 	char *body = NULL;
 	size_t body_len = 0;
 	uint64_t tag = 0;
 	int gr = publish_conn_get(ctx->conn, ctx->cfg.queue_name, &body, &body_len, &tag);
 	if (gr == 1) return 0;
 	if (gr == 2) {
-		/* task 큐가 아직 없음(engine 이 첫 task 때 생성) — 정상 대기. 404 가 채널을 닫았으니
-		 * 채널만 조용히 재오픈하고, 실패하면 전체 reconnect 로 폴백한다. 경고 없음. */
+		/* task 큐 아직 없음(engine 이 첫 task 때 생성) — 정상 대기. 404 로 닫힌 채널만 재오픈. */
 		if (publish_conn_recover_channel(ctx->conn) != 0)
 			ctx->conn_dead = 1;
 		return 0;
@@ -939,9 +938,53 @@ int worker_tick(worker_ctx_t *ctx)
 			return 0;
 		}
 
-		/* /running 마커가 있으면 이미 in-flight 인 task 의 redelivery다 — 이중 실행을 막고
-		 * ack 후 drop 한다(Linux try_pick_new_task 와 동일 가드). 정상 신규 task 는 마커가
-		 * 없어 그대로 진행한다. */
+		/* results/ 에 결과가 대기 중이면 이미 실행됐고 발행만 미완인 task — 재실행(이중 설치)하지
+		 * 않고 대기 결과를 발행+ack 후 done 으로 옮긴다. done/marker 만 보면 이 상태를 못 거른다. */
+		{
+			const char *exch = ctx->cfg.amqp.exchange ? ctx->cfg.amqp.exchange : "assessment.tasks";
+			const char *rkey = ctx->cfg.result_routing_key ? ctx->cfg.result_routing_key : "task.result";
+			char rp[1024];
+			snprintf(rp, sizeof rp, "%s\\%s.json", ctx->results_dir, tid);
+			if (file_exists(rp)) {
+				fprintf(stderr, "[worker] task %s has pending result — publishing instead of re-running\n", tid);
+				char *rbody = NULL;
+				size_t rlen = 0;
+				if (read_file_all(rp, &rbody, &rlen) == 0 && rbody) {
+					if (publish_conn_publish(ctx->conn, exch, rkey, rbody, rlen) == 0) {
+						publish_conn_ack(ctx->conn, tag);
+						char dp2[1024];
+						snprintf(dp2, sizeof dp2, "%s\\%s.json", ctx->done_dir, tid);
+						MoveFileExA(rp, dp2, MOVEFILE_REPLACE_EXISTING);
+						clear_running_marker(ctx, tid);
+					} else {
+						ctx->conn_dead = 1;
+					}
+					free(rbody);
+				} else {
+					free(rbody);
+					/* 결과 파일 판독 불가 -> internal_error 로 종결(재실행 방지). */
+					char *syn = build_result_json(ctx, tid, "failure", "internal_error",
+					                              0, 0, 0, "", "pending result file unreadable on redelivery\n");
+					if (syn) {
+						char dp2[1024];
+						snprintf(dp2, sizeof dp2, "%s\\%s.json", ctx->done_dir, tid);
+						if (write_file_atomic(dp2, syn) == 0 &&
+						    publish_conn_publish(ctx->conn, exch, rkey, syn, strlen(syn)) == 0) {
+							publish_conn_ack(ctx->conn, tag);
+							DeleteFileA(rp);
+							clear_running_marker(ctx, tid);
+						} else {
+							ctx->conn_dead = 1;
+						}
+						free(syn);
+					}
+				}
+				cJSON_Delete(task);
+				return 0;
+			}
+		}
+
+		/* /running 마커 있으면 in-flight task 의 redelivery — 이중 실행 막고 ack 후 drop. */
 		if (running_marker_present(ctx, tid)) {
 			fprintf(stderr, "[worker] task %s already in-flight — redelivery dropped\n", tid);
 			publish_conn_ack(ctx->conn, tag);
@@ -959,12 +1002,17 @@ int worker_tick(worker_ctx_t *ctx)
 		char *res = build_result_json(ctx, tid ? tid : "", "failure",
 		                              "internal_error", 0, 0, 0, "",
 		                              "worker spawn failed\n");
+		/* publish 성공 후에만 ack — 실패 시 ack 하면 task+result 동반 유실. spawn 실패는
+		 * 마커/결과 파일을 안 남겨 재전송돼도 재실행 위험 없음. */
 		if (res && ctx->conn && !ctx->conn_dead) {
-			publish_conn_publish(ctx->conn,
+			int prc = publish_conn_publish(ctx->conn,
 				ctx->cfg.amqp.exchange ? ctx->cfg.amqp.exchange : "assessment.tasks",
 				ctx->cfg.result_routing_key ? ctx->cfg.result_routing_key : "task.result",
 				res, strlen(res));
-			publish_conn_ack(ctx->conn, tag);
+			if (prc == 0)
+				publish_conn_ack(ctx->conn, tag);
+			else
+				ctx->conn_dead = 1;
 		}
 		free(res);
 		ctx->inflight_task_id[0] = '\0';
@@ -985,6 +1033,7 @@ void worker_keepalive(worker_ctx_t *ctx)
 void worker_begin_drain(worker_ctx_t *ctx)
 {
 	if (!ctx) return;
+	ctx->draining = 1;
 	ctx->state = (ctx->install_thread || ctx->inflight_task_id[0])
 		? WSTATE_BUSY : WSTATE_DRAIN;
 

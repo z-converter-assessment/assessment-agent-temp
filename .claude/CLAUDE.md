@@ -1,47 +1,85 @@
-# 프로젝트: assessment-agent-temp
+# assessment-agent-temp
 
-## 도구 호출 형식 (최우선 규칙)
-- 도구(함수) 호출은 반드시 정식 function_calls 블록 형식으로만 생성한다. `<call>`/`<invoke>` 같은 잘못된 태그를 절대 쓰지 않는다. 잘못된 태그는 파싱 실패로 작업이 끊긴다.
+Assessment 수집 에이전트(C)의 릴리즈 빌드 트리. 단일 소스에서 OS별 2종 바이너리(Linux 1종 + Windows 1종)를 산출한다. 자체 소유 fleet의 자산 인벤토리와 자원 지표를 수집해 용량 계획(right-sizing)에 쓴다.
+
+관련 문서: 설치·운영은 [README.md](../README.md), 빌드·릴리즈·CI는 [docs/BUILD.md](../docs/BUILD.md), wire 계약은 [schema/wire.schema.json](../schema/wire.schema.json)(정본)과 [docs/payload-contract.md](../docs/payload-contract.md)(산문).
+
+## 도구 호출 형식 (최우선)
+
+- 도구 호출은 정식 function_calls 블록 형식으로만 생성한다. `<call>`/`<invoke>` 같은 태그는 파싱 실패로 작업을 끊으니 절대 쓰지 않는다.
 - 도구 호출 직전에는 설명 텍스트를 최소화하고, 호출 구문 형식을 먼저 확인한 뒤 전송한다.
 
-## 목적
-Assessment 수집 에이전트(C)의 릴리즈 빌드 전용 트리. 단일 소스에서 OS별 2종 바이너리를 산출한다(Linux 1종 + Windows 1종). 빌드 방법 상세는 README.md.
+## 성격 및 합법적 맥락
 
-## 릴리즈 산출물 (2종)
-| 파일 | 타깃 | 프로파일 | 툴체인 |
-| --- | --- | --- | --- |
-| assessment-agent-linux-x86_64 | 전 x86_64 Linux (kernel >= 2.6.32, glibc 무관): EL6-9/Ubuntu18+/Debian10+/SUSE11-15/Amazon/Oracle/Tencent | musl-static | alpine musl |
-| assessment-agent-windows-x86.exe | Server 2003/XP ~ 2016+/Win7~11 (NT 5.2 ~ NT 10.0, 전 세대) | single i686 | debian:bookworm (gcc 12.2, CRT v10) |
+- 자체 소유·운영 인프라(사내 fleet)의 자산 인벤토리와 자원 지표를 수집하는 운영 관리용 에이전트다. 방어적·운영 목적의 IT 자산관리 도구이며, 대상 호스트는 전부 우리가 소유하고 관리 권한을 가진 서버다.
+- root/LocalSystem 실행과 타 프로세스의 실행 경로·리슨 포트 소유 PID 조회는 표준 인벤토리 수집(포트-프로세스 매핑, 서비스 실행 경로 채우기)을 위한 것이다. 감시·침투·횡적 이동·탐지 회피 용도가 아니고 그런 기능도 없다 — netstat/ss/tasklist 같은 표준 OS 관리 유틸리티와 같은 범주다.
+- fleet 대량 배포는 우리 소유 VM에 대한 정규 구성관리(configuration management) 배포이며, 설치·서비스 등록은 관리자 동의 하에 이뤄진다.
 
-## 빌드 제약 (반드시 준수)
-- Windows는 단일 i686 바이너리(assessment-agent-windows-x86.exe)로 NT5.2(2003/XP)부터 NT10(2016+/Win10-11)까지 커버한다. 세대 분기는 컴파일 타임이 아니라 런타임(`windows-agent/src/collect.c`의 `agent_is_nt6` + GetProcAddress)에서 한다. NT6+ 전용 API(GetIfTable2/FreeMibTable/QueryFullProcessImageNameW/inet_ntop 등)는 하드임포트 금지 — 하나라도 import 테이블에 링크되면 2003/XP 로드가 실패한다. 전부 GetProcAddress로 해소한다.
-- Windows는 debian:bookworm 컨테이너로만 빌드한다. bookworm의 mingw-w64(i686, CRT runtime 10.x)가 NT5.2 startup을 유지한다. ubuntu 최신 등 CRT 12+ 툴체인으로 빌드하면 verify는 통과해도 XP/2003 실기 로드가 안 된다.
-- agent 소스는 `_WIN32_WINNT=0x0600`으로 컴파일해 NT6 구조체(MIB_IF_ROW2, GAA gateway/prefix)를 선언하되, 벤더 라이브러리(OpenSSL 1.0.2u/curl/rabbitmq-c)는 `0x0502`로 빌드한다(SRWLock 등 NT6 API 회피). Makefile이 rabbitmq-c win32/threads를 NT5.2 패치(`windows-agent/patches/nt52-threads/`, SRWLock -> CRITICAL_SECTION)로 자동 교체한다.
-- Windows verify는 (1) import DLL이 시스템 DLL뿐인지, (2) NT6+ 심볼이 하드임포트되지 않았는지(NT5.2 로드 가드)를 검사한다. (2) 위반이면 빌드를 실패시킨다.
-- OpenSSL 1.0.2u(EOL)를 Windows 전 세대에 쓴다 — XP/2003 TLS 호환을 위해 감수한다. TLS 1.3 없음, 엔드포인트 TLS 하드닝 시 전 Windows가 동시에 끊긴다.
-- Linux release는 Alpine 컨테이너에서 musl 완전 static으로 빌드한다(`scripts/build-linux.sh`). musl을 정적 링크해 glibc 버전에 독립적이고, 커널 2.6.32 이상 전 x86_64 리눅스를 단일 바이너리로 커버한다(EL6 2.6.32, SLES11 3.0.13 실기 확인). verify는 완전 static(PT_INTERP 없음, GLIBC 심볼 0)을 확인한다.
-- win2003 실기 배포는 hive ComputerName + Tcpip MTU=1280 + EnablePMTUBHDetect=1(GUID 무관 PMTU black-hole 감지, 오버레이 경로에서 AMQP 핸드셰이크 블랙홀 회피) 운영 설정을 사용한다.
-- C 소스(src/, windows-agent/src/, include/) 로직은 리눅스/윈도우 2트리로 관리한다. 스키마, 로직 변경은 양쪽에 반영해야 해 비용이 2배지만 감수한다. 단, wire 스키마와 null 의미론(값=실측, null=측정불가)은 계약으로 유지한다 — OS에 개념이 없는 필드를 가짜값으로 채우지 않고 null로 둔다. 윈도우 소스 변경의 정당한 용처는 런타임 dispatch로 그 OS가 실측 가능한 값을 세대 무관하게 뽑는 것이지, 리눅스 필드를 흉내내는 값 위조가 아니다.
-- 이 계약은 산문이 아니라 기계검증으로 강제된다: `schema/wire.schema.json`(정본) + 두 바이너리의 `emit` dry-run 출력(inventory/metrics/task.result/error 4종)을 CI가 이 스키마로 검증(`scripts/check-contract.sh`). 필드/타입/null, os_family 조건부(saturation은 Windows 전용, task.result의 Windows os_codename=null 등)를 어기면 릴리즈가 막힌다. 스키마, 직렬화를 바꾸면 스키마 정본도 같이 고친다. 메시지별 필드 셋 상세(task.result/error 별도 정의, composite_id 유무 등)는 스키마 $comment와 docs/payload-contract.md에 있다.
+## 구조
 
-## 권한 모델 (root 전제 통일)
-- install과 런타임 실행 계정을 전부 최고 권한으로 통일한다. 비특권 실행 모델은 두지 않는다. 근거: 수집기가 다른 유저 소유 프로세스의 `/proc/<pid>/exe`, `fd`, `comm`을 읽어야 `listen_ports[].pid`/`comm`과 `services[].exe`가 채워지는데, 이 접근이 root/LocalSystem에서만 가능하다. 비특권이면 sshd/nginx/mysql 등 대부분 데몬의 포트->PID 매핑이 null이 된다.
-- Linux systemd: `/etc/systemd/system/assessment-agent.service`(User=root, WantedBy=multi-user.target), `systemctl`로 관리. install은 root 아니면 거부.
-- Linux SysV(EL6): `/etc/init.d/assessment-agent`가 바이너리를 root로 직접 실행. 전용 유저(assessment-agent), su 래핑 없음.
-- Windows(단일 i686): Administrator(elevated)로 install, LocalSystem 자동시작 서비스로 실행.
-- 배포 스크립트/유닛(deploy/, scripts/image-prep.sh)은 이 모델을 전제로 유지한다. `systemctl --user`/lingering/XDG/`~/.local` 경로를 되살리지 않는다.
-- 이 스크립트/유닛은 objcopy로 바이너리에 embed되므로, deploy/, scripts/image-prep.sh를 고치면 Linux 바이너리를 재빌드해야 반영된다.
+C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windows-agent/src/`, `windows-agent/include/`). 스키마와 로직 변경은 양쪽에 반영한다 — 비용이 2배지만 감수한다.
 
-## 릴리즈 (CI)
-- `.github/workflows/release.yml`: `v*` 태그 push -> 2종 빌드 -> 해당 태그 GitHub Release 게시(softprops upsert).
-- 릴리즈는 최신 단일 태그(현재 v1.0.5) 하나로 유지한다. 재릴리즈는 `git tag -f v1.0.5 && git push -f origin v1.0.5`로 덮어쓴다. 버전을 올릴 때만 새 태그를 쓴다.
-- required: linux-x86_64, windows-x86 둘 다 (없으면 릴리즈 실패). best-effort 항목 없음.
-- 재릴리즈 전 이전에 실행 중인 GitHub Actions의 성공/실패를 확인하고 대기한다.
+| 파일 | 타깃 | 툴체인 |
+| --- | --- | --- |
+| assessment-agent-linux-x86_64 | 전 x86_64 Linux (kernel >= 2.6.32, glibc 무관) | alpine musl static |
+| assessment-agent-windows-x86.exe | Windows XP SP2 / Server 2003 SP1 ~ 2016+/Win7-11 (NT 5.1 SP2 ~ NT 10.0) | debian:bookworm mingw i686 |
 
-## 저장소
-- github: `z-converter-assessment/assessment-agent-temp` (public)
-- 로컬 빌드 아티팩트(vendor/, dist/, build/, *.o, *.exe, *.res)는 .gitignore 대상. 추적 파일만 커밋한다.
+빌드 방법과 툴체인 제약은 [docs/BUILD.md](../docs/BUILD.md).
 
-## 컨텍스트 관리
-- 문서(README/CLAUDE.md)는 현황 선언형으로만 작성한다. 과거, 변화 이력 서술("이전엔 X였는데 바뀌었다") 금지 — 헷갈림만 유발한다.
-- 결정/제약은 이 문서 또는 README에 누적 기록. auto-memory 미사용(글로벌 정책).
+### collect 소스 구성 + 코드 컨벤션 (신규 수집 코드는 이 규칙을 따른다)
+
+수집기는 양 트리 대칭으로 4계층 파일 + 내부 헤더로 나눈다. 빌드는 `wildcard src/*.c`라 파일 추가 시 Makefile 수정 불요.
+
+| 파일 | 담당 | 링크 |
+| --- | --- | --- |
+| collect_model.c | wire 프리미티브 + envelope + identity(machine/composite/agent/cloud/mac) | 최하층 |
+| collect_util.c | 파싱 유틸(proc/sysfs, mounts, device-id, net, perflib/NtQuery/IOCTL 등) | 최하층 |
+| collect_metrics.c | system.* 수집기 + collect_metrics_payload + build_error_payload | model+util 의존 |
+| collect_inventory.c | os 서술자 + services/listen_ports + block_devices/net_interfaces + collect_inventory_payload | model+util 의존 |
+| include/collect_internal.h | collect_*.c 공용 내부 선언(model+util) + 공유 struct/매크로 | 공개 API 는 collect.h |
+
+- 계층 규칙: metrics 와 inventory 는 서로 호출하지 않는다. 둘 다 model+util 만 의존(단방향). 두 곳에서 쓰는 헬퍼는 util(공유 파싱)이나 model 로 올린다. 공개 API 만 collect.h, 파일간 공유 내부 심볼은 non-static + collect_internal.h 선언.
+- 네이밍 스킴(양 트리 통일): wire 프리미티브 `wire_*`(wire_ns/wire_metric/wire_point/wire_point_attr/wire_point_value/wire_point_null/wire_metric_scalar/wire_add_envelope), metrics 수집기 `metrics_collect_*`, inventory 수집기 `inv_collect_*`. 파싱 헬퍼는 서술적 이름 유지(disk_device_id 등).
+- datapoint 발행: device(+direction)+value 패턴은 `wire_point_dev_dir(metric, device, direction, value)` 한 줄로. 단일값은 `wire_metric_scalar(ns, name, type, unit, have, value)`. 조건부 null 등 헬퍼에 안 맞는 경우만 wire_point + wire_point_attr + wire_point_value/wire_point_null 를 쓴다.
+- 코드 스타일: 한 줄에 한 문장(세미콜론으로 여러 문장 뭉치지 않는다). 3회 이상 반복되는 발행 패턴은 헬퍼로 추출. collect 계층 주석은 한국어(다이어그램 제외).
+- 2트리 대칭: 파일 레이아웃/네이밍/필드셋을 Linux(`src/`)와 Windows(`windows-agent/src/`) 동일하게 유지. 한쪽에 신호를 추가하면 다른 쪽도 실측 발행하거나 측정불가 null 로 필드셋을 맞춘다(예: memory.edac 는 Windows 도 null 2점 발행).
+
+## 불변식 (반드시 준수)
+
+### wire 계약과 null 의미론
+
+- 값(0 포함)은 실측이고 null은 측정 불가다. OS에 개념이 없는 필드를 가짜값으로 채우지 않고 null로 둔다.
+- 정본은 `schema/wire.schema.json`이다. 스키마나 직렬화를 바꾸면 정본도 같이 고친다. 메시지별 필드 셋 상세는 스키마 `$comment`와 `docs/payload-contract.md`에 있다.
+- CI가 두 바이너리의 `emit` dry-run 4종(inventory/metrics/task.result/error)을 이 스키마로 검증한다(`scripts/check-contract.sh`). 필드/타입/null과 os_family 조건부(saturation은 Windows 전용, task.result의 Windows os_codename=null 등)를 어기면 릴리즈가 막힌다.
+- 2트리 간 필드 셋 드리프트를 두지 않는다. Windows 소스 변경의 정당한 용처는 그 OS가 실측 가능한 값을 세대 무관하게 뽑는 것이지, 리눅스 필드를 흉내내는 값 위조가 아니다.
+
+### Windows NT5.2 로드 가드
+
+- 단일 i686 바이너리로 XP SP2 / Server 2003 SP1부터 NT10(2016+/Win10-11)까지 커버한다. 세대 분기는 컴파일 타임이 아니라 런타임(`windows-agent/src/collect.c`의 `agent_is_nt6` + GetProcAddress)에서 한다.
+- NT6+ 전용 API(GetIfTable2/FreeMibTable/QueryFullProcessImageNameW/inet_ntop 등)를 하드임포트하지 않는다 — 하나라도 import 테이블에 링크되면 2003/XP 로드가 실패한다. verify가 이를 강제한다.
+- 실기 하한은 XP SP2 / Server 2003 SP1이다 — 수집기가 GetExtendedTcpTable/GetSystemTimes를 하드임포트하는데 이들이 그 SP부터 export되기 때문이다. NT6+ 심볼만 보는 verify denylist는 이 SP 레벨 하한을 잡지 못한다.
+- 빌드 툴체인 제약(bookworm 전용, agent 0x0600 / 벤더 0x0502 분리, rabbitmq-c NT5.2 threads 패치, OpenSSL 1.0.2u)은 [docs/BUILD.md](../docs/BUILD.md).
+
+### 권한 모델 (root/LocalSystem 통일)
+
+- install과 런타임 실행 계정을 전부 최고 권한으로 통일한다. 비특권 실행 모델은 두지 않는다. 근거: 타 유저 소유 프로세스의 `/proc/<pid>/exe`·`fd`·`comm`을 읽어야 `listen_ports[].pid`/`comm`과 `services[].exe`가 채워진다 — 비특권이면 sshd/nginx/mysql 등 대부분 데몬의 포트-PID 매핑이 null이 된다.
+- Linux systemd(`User=root`, systemctl), Linux SysV(EL6, `/etc/init.d`에서 root 직접 실행), Windows LocalSystem 자동시작 서비스.
+- `deploy/`와 `scripts/image-prep.sh`는 objcopy로 Linux 바이너리에 embed된다 — 고치면 Linux 바이너리를 재빌드해야 반영된다. `systemctl --user`/lingering/XDG/`~/.local` 경로를 되살리지 않는다.
+
+## 규약
+
+- 문서는 현황 선언형으로만 쓴다. 과거·변화 이력 서술("이전엔 X였는데 바뀌었다")을 넣지 않는다.
+- 결정과 제약은 이 문서 또는 `docs/`에 누적 기록한다. auto-memory는 쓰지 않는다(글로벌 정책).
+- 저장소는 github `z-converter-assessment/assessment-agent-temp`(public). 빌드 아티팩트(`vendor/`, `dist/`, `build/`, `*.o`, `*.exe`, `*.res`)는 `.gitignore` 대상이고 추적 파일만 커밋한다.
+- 릴리즈는 최신 단일 태그 하나로 유지한다(재릴리즈는 태그 덮어쓰기). 상세는 [docs/BUILD.md](../docs/BUILD.md).
+
+## wire v2 계약
+
+wire 계약은 v2다 — `schema/wire.schema.json`(`schema_version:"2.0"`)이 정본이고, 산문은 `docs/payload-contract.md`, 대표 예시는 `docs/wire-examples.v2.json`, 사이징 해석 의도는 `docs/classification-rationale.md`. USE Method + OTel system.* 기반 재설계이며 양 트리(Linux/Windows) 구현이 CI check-contract 4종과 testbed 실측으로 검증된다. 구현이 반드시 지키는 불변식:
+
+- 인코딩: payload는 datapoint-array다. system.* 네임스페이스 -> metric `{type,unit,points:[{attr,value}]}`. envelope + `schema_version:"2.0"`. task.result/error는 v1 body 유지 + schema_version(task.result에 task_policy 추가).
+- 값: 에이전트는 raw 누적 카운터만 싣고 rate/delta/util/await는 엔진이 계산한다(stateless). base 단위 = seconds/bytes/ratio(0..1). jiffies/sectors/100ns/%를 에이전트에서 정규화한다.
+- device 안정키(id_type): 시계열 자연키는 이름이 아니라 안정 id다. Linux 디스크 dm/uuid -> serial -> by-path -> name, 파티션 partuuid -> name; Windows 디스크 gptid -> mbrsig -> serial -> name, 볼륨 volguid. 네트워크 = MAC(폴백 by-path/name). wwid/by-id/fsuuid 는 id_type enum 엔 있으나 현재 producer 미발행. name 은 표시용.
+- Windows 디스크 성능: throughput(io/operations)은 NtQuerySystemInformation(diskperf 독립·단조) 1차 + perflib 폴백을 유지한다. saturation(%util/await/queue)만 죽은 IOCTL_DISK_PERFORMANCE 대신 perflib PhysicalDisk로 뽑되, perflib는 diskperf 의존이라 raw!=0 & 단조일 때만 값·아니면 null(가짜 0 금지). EnableCounterForIoctl 등 시스템 레지스트리를 에이전트가 변경하지 않는다(관측 전용).
+- USE 축: U는 분모 있는 이용률(disk io_time, memory available, network link.speed), S는 PSI(14일 canonical = `pressure.stall.time` 적분) + run_queue/commit 폴백, E는 완전체로 파싱하되 사이징에 미반영(엔진 confidence 오염 게이트 + attention).
+- 커널/드라이버 하한 미달은 null(PSI 4.20+, MemAvailable 3.14+, oom_kill 4.13+, virtio-net link speed). 값 위조 없음.
