@@ -65,4 +65,6 @@ void wire_point_attr(cJSON *point, const char *k, const char *v);
 void wire_point_null(cJSON *point);
 void wire_point_value(cJSON *point, double v);
 
+void wire_point_dev_dir(cJSON *metric, const char *device, const char *direction, double value);
+
 #endif

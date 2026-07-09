@@ -114,6 +114,15 @@ void wire_point_value(cJSON *point, double v) { cJSON_AddNumberToObject(point, "
 
 void wire_point_null(cJSON *point) { cJSON_AddNullToObject(point, "value"); }
 
+
+/* device(+direction) 데이터포인트 한 줄 발행 — 가장 흔한 패턴의 헬퍼. direction 이 NULL 이면 device 만. */
+void wire_point_dev_dir(cJSON *metric, const char *device, const char *direction, double value)
+{
+	cJSON *p = wire_point(metric);
+	wire_point_attr(p, "device", device);
+	if (direction) wire_point_attr(p, "direction", direction);
+	wire_point_value(p, value);
+}
 /* 단일 무-attr scalar point 발행 헬퍼(gauge/counter 공통). */
 void wire_metric_scalar(cJSON *ns, const char *name, const char *type,
                           const char *unit, int have, double v)

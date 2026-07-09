@@ -159,9 +159,16 @@ static void metrics_collect_memory(cJSON *root)
 	}
 	wire_metric_scalar(ns, "memory.commit.usage", "gauge", "By", have_cu, (double)cu);
 	wire_metric_scalar(ns, "memory.commit.limit", "gauge", "By", have_cl, (double)cl);
-	/* oom_kill/hardware_corrupted: Windows 개념 없음 -> null(WHEA 는 P5). */
+	/* oom_kill/hardware_corrupted/edac: Windows 개념 없음 -> null(WHEA 는 P5). edac 는 correctable/
+	 * uncorrectable 2점 null 로 발행해 Linux 트리와 필드셋 패리티를 맞춘다(값 위조 아님, 측정불가=null). */
 	wire_metric_scalar(ns, "memory.oom_kill", "counter", "events", 0, 0);
 	wire_metric_scalar(ns, "memory.hardware_corrupted", "gauge", "By", 0, 0);
+	{
+		cJSON *edac = wire_metric(ns, "memory.edac", "counter", "errors");
+		cJSON *ep;
+		ep = wire_point(edac); wire_point_attr(ep, "type", "correctable");   wire_point_null(ep);
+		ep = wire_point(edac); wire_point_attr(ep, "type", "uncorrectable"); wire_point_null(ep);
+	}
 
 	cJSON *pns = wire_ns(root, "system.paging");
 	cJSON *po = wire_metric(pns, "paging.operations", "counter", "operations");
@@ -187,10 +194,10 @@ static void metrics_collect_disk(cJSON *root)
 	unsigned long long rop = 0, wop = 0, rby = 0, wby = 0;
 	if (query_system_io(&rop, &wop, &rby, &wby)) {
 		cJSON *p;
-		p = wire_point(m_io);  wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "read");  wire_point_value(p, (double)rby);
-		p = wire_point(m_io);  wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "write"); wire_point_value(p, (double)wby);
-		p = wire_point(m_ops); wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "read");  wire_point_value(p, (double)rop);
-		p = wire_point(m_ops); wire_point_attr(p, "device", "aggregate:system"); wire_point_attr(p, "direction", "write"); wire_point_value(p, (double)wop);
+		wire_point_dev_dir(m_io, "aggregate:system", "read", (double)rby);
+		wire_point_dev_dir(m_io, "aggregate:system", "write", (double)wby);
+		wire_point_dev_dir(m_ops, "aggregate:system", "read", (double)rop);
+		wire_point_dev_dir(m_ops, "aggregate:system", "write", (double)wop);
 	}
 
 	DWORD i_pd = perf_index("PhysicalDisk");
@@ -225,7 +232,8 @@ static void metrics_collect_disk(cJSON *root)
 				p = wire_point(m_iot); wire_point_attr(p, "device", dev);
 				if (c_idle && idle > 0) {
 					double busy = (double)monotonic_ms() / 1000.0 - (double)idle / 1e7;
-					wire_point_value(p, busy < 0 ? 0.0 : busy);
+					/* busy<0 은 시계 skew(uptime<idle) — 측정 불가라 null(가짜 0 금지). */
+					if (busy < 0) wire_point_null(p); else wire_point_value(p, busy);
 				} else wire_point_null(p);
 				p = wire_point(m_opt); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "read");
 				if (c_rt && perf_freq > 0) wire_point_value(p, (double)perf_read(cb, c_rt) / (double)perf_freq); else wire_point_null(p);
@@ -272,14 +280,14 @@ static void metrics_collect_network(cJSON *root)
 				char alias[256]; WideCharToMultiByte(CP_UTF8,0,r->Alias,-1,alias,sizeof alias,NULL,NULL);
 				char id[80]; mac_to_devid(r->PhysicalAddress, r->PhysicalAddressLength, alias, id, sizeof id);
 				cJSON *p;
-				p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->InOctets);
-				p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->OutOctets);
-				p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)(r->InUcastPkts + r->InNUcastPkts));
-				p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)(r->OutUcastPkts + r->OutNUcastPkts));
-				p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->InErrors);
-				p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->OutErrors);
-				p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->InDiscards);
-				p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->OutDiscards);
+				wire_point_dev_dir(m_io, id, "receive", (double)r->InOctets);
+				wire_point_dev_dir(m_io, id, "transmit", (double)r->OutOctets);
+				wire_point_dev_dir(m_pk, id, "receive", (double)(r->InUcastPkts + r->InNUcastPkts));
+				wire_point_dev_dir(m_pk, id, "transmit", (double)(r->OutUcastPkts + r->OutNUcastPkts));
+				wire_point_dev_dir(m_er, id, "receive", (double)r->InErrors);
+				wire_point_dev_dir(m_er, id, "transmit", (double)r->OutErrors);
+				wire_point_dev_dir(m_dr, id, "receive", (double)r->InDiscards);
+				wire_point_dev_dir(m_dr, id, "transmit", (double)r->OutDiscards);
 				p=wire_point(m_sp); wire_point_attr(p,"device",id);
 				ULONG64 spd = r->ReceiveLinkSpeed ? r->ReceiveLinkSpeed : r->TransmitLinkSpeed;
 				if (spd > 0 && spd != 0xFFFFFFFFFFFFFFFFULL) wire_point_value(p,(double)spd); else wire_point_null(p);
@@ -297,14 +305,14 @@ static void metrics_collect_network(cJSON *root)
 					char nm[32]; snprintf(nm, sizeof nm, "if%lu", (unsigned long)r->dwIndex);
 					char id[80]; mac_to_devid(r->bPhysAddr, r->dwPhysAddrLen, nm, id, sizeof id);
 					cJSON *p;
-					p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->dwInOctets);
-					p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->dwOutOctets);
-					p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)((double)r->dwInUcastPkts + r->dwInNUcastPkts));
-					p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)((double)r->dwOutUcastPkts + r->dwOutNUcastPkts));
-					p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->dwInErrors);
-					p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->dwOutErrors);
-					p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)r->dwInDiscards);
-					p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)r->dwOutDiscards);
+					wire_point_dev_dir(m_io, id, "receive", (double)r->dwInOctets);
+					wire_point_dev_dir(m_io, id, "transmit", (double)r->dwOutOctets);
+					wire_point_dev_dir(m_pk, id, "receive", (double)((double)r->dwInUcastPkts + r->dwInNUcastPkts));
+					wire_point_dev_dir(m_pk, id, "transmit", (double)((double)r->dwOutUcastPkts + r->dwOutNUcastPkts));
+					wire_point_dev_dir(m_er, id, "receive", (double)r->dwInErrors);
+					wire_point_dev_dir(m_er, id, "transmit", (double)r->dwOutErrors);
+					wire_point_dev_dir(m_dr, id, "receive", (double)r->dwInDiscards);
+					wire_point_dev_dir(m_dr, id, "transmit", (double)r->dwOutDiscards);
 					p=wire_point(m_sp); wire_point_attr(p,"device",id);
 					if (r->dwSpeed > 0) wire_point_value(p,(double)r->dwSpeed); else wire_point_null(p);
 				}

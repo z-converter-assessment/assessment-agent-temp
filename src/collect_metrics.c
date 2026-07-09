@@ -73,14 +73,14 @@ static void metrics_collect_disk(cJSON *root)
 		char id[300];
 		disk_device_id(dev, id, sizeof id);
 		cJSON *p;
-		p = wire_point(m_io);  wire_point_attr(p, "device", id); wire_point_attr(p, "direction", "read");  wire_point_value(p, (double)sr * 512.0);
-		if (n >= 10) { p = wire_point(m_io);  wire_point_attr(p, "device", id); wire_point_attr(p, "direction", "write"); wire_point_value(p, (double)sw * 512.0); }
-		p = wire_point(m_ops); wire_point_attr(p, "device", id); wire_point_attr(p, "direction", "read");  wire_point_value(p, (double)rc);
-		if (n >= 8)  { p = wire_point(m_ops); wire_point_attr(p, "device", id); wire_point_attr(p, "direction", "write"); wire_point_value(p, (double)wc); }
+		wire_point_dev_dir(m_io, id, "read", (double)sr * 512.0);
+		if (n >= 10) { wire_point_dev_dir(m_io, id, "write", (double)sw * 512.0); }
+		wire_point_dev_dir(m_ops, id, "read", (double)rc);
+		if (n >= 8)  { wire_point_dev_dir(m_ops, id, "write", (double)wc); }
 		p = wire_point(m_iot); wire_point_attr(p, "device", id);
 		if (n >= 13) wire_point_value(p, (double)ticks / 1000.0); else wire_point_null(p);
-		p = wire_point(m_opt); wire_point_attr(p, "device", id); wire_point_attr(p, "direction", "read");  wire_point_value(p, (double)tr / 1000.0);
-		if (n >= 11) { p = wire_point(m_opt); wire_point_attr(p, "device", id); wire_point_attr(p, "direction", "write"); wire_point_value(p, (double)tw / 1000.0); }
+		wire_point_dev_dir(m_opt, id, "read", (double)tr / 1000.0);
+		if (n >= 11) { wire_point_dev_dir(m_opt, id, "write", (double)tw / 1000.0); }
 		p = wire_point(m_pnd); wire_point_attr(p, "device", id);
 		if (n >= 12) wire_point_value(p, (double)inflight); else wire_point_null(p);
 	}
@@ -213,14 +213,14 @@ static void metrics_collect_network(cJSON *root)
 			if (n < 8) continue;
 			char id[320]; net_device_id(iface, id, sizeof id);
 			cJSON *p;
-			p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)rb);
-			p=wire_point(m_io); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)tb);
-			p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)rp);
-			p=wire_point(m_pk); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)tp);
-			p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)re);
-			p=wire_point(m_er); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)te);
-			p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","receive");  wire_point_value(p,(double)rd);
-			p=wire_point(m_dr); wire_point_attr(p,"device",id); wire_point_attr(p,"direction","transmit"); wire_point_value(p,(double)td);
+			wire_point_dev_dir(m_io, id, "receive", (double)rb);
+			wire_point_dev_dir(m_io, id, "transmit", (double)tb);
+			wire_point_dev_dir(m_pk, id, "receive", (double)rp);
+			wire_point_dev_dir(m_pk, id, "transmit", (double)tp);
+			wire_point_dev_dir(m_er, id, "receive", (double)re);
+			wire_point_dev_dir(m_er, id, "transmit", (double)te);
+			wire_point_dev_dir(m_dr, id, "receive", (double)rd);
+			wire_point_dev_dir(m_dr, id, "transmit", (double)td);
 			/* link.speed: /sys/class/net/<if>/speed(Mbps)->bit/s. virtio 부재/미지원 -> null(가짜 0 금지). */
 			char sp[300], spv[32]; snprintf(sp, sizeof sp, "/sys/class/net/%s/speed", iface);
 			p=wire_point(m_sp); wire_point_attr(p,"device",id);
