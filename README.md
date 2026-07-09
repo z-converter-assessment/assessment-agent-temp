@@ -27,9 +27,11 @@ Linux는 단일 바이너리지만 install이 호스트 init 시스템을 감지
 
 ## 설치 프롬프트
 
-`install`은 브로커 주소(`RABBITMQ_HOST`), worker 다운로드 허용 호스트(`WORKER_DOWNLOAD_ALLOWED_HOSTS`), 비밀번호를 대화형으로 물어보고 나머지 값은 기본값을 쓴다.
+`install`은 브로커 주소(`RABBITMQ_HOST`)와 비밀번호(`RABBITMQ_PASS`, `RABBITMQ_WORKER_PASS`)만 대화형으로 물어보고 나머지 값은 기본값을 쓴다.
 
-무인 설치 한 줄은 필수 값(브로커 주소, 비밀번호)만 채우면 된다. 끝의 `< /dev/null`(Windows는 `< NUL`)이 stdin을 닫아, 프롬프트로 안 채운 값은 기본값으로 자동 수락한다. worker 허용 호스트는 콤마로 여럿 이어 쓴다(기본값 `192.168.3.92,192.168.3.94` — 이미 2개). 다른 값을 쓰려면 해당 환경변수를 한 줄에 추가한다.
+worker 다운로드 허용 호스트(`WORKER_DOWNLOAD_ALLOWED_HOSTS`)는 사실상 고정이라 프롬프트하지 않고 기본값 `192.168.3.92,192.168.3.94`를 그대로 쓴다. 다른 값이 필요하면 설치 후 `agent.env`에서 수정하거나, 설치 시 해당 환경변수를 미리 지정한다(콤마로 여럿).
+
+무인 설치 한 줄은 필수 값(브로커 주소, 비밀번호)만 채우면 된다. 끝의 `< /dev/null`(Windows는 `< NUL`)이 stdin을 닫아, 프롬프트로 안 채운 값은 기본값으로 자동 수락한다.
 
 ## Linux (assessment-agent-linux-x86_64)
 
