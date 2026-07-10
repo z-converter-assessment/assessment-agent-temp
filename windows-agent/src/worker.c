@@ -127,6 +127,14 @@ static int write_file_atomic(const char *path, const char *content)
 	return 0;
 }
 
+/* 즉시 실패 task.result 를 results_dir/<task_id>.json 에 원자적 기록(다운로드/실행 전 거부 경로 공용). */
+static void child_write_result_file(const worker_ctx_t *ctx, const char *task_id, const char *json)
+{
+	char path[1024];
+	snprintf(path, sizeof path, "%s\\%s.json", ctx->results_dir, task_id);
+	write_file_atomic(path, json);
+}
+
 static int read_file_all(const char *path, char **out, size_t *out_len)
 {
 	FILE *f = fopen(path, "rb");
@@ -212,7 +220,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 {
 	cJSON *root = cJSON_CreateObject();
 	if (!root) return NULL;
-	cJSON_AddStringToObject(root, "schema_version",   "2.0");
+	cJSON_AddStringToObject(root, "schema_version",   "1.0");
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	/* machine_id 부재 시 null — inventory/metrics/error(add_common_metadata)와 통일. */
 	if (machine_id && *machine_id)
@@ -498,6 +506,21 @@ static void free_install_args(char **args)
 	free(args);
 }
 
+/* install_thread_arg_t 소유 필드 일괄 해제(job 핸들은 별도 CloseHandle). calloc 기반이라 부분초기화 안전. */
+static void free_install_thread_arg(install_thread_arg_t *a)
+{
+	if (!a) return;
+	free(a->task_id);
+	free(a->url);
+	free(a->sha256);
+	free(a->work_dir);
+	free(a->target_file);
+	free(a->result_path);
+	free(a->running_marker_path);
+	free_install_args(a->install_args);
+	free(a);
+}
+
 static unsigned __stdcall install_thread_main(void *arg)
 {
 	install_thread_arg_t *a = (install_thread_arg_t *)arg;
@@ -543,11 +566,7 @@ static unsigned __stdcall install_thread_main(void *arg)
 
 	if (a->running_marker_path) DeleteFileA(a->running_marker_path);
 
-	free(a->task_id);    free(a->url);         free(a->sha256);
-	free(a->work_dir);   free(a->target_file); free(a->result_path);
-	free(a->running_marker_path);
-	free_install_args(a->install_args);
-	free(a);
+	free_install_thread_arg(a);
 	return 0;
 }
 
@@ -638,9 +657,19 @@ static int ensure_connection(worker_ctx_t *ctx)
 	return 0;
 }
 
+/* task.install 계약 major 게이트. 값은 "major.minor"("1.0"), major 는 첫 '.' 이전 정수.
+   에이전트가 아는 major(1) 와 다르거나 부재면 특권 실행 전 거부. Linux 트리와 동일. */
+#define AGENT_CONTRACT_MAJOR 1
+static int schema_version_major_ok(const cJSON *jver)
+{
+	if (!cJSON_IsString(jver) || !jver->valuestring) return 0;
+	return atoi(jver->valuestring) == AGENT_CONTRACT_MAJOR;
+}
+
 static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 {
 	const cJSON *jid       = cJSON_GetObjectItemCaseSensitive(task, "task_id");
+	const cJSON *jver      = cJSON_GetObjectItemCaseSensitive(task, "schema_version");
 	const cJSON *jmachine  = cJSON_GetObjectItemCaseSensitive(task, "machine_id");
 	const cJSON *jdownload = cJSON_GetObjectItemCaseSensitive(task, "download");
 	const cJSON *jinstall  = cJSON_GetObjectItemCaseSensitive(task, "install");
@@ -648,17 +677,22 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	const char *task_id = cJSON_IsString(jid) ? jid->valuestring : NULL;
 	if (!task_id_valid(task_id)) return -1;
 
+	/* 버전 게이트: 다운로드/실행 전. major 미상/불일치 = 거부. */
+	if (!schema_version_major_ok(jver)) {
+		char *res = build_result_json(ctx, task_id, "failure", "unsupported_contract_version",
+		                              0, 0, 0, "",
+		                              "task.install schema_version major unsupported (agent expects 1.x)\n");
+		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
+		strncpy_s(ctx->inflight_task_id, sizeof ctx->inflight_task_id, task_id, _TRUNCATE);
+		return 1;
+	}
+
 	if (cJSON_IsString(jmachine) && ctx->cfg.machine_id &&
 	    strcmp(jmachine->valuestring, ctx->cfg.machine_id) != 0) {
 		char *res = build_result_json(ctx, task_id, "failure", "internal_error",
 		                              0, 0, 0, "",
 		                              "machine_id mismatch - task routed in error\n");
-		if (res) {
-			char rp[1024];
-			snprintf(rp, sizeof rp, "%s\\%s.json", ctx->results_dir, task_id);
-			write_file_atomic(rp, res);
-			free(res);
-		}
+		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
 		strncpy_s(ctx->inflight_task_id, sizeof ctx->inflight_task_id,
 		          task_id, _TRUNCATE);
 		return 1;
@@ -684,12 +718,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		                              "unsupported_install_type",
 		                              0, 0, 0, "",
 		                              "install.type not handled by this OS\n");
-		if (res) {
-			char rp[1024];
-			snprintf(rp, sizeof rp, "%s\\%s.json", ctx->results_dir, task_id);
-			write_file_atomic(rp, res);
-			free(res);
-		}
+		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
 
 		strncpy_s(ctx->inflight_task_id, sizeof ctx->inflight_task_id,
 		          task_id, _TRUNCATE);
@@ -753,21 +782,13 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 
 	if (!a->task_id || !a->url || !a->sha256 ||
 	    !a->work_dir || !a->target_file || !a->result_path || !a->running_marker_path) {
-		free(a->task_id); free(a->url); free(a->sha256);
-		free(a->work_dir); free(a->target_file); free(a->result_path);
-		free(a->running_marker_path);
-		free_install_args(a->install_args);
-		free(a);
+		free_install_thread_arg(a);
 		return -1;
 	}
 
 	if (write_running_marker(ctx, a->task_id) != 0) {
 		fprintf(stderr, "[worker] write_running_marker failed for %s - aborting spawn\n", a->task_id);
-		free(a->task_id); free(a->url); free(a->sha256);
-		free(a->work_dir); free(a->target_file); free(a->result_path);
-		free(a->running_marker_path);
-		free_install_args(a->install_args);
-		free(a);
+		free_install_thread_arg(a);
 		return -1;
 	}
 
@@ -775,11 +796,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 	if (!job) {
 		fprintf(stderr, "[worker] CreateJobObjectA failed for %s - aborting spawn\n", a->task_id);
 		clear_running_marker(ctx, a->task_id);
-		free(a->task_id); free(a->url); free(a->sha256);
-		free(a->work_dir); free(a->target_file); free(a->result_path);
-		free(a->running_marker_path);
-		free_install_args(a->install_args);
-		free(a);
+		free_install_thread_arg(a);
 		return -1;
 	}
 	ctx->install_job = job;
@@ -790,11 +807,7 @@ static int spawn_install(worker_ctx_t *ctx, cJSON *task)
 		CloseHandle(job);
 		ctx->install_job = NULL;
 		clear_running_marker(ctx, a->task_id);
-		free(a->task_id); free(a->url); free(a->sha256);
-		free(a->work_dir); free(a->target_file); free(a->result_path);
-		free(a->running_marker_path);
-		free_install_args(a->install_args);
-		free(a);
+		free_install_thread_arg(a);
 		return -1;
 	}
 	ctx->install_thread = (HANDLE)th;

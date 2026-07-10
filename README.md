@@ -1,6 +1,6 @@
 # assessment-agent-temp
 
-운영 서버에 설치해 시스템 인벤토리와 자원 지표를 수집하고 브로커로 보내는 수집 에이전트다. OS에 맞춰 Linux용 또는 Windows용 바이너리 하나만 설치한다.
+운영 서버에 설치해 자산 인벤토리와 자원 지표를 수집하고 메시지 브로커(RabbitMQ)로 보내는 수집 에이전트다. 수집한 데이터는 엔진이 fleet 용량 계획(right-sizing)에 쓴다. OS에 맞춰 Linux용 또는 Windows용 바이너리 하나만 설치한다.
 
 ## 릴리즈 산출물
 
@@ -9,7 +9,7 @@
 | assessment-agent-linux-x86_64 | 전 x86_64 Linux (커널 2.6.32 이상, 배포판/glibc 무관) |
 | assessment-agent-windows-x86.exe | Windows XP SP2 / Server 2003 SP1 이상 (Win7-11, Server 2016+ 포함; 32/64비트 공통) |
 
-둘 다 정적 링크라 OpenSSL/curl 같은 런타임 의존성을 따로 깔 필요가 없다. Linux 바이너리는 배포판이나 glibc 버전과 무관하게 커널 2.6.32 이상이면 그대로 돌고, Windows 바이너리는 한 파일로 2003/XP부터 최신 Windows까지 커버한다(64비트 Windows에서도 그대로 동작하며, 실행 시 OS 세대를 감지해 그 OS가 지원하는 범위의 데이터를 수집한다).
+둘 다 정적 링크라 OpenSSL/curl 같은 런타임 의존성을 따로 깔 필요가 없다. Linux 바이너리는 배포판이나 glibc 버전과 무관하게 커널 2.6.32 이상이면 그대로 돌고, Windows 바이너리는 한 파일로 2003/XP부터 최신 Windows까지 커버한다(64비트 Windows 포함).
 
 두 바이너리 모두 `install` 서브커맨드 하나가 설치, 설정 프롬프트, 서비스 등록까지 처리한다. 아래에서 대상 OS 항목 하나만 그대로 따라가면 된다 — 각 항목은 그것만 봐도 되도록 독립적으로 정리했다.
 
@@ -101,4 +101,4 @@ assessment-agent-windows-x86.exe uninstall         :: 제거
 
 ## 빌드 / 릴리즈
 
-소스 빌드(2종), CI 태그 릴리즈, 저장소 트리는 [docs/BUILD.md](docs/BUILD.md)를 본다. wire 계약(에이전트 -> 엔진 페이로드)은 [docs/payload-contract.md](docs/payload-contract.md).
+소스 빌드(2종), CI 태그 릴리즈, 저장소 트리는 [docs/BUILD.md](docs/BUILD.md)를 본다. wire 계약(에이전트 -> 엔진 페이로드)은 [docs/payload-contract.md](docs/payload-contract.md). 설계 전반(아키텍처 원칙, OS별 커버 전략, 발행/권한 모델)은 [docs/architecture.md](docs/architecture.md).

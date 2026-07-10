@@ -167,7 +167,7 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	char now_buf[32];
 	iso8601_utc(ts.tv_sec, now_buf, sizeof now_buf);
 
-	cJSON_AddStringToObject(root, "schema_version",   "2.0");
+	cJSON_AddStringToObject(root, "schema_version",   "1.0");
 	cJSON_AddStringToObject(root, "message_type",     "task.result");
 	/* machine_id 부재 시 null(다른 메시지와 통일) — ""로 채우면 같은 호스트가 메시지별로 ""/null 로 갈려 감사/조인이 오염된다. */
 	if (machine_id && *machine_id)
@@ -275,6 +275,15 @@ static void child_write_result_file(const worker_ctx_t *ctx,
 	write_file_atomic(path, json);
 }
 
+/* task.install 계약 major 게이트. 값은 "major.minor"("1.0"), major 는 첫 '.' 이전 정수.
+   에이전트가 아는 major(1) 와 다르거나 부재면 특권 실행 전 거부. */
+#define AGENT_CONTRACT_MAJOR 1
+static int schema_version_major_ok(const cJSON *jver)
+{
+	if (!cJSON_IsString(jver) || !jver->valuestring) return 0;
+	return atoi(jver->valuestring) == AGENT_CONTRACT_MAJOR;
+}
+
 static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 {
 
@@ -282,6 +291,7 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	close_inherited_fds();
 
 	const cJSON *jid       = cJSON_GetObjectItemCaseSensitive(task, "task_id");
+	const cJSON *jver      = cJSON_GetObjectItemCaseSensitive(task, "schema_version");
 	const cJSON *jmachine  = cJSON_GetObjectItemCaseSensitive(task, "machine_id");
 	const cJSON *jdownload = cJSON_GetObjectItemCaseSensitive(task, "download");
 	const cJSON *jinstall  = cJSON_GetObjectItemCaseSensitive(task, "install");
@@ -289,6 +299,14 @@ static void child_run_task(worker_ctx_t *ctx, cJSON *task)
 	const char *task_id = cJSON_IsString(jid) ? jid->valuestring : NULL;
 	if (!task_id_valid(task_id)) {
 		_exit(2);
+	}
+
+	/* 버전 게이트: 다운로드/실행 전. major 미상/불일치 = 거부(의미 드리프트를 특권으로 실행하지 않음). */
+	if (!schema_version_major_ok(jver)) {
+		char *res = build_result_json(ctx, task_id, "failure", "unsupported_contract_version",
+		                              0, 0, 0, 0, "", "task.install schema_version major unsupported (agent expects 1.x)\n");
+		if (res) { child_write_result_file(ctx, task_id, res); free(res); }
+		_exit(0);
 	}
 
 	if (cJSON_IsString(jmachine) && ctx->cfg.machine_id &&

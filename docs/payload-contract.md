@@ -1,7 +1,7 @@
-# payload 계약 v2 (에이전트 -> 엔진)
+# payload 계약 (에이전트 -> 엔진)
 
 에이전트가 RabbitMQ 브로커로 발행하는 wire 계약. 이 문서는 산문 설명이고,
-기계검증 가능한 정본(source of truth)은 `schema/wire.schema.json`(JSON Schema, `schema_version:"2.0"`)이다.
+기계검증 가능한 정본(source of truth)은 `schema/wire.schema.json`(JSON Schema, `schema_version:"1.0"`)이다.
 CI가 두 바이너리의 `emit` dry-run 출력(inventory / metrics / task.result / error 4종 전부)을 이
 스키마로 강제해(`scripts/check-contract.sh`), 리눅스-윈도우 트리 간 드리프트와 자기계약 위반을
 릴리즈 전에 잡는다. 로컬 검증:
@@ -12,7 +12,7 @@ CI가 두 바이너리의 `emit` dry-run 출력(inventory / metrics / task.resul
 USE Method(Utilization/Saturation/Errors) 해석(Layer 2)은 엔진이 한다. USE 는 평가 프레임이지
 스키마가 아니므로 wire 에 넣지 않는다 — raw 사실만 싣고 파생(rate/util/await/ratio)은 소비자가
 계산하는 Prometheus/OpenTelemetry 공통 컨벤션을 따른다. metrics/inventory 는 OTel system.* semantic
-conventions 의 네이밍/속성/단위/카운터 타이핑에 맞춘다. 대표 예시는 `docs/wire-examples.v2.json`,
+conventions 의 네이밍/속성/단위/카운터 타이핑에 맞춘다. 대표 예시는 `docs/wire-examples.json`,
 사이징 해석 의도는 `docs/classification-rationale.md`.
 
 ## 인코딩 규약
@@ -40,12 +40,11 @@ conventions 의 네이밍/속성/단위/카운터 타이핑에 맞춘다. 대표
 | task.result | task.result | worker task 완료 시 |
 
 worker 는 `agent.tasks.{agent_id}` 큐를 구독하고, 엔진은 그 큐로 task 를 발행한다.
-metrics/inventory 는 v2 재설계(envelope + system.* / block_devices) 대상이고, task.result/error 는
-v1 body 를 v2 envelope 아래 그대로 유지하며 `schema_version` 만 추가한다(task.result 에 `task_policy` 추가).
+metrics/inventory 는 envelope + system.*/block_devices 를 싣고, task.result/error 는 envelope + 실행 결과·실패 body 를 싣는다(task.result 에 `task_policy` 추가).
 
 ## 공통 메타데이터 (모든 메시지)
 
-schema_version("2.0"), message_type, message_id, hostname, machine_id, composite_id, agent_id,
+schema_version("1.0"), message_type, message_id, hostname, machine_id, composite_id, agent_id,
 agent_version, boot_time, collected_at, agent_started_at, os_family.
 
 ## 식별과 라우팅
@@ -63,14 +62,26 @@ payload agent_version 은 스키마 계약 버전이 아니라 릴리즈/빌드 
 CI 가 git 태그에서 주입한다(`v1.0.0` -> `1.0.0`). 로컬/dev 빌드는 `0.0.0-dev`. 엔진은 이 값을 스키마
 분기 gate 로 쓰지 않고 opaque 메타데이터로 저장한다.
 
+`schema_version`(현재 `"1.0"`, major.minor)은 시스템 통일 계약 버전이다 — wire/assessment API/export/task.install 이
+한 major 축을 공유한다(엔진 `contract.py` CONTRACT_VERSION 정본). additive 변경(필드/enum 추가)은 버전을 올리지
+않고 소비자가 미지 필드를 관용한다. 구조 파괴만 major 범프(엔진+에이전트+DR 동시 flag-day). 인바운드 task.install 은
+에이전트가 major 게이트를 강제한다(major!=1/부재 = 다운로드·실행 전 거부, `failure_reason="unsupported_contract_version"`).
+
 ## inventory 필드 (정적 서술자)
 
 호스트 정적 사실. 파생 불가한 host-only 값이다.
 
 - hostname, os_id, os_version, os_codename(Windows null), kernel_version, cpu_model, cpu_cores(논리 코어),
   mem_total_bytes(By), ip_external(IMDS best-effort, 없으면 null).
-- services[]: 서비스 카탈로그(unit/sub/pid/exe). 열거 불가면 null(빈배열과 구분). v1 형태 유지.
-- listen_ports[]: 리슨 소켓(proto/addr/port/uid/pid/comm). 포트 기반 서비스 분류용. v1 형태 유지.
+- OS 재현 서술자(flat 최상위): arch(uname machine / wProcessorArchitecture), bits(32|64, arch 파생),
+  boot_firmware(uefi|bios|null; Linux /sys/firmware/efi, Windows GetFirmwareType/env 폴백),
+  secure_boot(bool|null; Linux efivars, Windows SecureBoot\State), edition(Windows EditionID, Linux null),
+  timezone(Linux IANA / Windows tz 키명 원문, 엔진이 IANA 매핑), rtc_utc(bool|null; Linux /etc/adjtime, Windows RealTimeIsUniversal).
+- boot(object|null): kernel_cmdline, root_ref_type(uuid|label|partuuid|path), grub_install_target. Linux /proc/cmdline,
+  Windows null(GRUB/cmdline 개념 부재).
+- nonblock_mounts[](Linux; Windows null): 블록장치 없는 마운트(tmpfs/nfs/cifs/9p/fuse.* + bind). {source,target,fstype,options[],fs_freq,fs_passno}.
+- services[]: 서비스 카탈로그(unit/sub/pid/exe). 열거 불가면 null(빈배열과 구분).
+- listen_ports[]: 리슨 소켓(proto/addr/port/uid/pid/comm). 포트 기반 서비스 분류용.
 - block_devices[], net_interfaces[], lvm_vgs[](Linux 조건부): 아래 "스토리지/네트워크 토폴로지".
 
 ## metrics 필드 (system.* 네임스페이스)
@@ -111,7 +122,7 @@ Windows saturation 은 죽은 IOCTL_DISK_PERFORMANCE 대신 perflib PhysicalDisk
 | disk.io_time | counter | s | device | diskstats io_ticks(ms->s) | perflib % Idle Time raw(busy=uptime-idle) | perflib 인스턴스 부재 |
 | disk.operation_time | counter | s | device, direction | diskstats time_reading/writing(ms->s) | perflib Avg. Disk sec/Read,Write raw(ticks/PerfFreq->s) | 인스턴스 부재 |
 | disk.pending_operations | gauge | operations | device | diskstats in_flight | perflib Current Disk Queue Length | 인스턴스 부재 |
-| disk.errors | counter | errors | device, type(mismatch/fs) | mdraid mismatch_cnt + ext4 errors_count | (best-effort/null) | 소스 부재 -> 미발행 |
+| disk.errors | counter | errors | device, type(mismatch/fs) | mdraid mismatch_cnt + ext4 errors_count | (개념 부재 -> 빈 metric) | metric 키 항상 발행; 소스 부재 시 빈 points |
 
 - Windows 전역 집계는 `device="aggregate:system"`, per-disk 는 `device="name:PhysicalDriveN"`.
   둘을 분리해 await(Δoperation_time/Δoperations)가 per-disk 에서 정확히 페어된다.
@@ -128,7 +139,7 @@ Windows saturation 은 죽은 IOCTL_DISK_PERFORMANCE 대신 perflib PhysicalDisk
 | network.dropped | counter | packets | device, direction | /proc/net/dev drop | In/OutDiscards | - |
 | network.link.speed | gauge | bit/s | device | /sys/class/net/*/speed(Mbps->bit/s) | Receive/TransmitLinkSpeed | virtio-net/가상 NIC 부재 -> null |
 | network.tcp.retransmits | counter | segments | - | /proc/net/snmp RetransSegs | GetTcpStatistics dwRetransSegs | - |
-| network.conntrack.usage/.limit | gauge | entries | - | nf_conntrack_count/max | (부재) | 모듈 미로드; Windows |
+| network.conntrack.usage/.limit | gauge | entries | - | nf_conntrack_count/max | (개념 부재 -> null) | 모듈 미로드 또는 Windows -> null |
 
 ### system.pressure (PSI; Linux 4.20+; Windows null)
 
@@ -167,21 +178,40 @@ parent(부모의 id 값; root=null; 부모 복수면 노드 반복), id + id_typ
 - type: disk/part/lvm/crypt/raid/mpath/dynamic/volume/swap(pass-through). swap=스왑 파티션/pagefile 노드.
 - Linux 수집: /sys/block whole-disk + 파티션 + dm(dm/uuid prefix 로 lvm/crypt/mpath 판정)/md,
   슬레이브(/sys/block/*/slaves)로 parent 링크, swap 은 /proc/swaps.
-- Windows 수집: 물리디스크(IOCTL_DISK_GET_LENGTH_INFO) + 볼륨(FindFirstVolume). 볼륨->디스크 parent 는
-  IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS(스팬/동적 볼륨은 extent 디스크별로 노드 반복). 성능 IOCTL 과
-  별개인 레이아웃 IOCTL(DRIVE_LAYOUT_EX)은 구세대 viostor 에서도 동작.
+- Windows 수집: 물리디스크(IOCTL_DISK_GET_LENGTH_INFO) + part(IOCTL_DISK_GET_DRIVE_LAYOUT_EX, parent=disk id) +
+  볼륨(FindFirstVolume). 볼륨->디스크 parent 는 IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS(스팬/동적 볼륨은 extent
+  디스크별로 노드 반복). 레이아웃 IOCTL(DRIVE_LAYOUT_EX)은 구세대 viostor 에서도 동작.
 
-### lvm_vgs[] (Linux 조건부; Windows 부재)
+재현(reproduction) 확장 키는 자연 노드타입에만 발행하고 비해당 노드는 키를 생략한다(엔진 OUTPUT 에서 null).
+- disk 노드: partition_table(gpt|mbr|null), sector_size, serial, wwn(0x+소문자hex; Windows 대부분 null),
+  rotational(true HDD/false SSD). Linux sysfs queue/*, Windows geometry/STORAGE_DEVICE_DESCRIPTOR/seek-penalty(NT5.2 null).
+- part 노드: part_number, part_start_bytes, part_type(MBR '0x'+hex / GPT 소문자무중괄호 GUID), part_name(GPT 레이블),
+  part_flags(esp/bios_grub/lvm/raid/swap/msftres + required/legacy_boot/hidden/no_automount/boot; 무플래그=[], 파싱실패=null).
+  Linux=GPT LBA1/MBR LBA0 직독(O_NONBLOCK+bounded)+sysfs, Windows=DRIVE_LAYOUT_EX. id_type=partuuid(GPT)/name(MBR).
+- fs 얹힌 노드: fs_uuid, fs_label, block_size, mount_options[], fs_freq, fs_passno. Linux=by-uuid/by-label 역매핑+
+  statvfs+fstab(UUID=/LABEL=/PARTUUID=/dev/마운트포인트 매칭), Windows=GetVolumeInformation(볼륨시리얼 XXXX-XXXX/label)+클러스터.
+- lvm 노드: lvm_vg, lvm_lv(dm/name 파싱), lvm_segtype, lvm_stripes, lvm_stripe_size_kib(/etc/lvm/backup 파싱).
+- raid 노드: raid_level(0|1|5|6|10, 비수치 null), raid_chunk_kib, raid_metadata, raid_uuid(/sys/block/md*/md/*).
+- crypt 노드: crypt_type(luks1|luks2|null; dm/uuid CRYPT-LUKS prefix). 그 외(PLAIN/VERITY/BitLocker)=null.
 
-{name, size_bytes, free_bytes} + 씬풀 {data_percent, metadata_percent}. VG size/free 와 thin data%/metadata%
-는 lvm2 툴(vgs/lvs) 또는 LVM 메타데이터 파싱이 필요한데, 정적 musl 에이전트는 이를 쓰지 않아 현재 미발행이다
-(testbed 실측에서 lvm_vgs=null 확인). LVM 토폴로지 자체는 block_devices 의 type=lvm 노드(dm/uuid parent 체인)로
-커버되며, VG 미할당 free(확장 여력) 신호만 빠진다 — 향후 과제(best-effort vgs 쉘 또는 메타데이터 파싱).
+### lvm_vgs[] (Linux; /etc/lvm/backup 존재 시)
+
+{name, vg_uuid, extent_size_bytes} + 미발행 슬롯 {size_bytes, free_bytes, data_percent, metadata_percent, pv_ids}=null.
+/etc/lvm/backup/<vg> 텍스트 메타데이터 파싱(device raw read 없이)으로 name/vg_uuid/extent_size 를 뽑는다. VG size/free 와
+thin data%/metadata%, pv_ids(PV 조인)는 lvm2 툴 또는 온디스크 파싱(I/O 행 위험)이 필요해 null(후속 협의). LVM 토폴로지는
+block_devices 의 type=lvm 노드(dm/uuid parent 체인 + lvm_vg/lvm_lv/segtype/stripes)로 커버된다. /etc/lvm/backup 부재 시 키 생략.
 
 ### net_interfaces[]
 
-{name(표시용), id, id_type, kind, speed_mbps, addresses[], gateway}. addresses[]={address, prefix, family}.
-Linux getifaddrs + /sys/class/net(MAC id, 폴백 by-path/name). Windows GetAdaptersAddresses(MAC id).
+{name(표시용), id, id_type, kind, speed_mbps, addresses[], gateway, mtu, dns[], routes[], bond_mode, vlan_id}.
+addresses[]={address, prefix, family, origin}. Linux getifaddrs + /sys/class/net(MAC id, 폴백 by-path/name).
+Windows GetAdaptersAddresses(MAC id).
+
+- mtu: Linux sysfs mtu / Windows Mtu. routes[]: 정적 비-default IPv4 {dest CIDR, via}(Linux /proc/net/route dest!=0 & gw!=0,
+  Windows GetIpForwardTable NETMGMT). 조회실패 null, 무라우트 [].
+- dns[]: Linux 전역 /etc/resolv.conf 를 default-route 인터페이스에만 부착(그 외 null), Windows per-adapter FirstDnsServerAddress.
+- bond_mode: Linux sysfs bonding/mode raw 토큰(엔진 정규화), Windows null. vlan_id: Linux /proc/net/vlan VID, Windows null.
+- origin(static|dhcp): Windows NT6+ PrefixOrigin 실측(NT5.2 null), Linux null(getifaddrs 미구분, netlink IFA_F_PERMANENT 후속).
 
 ### device 안정키 (계층 폴백)
 
@@ -215,7 +245,7 @@ E축은 사이징 숫자가 아니라 엔진의 confidence(오염 게이트) + m
 
 ## task.result / error 필드
 
-v1 body 를 v2 envelope 아래 유지 + schema_version. 상세 필드/조건은 스키마 $defs(task_result/error) 참조.
+envelope + 실행 결과·실패 body. 상세 필드/조건은 스키마 $defs(task_result/error) 참조.
 
 - task.result: task_id 로 매칭. exit_code/signal_no 상호배타(Windows signal_no 항상 null).
   task_policy(bool\|null)는 exit_code 보다 우선. boot_time/agent_started_at 은 워커 컨텍스트라 nullable.

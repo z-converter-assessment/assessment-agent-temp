@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -41,6 +42,9 @@ static cJSON *inv_collect_block_devices(void);
 static cJSON *inv_collect_external_ip(void);
 static cJSON *inv_collect_listen_ports(void);
 static cJSON *inv_collect_net_interfaces(void);
+static cJSON *inv_collect_lvm_vgs(void);
+static cJSON *inv_collect_boot(void);
+static cJSON *inv_collect_nonblock_mounts(void);
 static cJSON *inv_collect_services(void);
 static cJSON *inv_collect_services_sysv(void);
 static const char *dev_id_type(const char *full);
@@ -59,7 +63,7 @@ static int read_pid_comm(int pid, char *out, size_t out_len);
 static int read_sysv_pidfile(const char *name);
 static struct sock_inode_owner *build_socket_owner_map(size_t *out_count);
 static void add_cpu_model(cJSON *root);
-static void bd_add(cJSON *arr, const char *name, const char *type, long long size,
+static cJSON *bd_add(cJSON *arr, const char *name, const char *type, long long size,
                    const char *fst, const char *mnt, const char *parent, const char *idfull);
 static void parse_tcp_v4_hex_addr(const char *hex8, char *out, size_t out_len);
 static void parse_tcp_v6_hex_addr(const char *hex32, char *out, size_t out_len);
@@ -769,6 +773,117 @@ static cJSON *inv_collect_listen_ports(void)
 	return arr;
 }
 
+/* 재현 os 확장. arch/bits/boot_firmware/secure_boot/edition(Linux null)/timezone/rtc_utc.
+   미측정=null(위조 금지). edition 은 Windows 전용이라 Linux 는 항상 null. */
+
+/* secure_boot: efivars SecureBoot-<GUID> 파일 5번째 바이트(offset 4)=1 활성/0 비활성. 부재=null */
+static void os_add_secure_boot(cJSON *root)
+{
+	DIR *d = opendir("/sys/firmware/efi/efivars");
+	if (!d) {
+		cJSON_AddNullToObject(root, "secure_boot");
+		return;
+	}
+	struct dirent *e;
+	int done = 0;
+	while ((e = readdir(d)) != NULL) {
+		if (strncmp(e->d_name, "SecureBoot-", 11) != 0)
+			continue;
+		char path[512];
+		snprintf(path, sizeof path, "/sys/firmware/efi/efivars/%s", e->d_name);
+		FILE *f = fopen(path, "rb");
+		if (!f)
+			break;
+		unsigned char buf[8];
+		size_t n = fread(buf, 1, sizeof buf, f);
+		fclose(f);
+		if (n >= 5) {
+			cJSON_AddBoolToObject(root, "secure_boot", buf[4] ? 1 : 0);
+			done = 1;
+		}
+		break;
+	}
+	closedir(d);
+	if (!done)
+		cJSON_AddNullToObject(root, "secure_boot");
+}
+
+/* timezone: /etc/localtime 심링크 -> ".../zoneinfo/<IANA>" 에서 IANA 원문. 폴백 /etc/timezone. 부재=null */
+static void os_add_timezone(cJSON *root)
+{
+	char link[512];
+	ssize_t n = readlink("/etc/localtime", link, sizeof link - 1);
+	if (n > 0) {
+		link[n] = '\0';
+		const char *z = strstr(link, "zoneinfo/");
+		if (z && z[9]) {
+			cJSON_AddStringToObject(root, "timezone", z + 9);
+			return;
+		}
+	}
+	char *tz = read_file_all("/etc/timezone");
+	if (tz) {
+		char *p = tz;
+		while (*p && *p != '\n' && *p != '\r')
+			p++;
+		*p = '\0';
+		if (tz[0]) {
+			cJSON_AddStringToObject(root, "timezone", tz);
+			free(tz);
+			return;
+		}
+		free(tz);
+	}
+	cJSON_AddNullToObject(root, "timezone");
+}
+
+/* rtc_utc: /etc/adjtime 3번째 줄 "UTC"=true / "LOCAL"=false. 부재=null(위조 금지) */
+static void os_add_rtc_utc(cJSON *root)
+{
+	char *a = read_file_all("/etc/adjtime");
+	if (!a) {
+		cJSON_AddNullToObject(root, "rtc_utc");
+		return;
+	}
+	/* 3번째 줄로 이동 */
+	char *l1 = strchr(a, '\n');
+	char *l2 = l1 ? strchr(l1 + 1, '\n') : NULL;
+	char *l3 = l2 ? l2 + 1 : NULL;
+	if (l3 && strncmp(l3, "UTC", 3) == 0)
+		cJSON_AddBoolToObject(root, "rtc_utc", 1);
+	else if (l3 && strncmp(l3, "LOCAL", 5) == 0)
+		cJSON_AddBoolToObject(root, "rtc_utc", 0);
+	else
+		cJSON_AddNullToObject(root, "rtc_utc");
+	free(a);
+}
+
+static void inv_collect_os_repro(cJSON *root)
+{
+	struct utsname u;
+	int have = (uname(&u) == 0);
+	if (have && u.machine[0]) {
+		cJSON_AddStringToObject(root, "arch", u.machine);
+		/* bits: u.machine 문자열 매핑(sizeof(void*) 아님). "64" 포함 또는 s390x=64, 그 외 32 */
+		int is64 = (strstr(u.machine, "64") != NULL) || (strcmp(u.machine, "s390x") == 0);
+		cJSON_AddNumberToObject(root, "bits", is64 ? 64 : 32);
+	} else {
+		cJSON_AddNullToObject(root, "arch");
+		cJSON_AddNullToObject(root, "bits");
+	}
+	/* boot_firmware: /sys/firmware/efi 존재=uefi, /sys/firmware 만=bios, /sys 미접근=null */
+	if (access("/sys/firmware/efi", F_OK) == 0)
+		cJSON_AddStringToObject(root, "boot_firmware", "uefi");
+	else if (access("/sys/firmware", F_OK) == 0)
+		cJSON_AddStringToObject(root, "boot_firmware", "bios");
+	else
+		cJSON_AddNullToObject(root, "boot_firmware");
+	os_add_secure_boot(root);
+	cJSON_AddNullToObject(root, "edition"); /* Linux 없음 */
+	os_add_timezone(root);
+	os_add_rtc_utc(root);
+}
+
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -779,10 +894,11 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	int ok = 1;
 	add_os_release(root);
 	if (!add_kernel_version(root))     ok = 0;
+	inv_collect_os_repro(root);
 	if (!add_cpu_cores(root))          ok = 0;
 	add_cpu_model(root);
 
-	/* mem_total_bytes (base 단위). swap 은 block_devices type=swap 노드로(P4). */
+	/* mem_total_bytes (base 단위). swap 은 block_devices type=swap 노드로. */
 	{
 		char *mi = read_file_all("/proc/meminfo");
 		long kb = mi ? meminfo_get_kb(mi, "MemTotal") : -1;
@@ -797,6 +913,16 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	cJSON_AddItemToObject(root, "block_devices",  wire_or_empty_array(inv_collect_block_devices()));
 	cJSON_AddItemToObject(root, "net_interfaces", wire_or_empty_array(inv_collect_net_interfaces()));
+	{
+		/* lvm_vgs: /etc/lvm/backup 있을 때만 발행(LVM 미설치 호스트는 키 생략) */
+		cJSON *lvgs = inv_collect_lvm_vgs();
+		if (lvgs) cJSON_AddItemToObject(root, "lvm_vgs", lvgs);
+	}
+	cJSON_AddItemToObject(root, "boot", inv_collect_boot());
+	{
+		cJSON *nbm = inv_collect_nonblock_mounts();
+		if (nbm) cJSON_AddItemToObject(root, "nonblock_mounts", nbm);
+	}
 
 	if (!ok) {
 		cJSON_Delete(root);
@@ -871,7 +997,634 @@ static int dev_mount_info(const char *name, char *fst, size_t fsz, char *mnt, si
 	return found;
 }
 
-static void bd_add(cJSON *arr, const char *name, const char *type, long long size,
+/* ---- 파티션 테이블 파서: GPT(LBA1)/MBR(LBA0) 직독 ----
+   O_NONBLOCK open(미디어 대기 hang 회피) + bounded pread. 실패 시 그 디스크만 kind=none.
+   part_type/name/flags 는 이 테이블과 sysfs 시작오프셋 매칭으로 채운다. */
+
+#define PT_MAX 128
+
+struct pt_ent {
+	unsigned long long start_lba;   /* 테이블 LBA 단위(GPT=논리섹터, MBR=512 가정) */
+	char type[40];                  /* "0x83" 또는 소문자 무중괄호 GUID */
+	char name[128];                 /* GPT 레이블(UTF-8), MBR="" */
+	unsigned long long attr;        /* GPT 속성 비트 */
+	unsigned char mbr_status;       /* MBR status(0x80=active) */
+	unsigned char mbr_type;         /* MBR type 바이트 */
+	int is_mbr;
+};
+
+struct pt_table {
+	int kind;   /* 0 none, 1 gpt, 2 mbr */
+	int lbs;    /* 논리 섹터 크기(GPT LBA -> byte 환산) */
+	int n;
+	struct pt_ent e[PT_MAX];
+};
+
+static unsigned pt_le32(const unsigned char *p)
+{
+	return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+static unsigned long long pt_le64(const unsigned char *p)
+{
+	return (unsigned long long)pt_le32(p) | ((unsigned long long)pt_le32(p + 4) << 32);
+}
+
+static int disk_logical_block_size(const char *dev)
+{
+	char p[320], v[64];
+	snprintf(p, sizeof p, "/sys/block/%s/queue/logical_block_size", dev);
+	if (read_sysfs_str(p, v, sizeof v)) {
+		int b = atoi(v);
+		if (b > 0) return b;
+	}
+	return 512;
+}
+
+/* GPT type GUID(소문자 무중괄호) -> parted 계열 시맨틱 플래그명. 없으면 NULL */
+static const char *gpt_type_flag(const char *guid)
+{
+	if (!strcmp(guid, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b")) return "esp";
+	if (!strcmp(guid, "21686148-6449-6e6f-744e-656564454649")) return "bios_grub";
+	if (!strcmp(guid, "e6d6d379-f507-44c2-a23c-238f2a3df928")) return "lvm";
+	if (!strcmp(guid, "a19d880f-05fc-4d3b-a006-743f0f84911e")) return "raid";
+	if (!strcmp(guid, "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f")) return "swap";
+	if (!strcmp(guid, "e3c9e316-0b5c-4db8-817d-f92df00215ae")) return "msftres";
+	return NULL;
+}
+
+/* MBR type 바이트 -> 시맨틱 플래그명. 없으면 NULL */
+static const char *mbr_type_flag(unsigned char t)
+{
+	switch (t) {
+	case 0x82: return "swap";
+	case 0x8e: return "lvm";
+	case 0xfd: return "raid";
+	case 0xef: return "esp";
+	default:   return NULL;
+	}
+}
+
+/* 16바이트 GPT GUID -> 소문자 무중괄호 문자열(mixed-endian: 앞 3필드 LE, 뒤 2필드 BE). */
+static void gpt_guid_str(const unsigned char *g, char *out, size_t outsz)
+{
+	snprintf(out, outsz,
+	    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+	    g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6],
+	    g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+}
+
+/* UTF-16LE(최대 in_bytes, NUL 종단) -> UTF-8. BMP만(서로게이트는 건너뜀). */
+static void utf16le_to_utf8(const unsigned char *in, size_t in_bytes, char *out, size_t outsz)
+{
+	size_t oi = 0;
+	for (size_t i = 0; i + 1 < in_bytes && oi + 1 < outsz; i += 2) {
+		unsigned cp = (unsigned)in[i] | ((unsigned)in[i + 1] << 8);
+		if (cp == 0) break;
+		if (cp >= 0xD800 && cp <= 0xDFFF) continue; /* 서로게이트 반쪽 무시 */
+		if (cp < 0x80) {
+			out[oi++] = (char)cp;
+		} else if (cp < 0x800) {
+			if (oi + 2 >= outsz) break;
+			out[oi++] = (char)(0xC0 | (cp >> 6));
+			out[oi++] = (char)(0x80 | (cp & 0x3F));
+		} else {
+			if (oi + 3 >= outsz) break;
+			out[oi++] = (char)(0xE0 | (cp >> 12));
+			out[oi++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+			out[oi++] = (char)(0x80 | (cp & 0x3F));
+		}
+	}
+	out[oi] = '\0';
+}
+
+static void parse_partition_table(const char *dev, struct pt_table *t)
+{
+	t->kind = 0;
+	t->n = 0;
+	t->lbs = disk_logical_block_size(dev);
+	char path[300];
+	snprintf(path, sizeof path, "/dev/%s", dev);
+	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) return;
+
+	unsigned char lba01[1024];
+	ssize_t r = pread(fd, lba01, sizeof lba01, 0);
+	if (r < 512) { close(fd); return; }
+
+	int gpt = 0;
+	if (r >= 1024 && memcmp(lba01 + 512, "EFI PART", 8) == 0)
+		gpt = 1;
+	else if (lba01[510] == 0x55 && lba01[511] == 0xAA && lba01[446 + 4] == 0xEE)
+		gpt = 1;
+
+	unsigned char hdr[512];
+	if (gpt) {
+		/* GPT 헤더는 LBA1 = 오프셋 lbs. 512e 는 lba01 안(512), 4Kn 은 오프셋 4096 별도 pread. */
+		const unsigned char *h;
+		if (t->lbs == 512 && r >= 1024) {
+			h = lba01 + 512;
+		} else {
+			ssize_t hr = pread(fd, hdr, sizeof hdr, (off_t)t->lbs);
+			h = (hr >= 92) ? hdr : NULL;
+		}
+		unsigned long long ent_lba = h ? pt_le64(h + 72) : 0;
+		unsigned num = h ? pt_le32(h + 80) : 0;
+		unsigned esz = h ? pt_le32(h + 84) : 0;
+		if (h && memcmp(h, "EFI PART", 8) == 0 && esz >= 128 && esz <= 512 && num > 0 && num <= 4096) {
+			if (num > PT_MAX) num = PT_MAX;
+			size_t region = (size_t)num * esz;
+			if (region > 128 * 512) region = 128 * 512; /* bounded */
+			unsigned char *buf = malloc(region);
+			if (buf) {
+				off_t off = (off_t)ent_lba * t->lbs;
+				ssize_t er = pread(fd, buf, region, off);
+				if (er > 0) {
+					t->kind = 1;
+					unsigned cnt = (unsigned)((size_t)er / esz);
+					for (unsigned i = 0; i < cnt && t->n < PT_MAX; i++) {
+						const unsigned char *e = buf + (size_t)i * esz;
+						int zero = 1;
+						for (int b = 0; b < 16; b++)
+							if (e[b]) { zero = 0; break; }
+						if (zero) continue; /* 빈 엔트리 */
+						struct pt_ent *pe = &t->e[t->n++];
+						pe->is_mbr = 0;
+						pe->mbr_status = 0;
+						pe->mbr_type = 0;
+						pe->start_lba = pt_le64(e + 32);
+						pe->attr = pt_le64(e + 48);
+						gpt_guid_str(e, pe->type, sizeof pe->type);
+						utf16le_to_utf8(e + 56, 72, pe->name, sizeof pe->name);
+					}
+				}
+				free(buf);
+			}
+		}
+	} else if (lba01[510] == 0x55 && lba01[511] == 0xAA) {
+		t->kind = 2; /* MBR 프라이머리 4엔트리(논리 파티션은 미매칭 -> null) */
+		for (int i = 0; i < 4; i++) {
+			const unsigned char *e = lba01 + 446 + i * 16;
+			unsigned char type = e[4];
+			if (type == 0x00) continue;
+			struct pt_ent *pe = &t->e[t->n++];
+			pe->is_mbr = 1;
+			pe->attr = 0;
+			pe->mbr_status = e[0];
+			pe->mbr_type = type;
+			pe->start_lba = pt_le32(e + 8);
+			snprintf(pe->type, sizeof pe->type, "0x%02x", type);
+			pe->name[0] = '\0';
+		}
+	}
+	close(fd);
+}
+
+/* sysfs part 시작바이트로 테이블 엔트리 매칭 -> part_type/name/flags 부착. 미매칭=null 3종. */
+static void part_attach_meta(cJSON *node, const struct pt_table *t, long long start_bytes)
+{
+	const struct pt_ent *m = NULL;
+	if (t->kind && start_bytes >= 0) {
+		for (int i = 0; i < t->n; i++) {
+			/* GPT/MBR 공히 start_lba 는 논리섹터(lbs) 단위. 커널 msdos 파서도 4Kn 에서 lbs 배율. */
+			long long ebytes = (long long)t->e[i].start_lba * t->lbs;
+			if (ebytes == start_bytes) { m = &t->e[i]; break; }
+		}
+	}
+	if (!m) {
+		cJSON_AddNullToObject(node, "part_type");
+		cJSON_AddNullToObject(node, "part_name");
+		cJSON_AddNullToObject(node, "part_flags");
+		return;
+	}
+	cJSON_AddStringToObject(node, "part_type", m->type);
+	if (!m->is_mbr && m->name[0]) cJSON_AddStringToObject(node, "part_name", m->name);
+	else                         cJSON_AddNullToObject(node, "part_name");
+	cJSON *fl = cJSON_CreateArray();
+	if (m->is_mbr) {
+		if (m->mbr_status == 0x80) cJSON_AddItemToArray(fl, cJSON_CreateString("boot"));
+		const char *tf = mbr_type_flag(m->mbr_type);
+		if (tf) cJSON_AddItemToArray(fl, cJSON_CreateString(tf));
+	} else {
+		const char *tf = gpt_type_flag(m->type);
+		if (tf) cJSON_AddItemToArray(fl, cJSON_CreateString(tf));
+		if (m->attr & (1ULL << 0))  cJSON_AddItemToArray(fl, cJSON_CreateString("required"));
+		if (m->attr & (1ULL << 2))  cJSON_AddItemToArray(fl, cJSON_CreateString("legacy_boot"));
+		if (m->attr & (1ULL << 62)) cJSON_AddItemToArray(fl, cJSON_CreateString("hidden"));
+		if (m->attr & (1ULL << 63)) cJSON_AddItemToArray(fl, cJSON_CreateString("no_automount"));
+	}
+	cJSON_AddItemToObject(node, "part_flags", fl);
+}
+
+/* ---- fs 메타: fs_uuid/fs_label/block_size/mount_options/fs_freq/fs_passno ----
+   발견 시에만 발행(미발견=키 생략, 엔진 OUTPUT 에서 null). swap 노드 제외. */
+
+static int hexnib(int c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* udev by-label/by-uuid 이름의 \xNN 이스케이프 디코드(공백 등). */
+static void blk_decode_escapes(const char *in, char *out, size_t outsz)
+{
+	size_t o = 0;
+	for (size_t i = 0; in[i] && o + 1 < outsz; ) {
+		if (in[i] == '\\' && in[i + 1] == 'x' && hexnib(in[i + 2]) >= 0 && hexnib(in[i + 3]) >= 0) {
+			out[o++] = (char)((hexnib(in[i + 2]) << 4) | hexnib(in[i + 3]));
+			i += 4;
+		} else {
+			out[o++] = in[i++];
+		}
+	}
+	out[o] = '\0';
+}
+
+/* /dev/disk/by-* 에서 dev(블록 basename)를 가리키는 심링크 이름 역매핑. */
+static int blk_reverse_map(const char *dir, const char *dev, char *out, size_t outsz)
+{
+	DIR *d = opendir(dir);
+	if (!d) return 0;
+	struct dirent *e;
+	int found = 0;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		char lp[512], tgt[512];
+		snprintf(lp, sizeof lp, "%s/%s", dir, e->d_name);
+		ssize_t n = readlink(lp, tgt, sizeof tgt - 1);
+		if (n <= 0) continue;
+		tgt[n] = '\0';
+		const char *base = strrchr(tgt, '/');
+		base = base ? base + 1 : tgt;
+		if (strcmp(base, dev) == 0) {
+			blk_decode_escapes(e->d_name, out, outsz);
+			found = 1;
+			break;
+		}
+	}
+	closedir(d);
+	return found;
+}
+
+/* /etc/fstab 매칭(UUID=/LABEL=/dev/ 또는 마운트포인트) -> mount_options/fs_freq/fs_passno. */
+static int fstab_lookup(const char *dev, const char *uuid, const char *label,
+                        const char *partuuid, const char *mountpoint, cJSON **out_opts, int *freq, int *passno)
+{
+	FILE *f = fopen("/etc/fstab", "r");
+	if (!f) return 0;
+	char line[1024];
+	int found = 0;
+	while (fgets(line, sizeof line, f)) {
+		char *p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '#' || *p == '\n' || *p == '\0') continue;
+		char spec[400], mp[400], type[80], opts[400];
+		int fr = 0, pa = 0;
+		int nf = sscanf(p, "%399s %399s %79s %399s %d %d", spec, mp, type, opts, &fr, &pa);
+		if (nf < 4) continue;
+		int match = 0;
+		if (!strncmp(spec, "UUID=", 5) && uuid && !strcmp(spec + 5, uuid)) match = 1;
+		else if (!strncmp(spec, "LABEL=", 6) && label && !strcmp(spec + 6, label)) match = 1;
+		else if (!strncmp(spec, "PARTUUID=", 9) && partuuid && !strcasecmp(spec + 9, partuuid)) match = 1;
+		else if (!strncmp(spec, "/dev/", 5)) {
+			char rp[4100]; const char *base;
+			if (realpath(spec, rp)) { base = strrchr(rp, '/'); base = base ? base + 1 : rp; }
+			else                    { base = strrchr(spec, '/'); base = base ? base + 1 : spec; }
+			if (!strcmp(base, dev)) match = 1;
+		}
+		else if (mountpoint && mountpoint[0] && !strcmp(mp, mountpoint)) match = 1;
+		if (!match) continue;
+		cJSON *arr = cJSON_CreateArray();
+		char *save = NULL;
+		for (char *tok = strtok_r(opts, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
+			cJSON_AddItemToArray(arr, cJSON_CreateString(tok));
+		*out_opts = arr;
+		*freq = (nf >= 5) ? fr : 0;
+		*passno = (nf >= 6) ? pa : 0;
+		found = 1;
+		break;
+	}
+	fclose(f);
+	return found;
+}
+
+static void attach_fs_meta(cJSON *node, const char *dev, const char *mountpoint, const char *idfull)
+{
+	char uuid[160] = {0}, label[160] = {0};
+	int have_uuid = blk_reverse_map("/dev/disk/by-uuid", dev, uuid, sizeof uuid);
+	int have_label = blk_reverse_map("/dev/disk/by-label", dev, label, sizeof label);
+	if (have_uuid)  cJSON_AddStringToObject(node, "fs_uuid", uuid);
+	if (have_label) cJSON_AddStringToObject(node, "fs_label", label);
+	if (mountpoint && mountpoint[0]) {
+		struct statvfs vfs;
+		if (statvfs(mountpoint, &vfs) == 0 && vfs.f_bsize > 0)
+			cJSON_AddNumberToObject(node, "block_size", (double)vfs.f_bsize);
+	}
+	/* part 노드의 partuuid(id_type=partuuid)면 fstab PARTUUID= 매칭에 쓴다. */
+	const char *partuuid = (strcmp(dev_id_type(idfull), "partuuid") == 0) ? dev_id_value(idfull) : NULL;
+	cJSON *opts = NULL; int fr = 0, pa = 0;
+	if (fstab_lookup(dev, have_uuid ? uuid : NULL, have_label ? label : NULL, partuuid, mountpoint, &opts, &fr, &pa)) {
+		cJSON_AddItemToObject(node, "mount_options", opts);
+		cJSON_AddNumberToObject(node, "fs_freq", fr);
+		cJSON_AddNumberToObject(node, "fs_passno", pa);
+	}
+}
+
+/* /dev/disk/by-id/wwn-0x... 역매핑 -> "0x..."(schema wwn 포맷). */
+static int disk_wwn(const char *dev, char *out, size_t outsz)
+{
+	DIR *d = opendir("/dev/disk/by-id");
+	if (!d) return 0;
+	struct dirent *e;
+	int found = 0;
+	while ((e = readdir(d))) {
+		if (strncmp(e->d_name, "wwn-", 4) != 0) continue;
+		char lp[512], tgt[512];
+		snprintf(lp, sizeof lp, "/dev/disk/by-id/%s", e->d_name);
+		ssize_t n = readlink(lp, tgt, sizeof tgt - 1);
+		if (n <= 0) continue;
+		tgt[n] = '\0';
+		const char *base = strrchr(tgt, '/');
+		base = base ? base + 1 : tgt;
+		if (strcmp(base, dev) == 0) {
+			snprintf(out, outsz, "%s", e->d_name + 4); /* "wwn-0x5000..." -> "0x5000..." */
+			found = 1;
+			break;
+		}
+	}
+	closedir(d);
+	return found;
+}
+
+/* disk 상세(disk 노드): sector_size/serial/wwn/rotational. 미측정=null. */
+static void attach_disk_meta(cJSON *node, const char *dev)
+{
+	char p[320], v[160];
+	cJSON_AddNumberToObject(node, "sector_size", disk_logical_block_size(dev));
+	snprintf(p, sizeof p, "/sys/block/%s/queue/rotational", dev);
+	if (read_sysfs_str(p, v, sizeof v)) cJSON_AddBoolToObject(node, "rotational", atoi(v) ? 1 : 0);
+	else                                cJSON_AddNullToObject(node, "rotational");
+	char ser[160] = {0};
+	snprintf(p, sizeof p, "/sys/block/%s/serial", dev);
+	if (!read_sysfs_str(p, ser, sizeof ser)) {
+		snprintf(p, sizeof p, "/sys/block/%s/device/serial", dev);
+		read_sysfs_str(p, ser, sizeof ser);
+	}
+	if (ser[0]) cJSON_AddStringToObject(node, "serial", ser);
+	else        cJSON_AddNullToObject(node, "serial");
+	char wwn[160];
+	if (disk_wwn(dev, wwn, sizeof wwn)) cJSON_AddStringToObject(node, "wwn", wwn);
+	else                                cJSON_AddNullToObject(node, "wwn");
+}
+
+/* ---- LVM/RAID/crypt(Linux 전용 노드타입) ---- */
+
+/* crypt: dmuuid CRYPT-LUKS1/2 -> luks1/luks2, 그 외(PLAIN/VERITY 등)=null */
+static void attach_crypt_meta(cJSON *node, const char *dmuuid)
+{
+	if (!strncmp(dmuuid, "CRYPT-LUKS1", 11))      cJSON_AddStringToObject(node, "crypt_type", "luks1");
+	else if (!strncmp(dmuuid, "CRYPT-LUKS2", 11)) cJSON_AddStringToObject(node, "crypt_type", "luks2");
+	else                                          cJSON_AddNullToObject(node, "crypt_type");
+}
+
+/* raid: /sys/block/<dev>/md/{level,chunk_size,metadata_version,uuid} */
+static void attach_raid_meta(cJSON *node, const char *dev)
+{
+	char p[320], v[128];
+	snprintf(p, sizeof p, "/sys/block/%s/md/level", dev);
+	if (read_sysfs_str(p, v, sizeof v) && !strncmp(v, "raid", 4) && v[4] >= '0' && v[4] <= '9')
+		cJSON_AddNumberToObject(node, "raid_level", atoi(v + 4));
+	else
+		cJSON_AddNullToObject(node, "raid_level"); /* linear/multipath 등 비수치=null */
+	snprintf(p, sizeof p, "/sys/block/%s/md/chunk_size", dev);
+	if (read_sysfs_str(p, v, sizeof v) && strtol(v, NULL, 10) > 0)
+		cJSON_AddNumberToObject(node, "raid_chunk_kib", (double)(strtol(v, NULL, 10) / 1024));
+	else
+		cJSON_AddNullToObject(node, "raid_chunk_kib");
+	snprintf(p, sizeof p, "/sys/block/%s/md/metadata_version", dev);
+	if (read_sysfs_str(p, v, sizeof v) && v[0]) cJSON_AddStringToObject(node, "raid_metadata", v);
+	else                                        cJSON_AddNullToObject(node, "raid_metadata");
+	snprintf(p, sizeof p, "/sys/block/%s/md/uuid", dev);
+	if (read_sysfs_str(p, v, sizeof v) && v[0]) cJSON_AddStringToObject(node, "raid_uuid", v);
+	else                                        cJSON_AddNullToObject(node, "raid_uuid");
+}
+
+/* LVM backup 텍스트에서 key = "value" / key = NUM 첫 매치 추출. */
+static int lvm_kv_str(const char *buf, const char *key, char *out, size_t outsz)
+{
+	char pat[64];
+	snprintf(pat, sizeof pat, "%s = \"", key);
+	const char *p = strstr(buf, pat);
+	if (!p) return 0;
+	p += strlen(pat);
+	const char *e = strchr(p, '"');
+	if (!e) return 0;
+	size_t n = (size_t)(e - p);
+	if (n >= outsz) n = outsz - 1;
+	memcpy(out, p, n);
+	out[n] = '\0';
+	return 1;
+}
+static int lvm_kv_num(const char *buf, const char *key, long long *out)
+{
+	char pat[64];
+	snprintf(pat, sizeof pat, "%s = ", key);
+	const char *p = strstr(buf, pat);
+	if (!p) return 0;
+	*out = strtoll(p + strlen(pat), NULL, 10);
+	return 1;
+}
+
+/* dm 이름 "vg-lv"(리터럴 '-'는 '--') -> vg/lv 분리. */
+static void lvm_split_dmname(const char *s, char *vg, size_t vgsz, char *lv, size_t lvsz)
+{
+	size_t n = strlen(s), i = 0, o = 0;
+	vg[0] = lv[0] = '\0';
+	while (i < n && o + 1 < vgsz) {
+		if (s[i] == '-' && i + 1 < n && s[i + 1] == '-') { vg[o++] = '-'; i += 2; continue; }
+		if (s[i] == '-') { i++; break; } /* 구분자 */
+		vg[o++] = s[i++];
+	}
+	vg[o] = '\0';
+	o = 0;
+	while (i < n && o + 1 < lvsz) {
+		if (s[i] == '-' && i + 1 < n && s[i + 1] == '-') { lv[o++] = '-'; i += 2; continue; }
+		lv[o++] = s[i++];
+	}
+	lv[o] = '\0';
+}
+
+/* lvm 노드: dm/name -> vg/lv, /etc/lvm/backup/<vg> -> segtype/stripes/stripe_size. */
+static void attach_lvm_meta(cJSON *node, const char *dev)
+{
+	char p[320], dmname[256] = {0};
+	snprintf(p, sizeof p, "/sys/block/%s/dm/name", dev);
+	char vg[160] = {0}, lv[160] = {0};
+	if (read_sysfs_str(p, dmname, sizeof dmname) && dmname[0])
+		lvm_split_dmname(dmname, vg, sizeof vg, lv, sizeof lv);
+	if (vg[0]) cJSON_AddStringToObject(node, "lvm_vg", vg); else cJSON_AddNullToObject(node, "lvm_vg");
+	if (lv[0]) cJSON_AddStringToObject(node, "lvm_lv", lv); else cJSON_AddNullToObject(node, "lvm_lv");
+	char segtype[40] = {0};
+	int stripes = -1, stripe_kib = -1;
+	if (vg[0] && lv[0]) {
+		char path[400];
+		snprintf(path, sizeof path, "/etc/lvm/backup/%s", vg);
+		char *buf = read_file_all(path);
+		if (buf) {
+			char needle[200];
+			snprintf(needle, sizeof needle, "\n\t\t%s {", lv);
+			const char *b = strstr(buf, needle);
+			if (b) {
+				const char *end = strstr(b + 1, "\n\t\t}");
+				size_t blen = end ? (size_t)(end - b) : strlen(b);
+				char *block = malloc(blen + 1);
+				if (block) {
+					memcpy(block, b, blen);
+					block[blen] = '\0';
+					lvm_kv_str(block, "type", segtype, sizeof segtype);
+					long long sc = 0, ss = 0;
+					if (lvm_kv_num(block, "stripe_count", &sc)) stripes = (int)sc;
+					if (lvm_kv_num(block, "stripe_size", &ss))  stripe_kib = (int)(ss / 2); /* 512섹터 -> KiB */
+					/* LVM2 는 linear 세그먼트를 type=striped + stripe_count=1 로 저장 -> lvs 규약대로 linear 로 정규화 */
+					if (strcmp(segtype, "striped") == 0 && stripes <= 1)
+						snprintf(segtype, sizeof segtype, "linear");
+					free(block);
+				}
+			}
+			free(buf);
+		}
+	}
+	if (segtype[0])    cJSON_AddStringToObject(node, "lvm_segtype", segtype); else cJSON_AddNullToObject(node, "lvm_segtype");
+	if (stripes >= 0)  cJSON_AddNumberToObject(node, "lvm_stripes", stripes); else cJSON_AddNullToObject(node, "lvm_stripes");
+	if (stripe_kib >= 0) cJSON_AddNumberToObject(node, "lvm_stripe_size_kib", stripe_kib); else cJSON_AddNullToObject(node, "lvm_stripe_size_kib");
+}
+
+static void attach_dm_type_meta(cJSON *node, const char *dev, const char *type, const char *dmuuid)
+{
+	if      (!strcmp(type, "crypt")) attach_crypt_meta(node, dmuuid);
+	else if (!strcmp(type, "raid"))  attach_raid_meta(node, dev);
+	else if (!strcmp(type, "lvm"))   attach_lvm_meta(node, dev);
+	/* dm/mpath: 추가 필드 없음 */
+}
+
+/* 최상위 lvm_vgs: /etc/lvm/backup/<vg> 각각 -> name/vg_uuid/extent_size_bytes. 나머지 1차 null. */
+static cJSON *inv_collect_lvm_vgs(void)
+{
+	DIR *d = opendir("/etc/lvm/backup");
+	if (!d) return NULL;
+	cJSON *arr = cJSON_CreateArray();
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		char path[400];
+		snprintf(path, sizeof path, "/etc/lvm/backup/%s", e->d_name);
+		char *buf = read_file_all(path);
+		if (!buf) continue;
+		char vgid[96] = {0};
+		long long ext = 0;
+		lvm_kv_str(buf, "id", vgid, sizeof vgid);
+		int have_ext = lvm_kv_num(buf, "extent_size", &ext);
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "name", e->d_name);
+		cJSON_AddNullToObject(o, "size_bytes");
+		cJSON_AddNullToObject(o, "free_bytes");
+		cJSON_AddNullToObject(o, "data_percent");
+		cJSON_AddNullToObject(o, "metadata_percent");
+		if (vgid[0])  cJSON_AddStringToObject(o, "vg_uuid", vgid); else cJSON_AddNullToObject(o, "vg_uuid");
+		if (have_ext) cJSON_AddNumberToObject(o, "extent_size_bytes", (double)(ext * 512)); else cJSON_AddNullToObject(o, "extent_size_bytes");
+		cJSON_AddNullToObject(o, "pv_ids"); /* 1차 null(후속 협의) */
+		cJSON_AddItemToArray(arr, o);
+		free(buf);
+	}
+	closedir(d);
+	return arr;
+}
+
+/* ---- boot + nonblock_mounts ---- */
+
+/* boot: /proc/cmdline + root= 참조 방식. grub_install_target 1차 null(ESP 기반 판별 후속). */
+static cJSON *inv_collect_boot(void)
+{
+	cJSON *o = cJSON_CreateObject();
+	char *cmd = read_file_all("/proc/cmdline");
+	if (cmd) {
+		char *nl = strchr(cmd, '\n');
+		if (nl) *nl = '\0';
+		cJSON_AddStringToObject(o, "kernel_cmdline", cmd);
+		const char *r = strstr(cmd, "root=");
+		const char *rt = NULL;
+		if (r) {
+			r += 5;
+			if      (!strncmp(r, "UUID=", 5))     rt = "uuid";
+			else if (!strncmp(r, "LABEL=", 6))    rt = "label";
+			else if (!strncmp(r, "PARTUUID=", 9)) rt = "partuuid";
+			else if (!strncmp(r, "/dev/", 5))     rt = "path";
+		}
+		if (rt) cJSON_AddStringToObject(o, "root_ref_type", rt);
+		else    cJSON_AddNullToObject(o, "root_ref_type");
+		free(cmd);
+	} else {
+		cJSON_AddNullToObject(o, "kernel_cmdline");
+		cJSON_AddNullToObject(o, "root_ref_type");
+	}
+	cJSON_AddNullToObject(o, "grub_install_target");
+	return o;
+}
+
+/* 재현 관련 비-블록 fs 화이트리스트(pseudo-fs proc/sys/cgroup 등 제외). */
+static int is_nonblock_fs(const char *fs)
+{
+	static const char *wl[] = { "tmpfs", "ramfs", "nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "ceph", "glusterfs", NULL };
+	for (int i = 0; wl[i]; i++)
+		if (!strcmp(fs, wl[i])) return 1;
+	if (!strncmp(fs, "fuse.", 5)) return 1; /* fuse.sshfs 등(제어용 fusectl 은 제외) */
+	return 0;
+}
+
+/* nonblock_mounts: /proc/self/mountinfo 에서 블록장치 없는 마운트(tmpfs/nfs/cifs/9p) + bind(root!='/'). */
+static cJSON *inv_collect_nonblock_mounts(void)
+{
+	FILE *f = fopen("/proc/self/mountinfo", "r");
+	if (!f) return NULL;
+	cJSON *arr = cJSON_CreateArray();
+	char line[2048];
+	while (fgets(line, sizeof line, f)) {
+		char *dash = strstr(line, " - ");
+		if (!dash) continue;
+		int mid, pid, maj, min;
+		char root[512], mp[512], mopts[512];
+		if (sscanf(line, "%d %d %d:%d %511s %511s %511s", &mid, &pid, &maj, &min, root, mp, mopts) < 7) continue;
+		char fstype[64], source[512], sopts[512];
+		if (sscanf(dash + 3, "%63s %511s %511s", fstype, source, sopts) < 2) continue;
+		int is_bind = (maj != 0 && strcmp(root, "/") != 0);
+		int is_nb = (maj == 0 && is_nonblock_fs(fstype));
+		if (!is_nb && !is_bind) continue;
+		const char *src = is_bind ? root : source;
+		cJSON *opts = NULL;
+		int fr = 0, pa = 0;
+		if (!fstab_lookup("", NULL, NULL, NULL, mp, &opts, &fr, &pa)) {
+			/* fstab 부재(런타임-only) -> mountinfo 옵션 + 0/0 */
+			opts = cJSON_CreateArray();
+			char *save = NULL;
+			for (char *tok = strtok_r(mopts, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
+				cJSON_AddItemToArray(opts, cJSON_CreateString(tok));
+			fr = 0; pa = 0;
+		}
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "source", src);
+		cJSON_AddStringToObject(o, "target", mp);
+		cJSON_AddStringToObject(o, "fstype", fstype);
+		cJSON_AddItemToObject(o, "options", opts);
+		cJSON_AddNumberToObject(o, "fs_freq", fr);
+		cJSON_AddNumberToObject(o, "fs_passno", pa);
+		cJSON_AddItemToArray(arr, o);
+	}
+	fclose(f);
+	return arr;
+}
+
+static cJSON *bd_add(cJSON *arr, const char *name, const char *type, long long size,
                    const char *fst, const char *mnt, const char *parent, const char *idfull)
 {
 	cJSON *o = cJSON_CreateObject();
@@ -883,10 +1636,13 @@ static void bd_add(cJSON *arr, const char *name, const char *type, long long siz
 	if (parent) cJSON_AddStringToObject(o, "parent", parent); else cJSON_AddNullToObject(o, "parent");
 	cJSON_AddStringToObject(o, "id", dev_id_value(idfull));
 	cJSON_AddStringToObject(o, "id_type", dev_id_type(idfull));
+	if (strcmp(type, "swap") != 0)
+		attach_fs_meta(o, name, mnt, idfull);
 	cJSON_AddItemToArray(arr, o);
+	return o;
 }
 
-/* P4 block_devices: /sys/block whole-disk + partitions + dm(LVM/crypt/mpath)/md. parent=부모 id 값(복수면 노드 반복). swap=/proc/swaps. */
+/* block_devices: /sys/block whole-disk + partitions + dm(LVM/crypt/mpath)/md. parent=부모 id 값(복수면 노드 반복). swap=/proc/swaps. */
 static cJSON *inv_collect_block_devices(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -924,14 +1680,24 @@ static cJSON *inv_collect_block_devices(void)
 						if (se->d_name[0] == '.') continue;
 						char sid[320]; resolve_block_id(se->d_name, sid, sizeof sid);
 						char pval[300]; snprintf(pval, sizeof pval, "%s", dev_id_value(sid));
-						bd_add(arr, dev, type, size, hm ? fst : NULL, hm ? mnt : NULL, pval, idfull);
+						cJSON *nn = bd_add(arr, dev, type, size, hm ? fst : NULL, hm ? mnt : NULL, pval, idfull);
+						attach_dm_type_meta(nn, dev, type, dmuuid);
 						emitted = 1;
 					}
 					closedir(sd);
 				}
-				if (!emitted) bd_add(arr, dev, type, size, hm ? fst : NULL, hm ? mnt : NULL, NULL, idfull);
+				if (!emitted) {
+					cJSON *nn = bd_add(arr, dev, type, size, hm ? fst : NULL, hm ? mnt : NULL, NULL, idfull);
+					attach_dm_type_meta(nn, dev, type, dmuuid);
+				}
 			} else {
-				bd_add(arr, dev, "disk", size, hm ? fst : NULL, hm ? mnt : NULL, NULL, idfull);
+				struct pt_table pt;
+				parse_partition_table(dev, &pt);
+				cJSON *dn = bd_add(arr, dev, "disk", size, hm ? fst : NULL, hm ? mnt : NULL, NULL, idfull);
+				attach_disk_meta(dn, dev);
+				if (pt.kind == 1)      cJSON_AddStringToObject(dn, "partition_table", "gpt");
+				else if (pt.kind == 2) cJSON_AddStringToObject(dn, "partition_table", "mbr");
+				else                   cJSON_AddNullToObject(dn, "partition_table");
 				/* 파티션 */
 				snprintf(pth, sizeof pth, "/sys/block/%s", dev);
 				DIR *pd = opendir(pth);
@@ -942,14 +1708,25 @@ static cJSON *inv_collect_block_devices(void)
 						char ppth[420];
 						snprintf(ppth, sizeof ppth, "/sys/block/%s/%s/partition", dev, pe->d_name);
 						if (access(ppth, F_OK) != 0) continue;
-						long long psize = -1;
+						int partno = -1;
+						char pv[64];
+						if (read_sysfs_str(ppth, pv, sizeof pv)) partno = atoi(pv);
+						long long psize = -1, startsec = -1;
 						snprintf(ppth, sizeof ppth, "/sys/block/%s/%s/size", dev, pe->d_name);
 						if (read_sysfs_str(ppth, v, sizeof v)) psize = strtoll(v, NULL, 10) * 512;
+						snprintf(ppth, sizeof ppth, "/sys/block/%s/%s/start", dev, pe->d_name);
+						if (read_sysfs_str(ppth, v, sizeof v)) startsec = strtoll(v, NULL, 10);
 						char pidfull[320]; part_device_id(pe->d_name, pidfull, sizeof pidfull);
 						char pfst[80] = {0}, pmnt[300] = {0};
 						int phm = dev_mount_info(pe->d_name, pfst, sizeof pfst, pmnt, sizeof pmnt);
 						char parval[300]; snprintf(parval, sizeof parval, "%s", dev_id_value(idfull));
-						bd_add(arr, pe->d_name, "part", psize, phm ? pfst : NULL, phm ? pmnt : NULL, parval, pidfull);
+						cJSON *pn = bd_add(arr, pe->d_name, "part", psize, phm ? pfst : NULL, phm ? pmnt : NULL, parval, pidfull);
+						if (partno >= 0) cJSON_AddNumberToObject(pn, "part_number", partno);
+						else             cJSON_AddNullToObject(pn, "part_number");
+						long long start_bytes = (startsec >= 0) ? startsec * 512 : -1;
+						if (start_bytes >= 0) cJSON_AddNumberToObject(pn, "part_start_bytes", (double)start_bytes);
+						else                  cJSON_AddNullToObject(pn, "part_start_bytes");
+						part_attach_meta(pn, &pt, start_bytes);
 					}
 					closedir(pd);
 				}
@@ -976,11 +1753,66 @@ static cJSON *inv_collect_block_devices(void)
 	return arr;
 }
 
-/* P3 net_interfaces: /sys/class/net 열거 -> MAC id + kind + speed + addresses[](getifaddrs) + gateway(default route). */
+/* 라우트: /proc/net/route(IPv4)에서 iff 의 비-default(dest!=0) + gateway!=0(정적) 라우트 {dest CIDR, via}.
+   파일 열림+무매칭=[](측정 empty), 파일 실패=NULL(호출부 null). */
+static cJSON *iface_routes(const char *iff)
+{
+	FILE *f = fopen("/proc/net/route", "r");
+	if (!f) return NULL;
+	cJSON *arr = cJSON_CreateArray();
+	char line[512];
+	int first = 1;
+	while (fgets(line, sizeof line, f)) {
+		if (first) { first = 0; continue; }
+		char rif[64];
+		unsigned long dest, gw, flags, mask;
+		int refc, use, metric;
+		if (sscanf(line, "%63s %lx %lx %lx %d %d %d %lx", rif, &dest, &gw, &flags, &refc, &use, &metric, &mask) < 8) continue;
+		if (strcmp(rif, iff) != 0) continue;
+		if (dest == 0 || gw == 0) continue; /* default 또는 링크 자동 라우트 제외 */
+		unsigned pfx = 0, m = (unsigned)mask;
+		while (m) { pfx += m & 1; m >>= 1; }
+		char cidr[32], gwip[16];
+		snprintf(cidr, sizeof cidr, "%lu.%lu.%lu.%lu/%u",
+		    dest & 0xFF, (dest >> 8) & 0xFF, (dest >> 16) & 0xFF, (dest >> 24) & 0xFF, pfx);
+		snprintf(gwip, sizeof gwip, "%lu.%lu.%lu.%lu",
+		    gw & 0xFF, (gw >> 8) & 0xFF, (gw >> 16) & 0xFF, (gw >> 24) & 0xFF);
+		cJSON *r = cJSON_CreateObject();
+		cJSON_AddStringToObject(r, "dest", cidr);
+		cJSON_AddStringToObject(r, "via", gwip);
+		cJSON_AddItemToArray(arr, r);
+	}
+	fclose(f);
+	return arr;
+}
+
+/* /etc/resolv.conf nameserver 목록(전역). 없으면 NULL. */
+static cJSON *resolv_dns(void)
+{
+	FILE *f = fopen("/etc/resolv.conf", "r");
+	if (!f) return NULL;
+	cJSON *arr = NULL;
+	char line[512];
+	while (fgets(line, sizeof line, f)) {
+		char *p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (strncmp(p, "nameserver", 10) != 0) continue;
+		p += 10;
+		char ns[128];
+		if (sscanf(p, "%127s", ns) != 1) continue;
+		if (!arr) arr = cJSON_CreateArray();
+		cJSON_AddItemToArray(arr, cJSON_CreateString(ns));
+	}
+	fclose(f);
+	return arr;
+}
+
+/* net_interfaces: /sys/class/net 열거 -> MAC id + kind + speed + addresses[](getifaddrs) + gateway(default route). */
 static cJSON *inv_collect_net_interfaces(void)
 {
 	cJSON *arr = cJSON_CreateArray();
 	cJSON *gw4 = build_default_gw_v4();
+	cJSON *dns = resolv_dns(); /* 전역 DNS. default-route iface 에 부착 */
 	struct ifaddrs *ifap = NULL;
 	getifaddrs(&ifap);
 
@@ -1022,16 +1854,51 @@ static cJSON *inv_collect_net_interfaces(void)
 				cJSON_AddStringToObject(a, "address", ip);
 				cJSON_AddNumberToObject(a, "prefix", (double)prefix);
 				cJSON_AddStringToObject(a, "family", family);
+				cJSON_AddNullToObject(a, "origin"); /* getifaddrs 는 static/dhcp 미구분 -> null(netlink IFA_F_PERMANENT 후속) */
 				cJSON_AddItemToArray(addrs, a);
 			}
 			cJSON_AddItemToObject(o, "addresses", addrs);
 			cJSON *hit = cJSON_GetObjectItem(gw4, iff);
-			cJSON_AddItemToObject(o, "gateway", (hit && cJSON_IsString(hit)) ? cJSON_CreateString(hit->valuestring) : cJSON_CreateNull());
+			int has_gw = (hit && cJSON_IsString(hit));
+			cJSON_AddItemToObject(o, "gateway", has_gw ? cJSON_CreateString(hit->valuestring) : cJSON_CreateNull());
+			/* mtu */
+			char np[320], nv[64];
+			snprintf(np, sizeof np, "/sys/class/net/%s/mtu", iff);
+			if (read_sysfs_str(np, nv, sizeof nv) && atoi(nv) > 0) cJSON_AddNumberToObject(o, "mtu", atoi(nv));
+			else                                                   cJSON_AddNullToObject(o, "mtu");
+			/* bond_mode: 본딩 iface 의 raw 토큰(엔진 정규화) */
+			snprintf(np, sizeof np, "/sys/class/net/%s/bonding/mode", iff);
+			if (read_sysfs_str(np, nv, sizeof nv)) {
+				char tok[64];
+				if (sscanf(nv, "%63s", tok) == 1) cJSON_AddStringToObject(o, "bond_mode", tok);
+				else                              cJSON_AddNullToObject(o, "bond_mode");
+			} else cJSON_AddNullToObject(o, "bond_mode");
+			/* vlan_id: /proc/net/vlan/<iff> VID */
+			int vid = -1;
+			snprintf(np, sizeof np, "/proc/net/vlan/%s", iff);
+			FILE *vf = fopen(np, "r");
+			if (vf) {
+				char l[256];
+				while (fgets(l, sizeof l, vf)) {
+					char *q = strstr(l, "VID:");
+					if (q) { vid = atoi(q + 4); break; }
+				}
+				fclose(vf);
+			}
+			if (vid >= 0) cJSON_AddNumberToObject(o, "vlan_id", vid);
+			else          cJSON_AddNullToObject(o, "vlan_id");
+			/* routes: 정적 비-default */
+			cJSON *rts = iface_routes(iff);
+			cJSON_AddItemToObject(o, "routes", rts ? rts : cJSON_CreateNull());
+			/* dns: 전역 목록을 default-route iface 에만 부착(복제) */
+			if (has_gw && dns) cJSON_AddItemToObject(o, "dns", cJSON_Duplicate(dns, 1));
+			else               cJSON_AddNullToObject(o, "dns");
 			cJSON_AddItemToArray(arr, o);
 		}
 		closedir(d);
 	}
 	if (ifap) freeifaddrs(ifap);
 	cJSON_Delete(gw4);
+	if (dns) cJSON_Delete(dns);
 	return arr;
 }

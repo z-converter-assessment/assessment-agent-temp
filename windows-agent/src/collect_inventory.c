@@ -35,7 +35,7 @@ static cJSON *inv_collect_net_interfaces(void);
 static cJSON *inv_collect_services(void);
 static void add_listen_entry(cJSON *arr, const char *proto, const char *addr,
                              unsigned short port, DWORD pid);
-static void bd_add_win(cJSON *arr, const char *name, const char *type, long long size,
+static cJSON *bd_add(cJSON *arr, const char *name, const char *type, long long size,
                        const char *fst, const char *mnt, const char *parent, const char *idfull);
 static void collect_tcp4_listen(cJSON *arr);
 static void collect_tcp6_listen(cJSON *arr);
@@ -370,6 +370,135 @@ static cJSON *inv_collect_listen_ports(void)
 	return arr;
 }
 
+/* 재현 os 확장. arch/bits/boot_firmware/secure_boot/edition/timezone/rtc_utc.
+   미측정=null(위조 금지). 세대 분기는 GetProcAddress 런타임(NT5.2 하드임포트 금지). */
+
+/* 레지스트리 REG_SZ 를 wide 로 읽어 UTF-8 로 변환. RegQueryValueExA(ANSI)는 비영어 로케일에서
+   값을 로컬 코드페이지(예 Korean CP949)로 돌려줘 invalid UTF-8 을 만든다(NT5.2 timezone StandardName
+   폴백이 로컬라이즈 한국어 -> 엔진 dead-letter). wide 읽기 + WideCharToMultiByte(CP_UTF8)로 항상 UTF-8. */
+static int reg_read_sz(HKEY root, const char *path, const char *val, char *out, size_t outsz)
+{
+	HKEY h;
+	if (RegOpenKeyExA(root, path, 0, KEY_READ, &h) != ERROR_SUCCESS)
+		return 0;
+	WCHAR wval[128];
+	MultiByteToWideChar(CP_ACP, 0, val, -1, wval, 128);
+	WCHAR wbuf[512];
+	DWORD sz = sizeof wbuf;
+	DWORD type = 0;
+	LONG rc = RegQueryValueExW(h, wval, NULL, &type, (LPBYTE)wbuf, &sz);
+	RegCloseKey(h);
+	if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ))
+		return 0;
+	int wn = (int)(sz / sizeof(WCHAR));
+	while (wn > 0 && wbuf[wn - 1] == L'\0') wn--; /* 종단 NUL 제거 */
+	int n = WideCharToMultiByte(CP_UTF8, 0, wbuf, wn, out, (int)outsz - 1, NULL, NULL);
+	out[(n > 0 && n < (int)outsz) ? n : 0] = '\0';
+	return out[0] ? 1 : 0;
+}
+
+/* 레지스트리 REG_DWORD 읽기. 성공 1 */
+static int reg_read_dword(HKEY root, const char *path, const char *val, DWORD *out)
+{
+	HKEY h;
+	if (RegOpenKeyExA(root, path, 0, KEY_READ, &h) != ERROR_SUCCESS)
+		return 0;
+	DWORD sz = sizeof(*out);
+	DWORD type = 0;
+	LONG rc = RegQueryValueExA(h, val, NULL, &type, (LPBYTE)out, &sz);
+	RegCloseKey(h);
+	return (rc == ERROR_SUCCESS && type == REG_DWORD) ? 1 : 0;
+}
+
+/* boot_firmware: GetFirmwareType(NT6.2+) 1차, GetFirmwareEnvironmentVariableA 트릭(XP+) 폴백 */
+static void os_add_boot_firmware(cJSON *m)
+{
+	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+	if (k32) {
+		typedef BOOL (WINAPI *GetFirmwareTypeFn)(void *);
+		GetFirmwareTypeFn gft = (GetFirmwareTypeFn)(void *)GetProcAddress(k32, "GetFirmwareType");
+		if (gft) {
+			int ft = 0; /* FirmwareTypeBios=1, FirmwareTypeUefi=2 */
+			if (gft(&ft)) {
+				if (ft == 2)      { cJSON_AddStringToObject(m, "boot_firmware", "uefi"); return; }
+				else if (ft == 1) { cJSON_AddStringToObject(m, "boot_firmware", "bios"); return; }
+			}
+		}
+	}
+	/* 폴백: 더미 GUID 로 GetFirmwareEnvironmentVariableA 호출. BIOS=ERROR_INVALID_FUNCTION(1) */
+	SetLastError(0);
+	GetFirmwareEnvironmentVariableA("", "{00000000-0000-0000-0000-000000000000}", NULL, 0);
+	DWORD err = GetLastError();
+	if (err == ERROR_INVALID_FUNCTION)
+		cJSON_AddStringToObject(m, "boot_firmware", "bios");
+	else if (err == ERROR_NOACCESS || err == ERROR_ENVVAR_NOT_FOUND || err == ERROR_SUCCESS)
+		cJSON_AddStringToObject(m, "boot_firmware", "uefi");
+	else
+		cJSON_AddNullToObject(m, "boot_firmware");
+}
+
+static void inv_collect_os_repro(cJSON *m)
+{
+	SYSTEM_INFO si;
+	GetNativeSystemInfo(&si);
+	const char *arch = NULL;
+	int bits = 0;
+	switch (si.wProcessorArchitecture) {
+	case PROCESSOR_ARCHITECTURE_AMD64: arch = "x86_64";  bits = 64; break;
+	case PROCESSOR_ARCHITECTURE_INTEL: arch = "i686";    bits = 32; break;
+	case PROCESSOR_ARCHITECTURE_IA64:  arch = "ia64";    bits = 64; break;
+	case 12 /*ARM64*/:                 arch = "aarch64"; bits = 64; break;
+	case PROCESSOR_ARCHITECTURE_ARM:   arch = "arm";     bits = 32; break;
+	default: break;
+	}
+	if (arch) {
+		cJSON_AddStringToObject(m, "arch", arch);
+		cJSON_AddNumberToObject(m, "bits", bits);
+	} else {
+		cJSON_AddNullToObject(m, "arch");
+		cJSON_AddNullToObject(m, "bits");
+	}
+	os_add_boot_firmware(m);
+	/* secure_boot: SecureBoot\State UEFISecureBootEnabled DWORD. 부재=null */
+	{
+		DWORD v = 0;
+		if (reg_read_dword(HKEY_LOCAL_MACHINE,
+		    "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", "UEFISecureBootEnabled", &v))
+			cJSON_AddBoolToObject(m, "secure_boot", v ? 1 : 0);
+		else
+			cJSON_AddNullToObject(m, "secure_boot");
+	}
+	/* edition: CurrentVersion EditionID(SKU 코드). 부재=null */
+	{
+		char ed[64] = {0};
+		if (reg_read_sz(HKEY_LOCAL_MACHINE,
+		    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "EditionID", ed, sizeof ed))
+			cJSON_AddStringToObject(m, "edition", ed);
+		else
+			cJSON_AddNullToObject(m, "edition");
+	}
+	/* timezone: TimeZoneKeyName(Vista+) 1차, StandardName(XP/2003) 폴백. 원문(엔진이 CLDR 매핑) */
+	{
+		char tz[128] = {0};
+		if (reg_read_sz(HKEY_LOCAL_MACHINE,
+		        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "TimeZoneKeyName", tz, sizeof tz)
+		    || reg_read_sz(HKEY_LOCAL_MACHINE,
+		        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "StandardName", tz, sizeof tz))
+			cJSON_AddStringToObject(m, "timezone", tz);
+		else
+			cJSON_AddNullToObject(m, "timezone");
+	}
+	/* rtc_utc: RealTimeIsUniversal DWORD. 부재=null(위조 금지 — 기본 local 을 false 로 위조하지 않음) */
+	{
+		DWORD v = 0;
+		if (reg_read_dword(HKEY_LOCAL_MACHINE,
+		    "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "RealTimeIsUniversal", &v))
+			cJSON_AddBoolToObject(m, "rtc_utc", v ? 1 : 0);
+		else
+			cJSON_AddNullToObject(m, "rtc_utc");
+	}
+}
+
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version)
 {
 	cJSON *m = cJSON_CreateObject();
@@ -386,6 +515,8 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	if (build[0]) cJSON_AddStringToObject(m, "kernel_version", build);
 	else          cJSON_AddNullToObject  (m, "kernel_version");
 
+	inv_collect_os_repro(m);
+
 	SYSTEM_INFO si;
 	GetNativeSystemInfo(&si);
 	cJSON_AddNumberToObject(m, "cpu_cores", (double)si.dwNumberOfProcessors);
@@ -395,7 +526,7 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 	if (cpu_brand[0]) cJSON_AddStringToObject(m, "cpu_model", cpu_brand);
 	else              cJSON_AddNullToObject  (m, "cpu_model");
 
-	/* mem_total_bytes (base 단위). swap 은 block_devices type=swap(pagefile) 로(P4). */
+	/* mem_total_bytes (base 단위). swap 은 block_devices type=swap(pagefile) 로. */
 	MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
 	if (GlobalMemoryStatusEx(&ms))
 		cJSON_AddNumberToObject(m, "mem_total_bytes", (double)ms.ullTotalPhys);
@@ -408,11 +539,14 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	cJSON_AddItemToObject(m, "block_devices",  inv_collect_block_devices());
 	cJSON_AddItemToObject(m, "net_interfaces", inv_collect_net_interfaces());
+	/* boot/nonblock_mounts: Linux GRUB cmdline / mountinfo 개념 -> Windows 는 측정불가 null(필드셋 대칭). */
+	cJSON_AddNullToObject(m, "boot");
+	cJSON_AddNullToObject(m, "nonblock_mounts");
 
 	return m;
 }
 
-static void bd_add_win(cJSON *arr, const char *name, const char *type, long long size,
+static cJSON *bd_add(cJSON *arr, const char *name, const char *type, long long size,
                        const char *fst, const char *mnt, const char *parent, const char *idfull)
 {
 	cJSON *o = cJSON_CreateObject();
@@ -425,23 +559,217 @@ static void bd_add_win(cJSON *arr, const char *name, const char *type, long long
 	cJSON_AddStringToObject(o, "id", win_id_value(idfull));
 	cJSON_AddStringToObject(o, "id_type", win_id_type(idfull));
 	cJSON_AddItemToArray(arr, o);
+	return o;
 }
 
-/* P4 block_devices: 물리디스크(disk, gptid/mbrsig/serial) + 볼륨(volume, volguid, parent=disk extents). */
+/* ---- 파티션 레이아웃: IOCTL_DISK_GET_DRIVE_LAYOUT_EX(XP/2003+, IOCTL 이라 import 없음) ----
+   partition_table(disk 노드) + type='part' 노드 신설(parent=disk id). Linux part 노드와 필드셋 대칭. */
+
+/* Windows GUID -> 소문자 무중괄호(Linux GPT part_type 포맷과 통일). API가 논리 GUID 필드 제공(바이트 스왑 불요). */
+static void win_gpt_guid_str(const GUID *g, char *out, size_t outsz)
+{
+	snprintf(out, outsz, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+	    (unsigned long)g->Data1, g->Data2, g->Data3,
+	    g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
+	    g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+}
+
+/* GPT type GUID(소문자 무중괄호) -> parted 계열 시맨틱 플래그명. Linux 트리와 동일 표. */
+static const char *gpt_type_flag(const char *guid)
+{
+	if (!strcmp(guid, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b")) return "esp";
+	if (!strcmp(guid, "21686148-6449-6e6f-744e-656564454649")) return "bios_grub";
+	if (!strcmp(guid, "e6d6d379-f507-44c2-a23c-238f2a3df928")) return "lvm";
+	if (!strcmp(guid, "a19d880f-05fc-4d3b-a006-743f0f84911e")) return "raid";
+	if (!strcmp(guid, "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f")) return "swap";
+	if (!strcmp(guid, "e3c9e316-0b5c-4db8-817d-f92df00215ae")) return "msftres";
+	return NULL;
+}
+
+/* MBR type 바이트 -> 시맨틱 플래그명. Linux 트리와 동일 표. */
+static const char *mbr_type_flag(unsigned char t)
+{
+	switch (t) {
+	case 0x82: return "swap";
+	case 0x8e: return "lvm";
+	case 0xfd: return "raid";
+	case 0xef: return "esp";
+	default:   return NULL;
+	}
+}
+
+/* GPT Name[36](WCHAR, 미종단 가능) -> UTF-8. 빈 문자열이면 out="" */
+static void win_gpt_name(const WCHAR *w, char *out, size_t outsz)
+{
+	int len = 0;
+	while (len < 36 && w[len]) len++;
+	if (len == 0) { out[0] = '\0'; return; }
+	int n = WideCharToMultiByte(CP_UTF8, 0, w, len, out, (int)outsz - 1, NULL, NULL);
+	out[(n > 0 && n < (int)outsz) ? n : 0] = '\0';
+}
+
+/* IOCTL_DISK_GET_DRIVE_LAYOUT_EX 를 확장 버퍼로 읽어 malloc 버퍼 반환(호출자 free). 실패 NULL */
+static BYTE *win_read_drive_layout(HANDLE h)
+{
+	DWORD cap = 16384; /* 헤더 + 파티션 배열(넉넉) */
+	for (int tries = 0; tries < 3; tries++) {
+		BYTE *buf = (BYTE *)malloc(cap);
+		if (!buf) return NULL;
+		DWORD ret = 0;
+		if (DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, buf, cap, &ret, NULL))
+			return buf;
+		DWORD err = GetLastError();
+		free(buf);
+		if (err != ERROR_INSUFFICIENT_BUFFER && err != ERROR_MORE_DATA) return NULL;
+		cap *= 4;
+	}
+	return NULL;
+}
+
+/* disk 상세: sector_size(geometry)/serial(STORAGE_DEVICE_DESCRIPTOR)/rotational(seek penalty). 핸들 살아있을 때 수집. */
+struct wdmeta { long long sector; int have_sector; char serial[160]; int rot; }; /* rot: -1 unknown, 0 ssd, 1 hdd */
+
+static void win_read_disk_meta(HANDLE h, struct wdmeta *m)
+{
+	m->have_sector = 0; m->serial[0] = '\0'; m->rot = -1;
+	DWORD ret = 0;
+	DISK_GEOMETRY geo;
+	if (DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, &geo, sizeof geo, &ret, NULL) && geo.BytesPerSector) {
+		m->sector = geo.BytesPerSector;
+		m->have_sector = 1;
+	}
+	STORAGE_PROPERTY_QUERY q; memset(&q, 0, sizeof q); q.PropertyId = StorageDeviceProperty; q.QueryType = PropertyStandardQuery;
+	BYTE sbuf[2048] = {0}; /* 제로초기화: offset 이 반환영역 밖이어도 %s 가 NUL 만나 OOB 방지 */
+	if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, sbuf, sizeof sbuf, &ret, NULL)) {
+		STORAGE_DEVICE_DESCRIPTOR *sd = (STORAGE_DEVICE_DESCRIPTOR *)sbuf;
+		if (sd->SerialNumberOffset && sd->SerialNumberOffset < ret) { /* 반환 바이트수(ret) 내부만 */
+			char *s = (char *)sbuf + sd->SerialNumberOffset;
+			while (*s == ' ') s++;
+			snprintf(m->serial, sizeof m->serial, "%s", s);
+			for (int k = (int)strlen(m->serial) - 1; k >= 0 && m->serial[k] == ' '; k--) m->serial[k] = '\0';
+		}
+	}
+	/* StorageDeviceSeekPenaltyProperty=7. IncursSeekPenalty TRUE=HDD. NT5.2/미지원 -> rot 유지(-1) */
+	STORAGE_PROPERTY_QUERY q2; memset(&q2, 0, sizeof q2); q2.PropertyId = (STORAGE_PROPERTY_ID)7; q2.QueryType = PropertyStandardQuery;
+	struct { DWORD Version; DWORD Size; BOOLEAN IncursSeekPenalty; } sp; memset(&sp, 0, sizeof sp);
+	if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q2, sizeof q2, &sp, sizeof sp, &ret, NULL) && ret >= sizeof sp)
+		m->rot = sp.IncursSeekPenalty ? 1 : 0;
+}
+
+static void win_attach_disk_meta(cJSON *node, const struct wdmeta *m)
+{
+	if (m->have_sector) cJSON_AddNumberToObject(node, "sector_size", (double)m->sector);
+	else                cJSON_AddNullToObject(node, "sector_size");
+	if (m->serial[0]) cJSON_AddStringToObject(node, "serial", m->serial);
+	else              cJSON_AddNullToObject(node, "serial");
+	cJSON_AddNullToObject(node, "wwn"); /* virtio/하이퍼바이저 미제공 -> null */
+	if (m->rot < 0) cJSON_AddNullToObject(node, "rotational");
+	else            cJSON_AddBoolToObject(node, "rotational", m->rot ? 1 : 0);
+}
+
+/* disk 노드에 partition_table 부착 + part 노드 발행. layout NULL 이면 partition_table=null. */
+static void win_emit_layout(cJSON *arr, cJSON *dn, const BYTE *layout,
+                            const char *parentid, const char *diskname)
+{
+	if (!layout) { cJSON_AddNullToObject(dn, "partition_table"); return; }
+	const DRIVE_LAYOUT_INFORMATION_EX *dl = (const DRIVE_LAYOUT_INFORMATION_EX *)layout;
+	if      (dl->PartitionStyle == PARTITION_STYLE_GPT) cJSON_AddStringToObject(dn, "partition_table", "gpt");
+	else if (dl->PartitionStyle == PARTITION_STYLE_MBR) cJSON_AddStringToObject(dn, "partition_table", "mbr");
+	else                                                cJSON_AddNullToObject(dn, "partition_table");
+
+	DWORD n = dl->PartitionCount;
+	if (n > 512) n = 512; /* 방어 상한 */
+	for (DWORD i = 0; i < n; i++) {
+		const PARTITION_INFORMATION_EX *pe = &dl->PartitionEntry[i];
+		if (pe->PartitionNumber == 0) continue;          /* MBR 빈 프라이머리 슬롯/확장 컨테이너 */
+		if (pe->PartitionLength.QuadPart == 0) continue;
+
+		char pname[48];
+		snprintf(pname, sizeof pname, "%s-part%lu", diskname, (unsigned long)pe->PartitionNumber);
+		int is_gpt = (pe->PartitionStyle == PARTITION_STYLE_GPT);
+		char idfull[128];
+		char tguid[48] = {0};
+		if (is_gpt) {
+			char pid[48];
+			win_gpt_guid_str(&pe->Gpt.PartitionId, pid, sizeof pid);
+			snprintf(idfull, sizeof idfull, "partuuid:%s", pid);
+		} else {
+			snprintf(idfull, sizeof idfull, "name:%s", pname);
+		}
+		cJSON *pn = bd_add(arr, pname, "part", (long long)pe->PartitionLength.QuadPart,
+		                       NULL, NULL, parentid, idfull);
+		cJSON_AddNumberToObject(pn, "part_number", (double)pe->PartitionNumber);
+		cJSON_AddNumberToObject(pn, "part_start_bytes", (double)pe->StartingOffset.QuadPart);
+
+		if (is_gpt) {
+			win_gpt_guid_str(&pe->Gpt.PartitionType, tguid, sizeof tguid);
+			cJSON_AddStringToObject(pn, "part_type", tguid);
+			char nm[160]; /* GPT Name 36 WCHAR * 3(UTF-8 BMP) + NUL 여유 */
+			win_gpt_name(pe->Gpt.Name, nm, sizeof nm);
+			if (nm[0]) cJSON_AddStringToObject(pn, "part_name", nm);
+			else       cJSON_AddNullToObject(pn, "part_name");
+			cJSON *fl = cJSON_CreateArray();
+			const char *tf = gpt_type_flag(tguid);
+			if (tf) cJSON_AddItemToArray(fl, cJSON_CreateString(tf));
+			unsigned long long at = (unsigned long long)pe->Gpt.Attributes;
+			if (at & (1ULL << 0))  cJSON_AddItemToArray(fl, cJSON_CreateString("required"));
+			if (at & (1ULL << 2))  cJSON_AddItemToArray(fl, cJSON_CreateString("legacy_boot"));
+			if (at & (1ULL << 62)) cJSON_AddItemToArray(fl, cJSON_CreateString("hidden"));
+			if (at & (1ULL << 63)) cJSON_AddItemToArray(fl, cJSON_CreateString("no_automount"));
+			cJSON_AddItemToObject(pn, "part_flags", fl);
+		} else if (pe->PartitionStyle == PARTITION_STYLE_MBR) {
+			unsigned char t = pe->Mbr.PartitionType;
+			char th[8];
+			snprintf(th, sizeof th, "0x%02x", t);
+			cJSON_AddStringToObject(pn, "part_type", th);
+			cJSON_AddNullToObject(pn, "part_name");
+			cJSON *fl = cJSON_CreateArray();
+			if (pe->Mbr.BootIndicator) cJSON_AddItemToArray(fl, cJSON_CreateString("boot"));
+			const char *tf = mbr_type_flag(t);
+			if (tf) cJSON_AddItemToArray(fl, cJSON_CreateString(tf));
+			cJSON_AddItemToObject(pn, "part_flags", fl);
+		} else {
+			cJSON_AddNullToObject(pn, "part_type");
+			cJSON_AddNullToObject(pn, "part_name");
+			cJSON_AddNullToObject(pn, "part_flags");
+		}
+	}
+}
+
+/* fs 메타(volume 노드): fs_uuid=볼륨 시리얼(XXXX-XXXX, Windows 규약) / fs_label / block_size=클러스터.
+   mount_options/fs_freq/fs_passno 는 Windows fstab 부재 -> 생략(엔진 OUTPUT null). Linux 트리와 필드셋 대칭. */
+static void win_fs_meta(cJSON *node, const char *label, DWORD serial, long long cluster)
+{
+	if (serial) {
+		char u[16];
+		snprintf(u, sizeof u, "%04X-%04X", (unsigned)(serial >> 16), (unsigned)(serial & 0xFFFF));
+		cJSON_AddStringToObject(node, "fs_uuid", u);
+	}
+	if (label && label[0]) cJSON_AddStringToObject(node, "fs_label", label);
+	if (cluster > 0)       cJSON_AddNumberToObject(node, "block_size", (double)cluster);
+}
+
+/* block_devices: 물리디스크(disk, gptid/mbrsig/serial) + 볼륨(volume, volguid, parent=disk extents). */
+#define WIN_MAX_PHYSDRIVE 32   /* PhysicalDriveN 스캔 상한(N=0..31) */
 static cJSON *inv_collect_block_devices(void)
 {
 	cJSON *arr = cJSON_CreateArray();
-	char diskid[32][96]; int diskvalid[32] = {0};
-	for (int i = 0; i < 32; i++) {
+	char diskid[WIN_MAX_PHYSDRIVE][96]; int diskvalid[WIN_MAX_PHYSDRIVE] = {0};
+	for (int i = 0; i < WIN_MAX_PHYSDRIVE; i++) {
 		HANDLE h = open_physical_drive(i);
 		if (h == INVALID_HANDLE_VALUE) continue;
 		GET_LENGTH_INFORMATION gli; DWORD ret = 0; long long size = -1;
 		if (DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &gli, sizeof gli, &ret, NULL)) size = (long long)gli.Length.QuadPart;
+		BYTE *layout = win_read_drive_layout(h);   /* 핸들 살아있을 때 파티션 레이아웃 확보 */
+		struct wdmeta dm; win_read_disk_meta(h, &dm);
 		CloseHandle(h);
 		char idfull[96]; win_disk_id(i, idfull, sizeof idfull);
 		snprintf(diskid[i], sizeof diskid[i], "%s", win_id_value(idfull)); diskvalid[i] = 1;
 		char name[32]; snprintf(name, sizeof name, "PhysicalDrive%d", i);
-		bd_add_win(arr, name, "disk", size, NULL, NULL, NULL, idfull);
+		cJSON *dn = bd_add(arr, name, "disk", size, NULL, NULL, NULL, idfull);
+		win_attach_disk_meta(dn, &dm);
+		win_emit_layout(arr, dn, layout, diskid[i], name);
+		free(layout);
 	}
 	wchar_t vol[MAX_PATH];
 	HANDLE fv = FindFirstVolumeW(vol, MAX_PATH);
@@ -453,8 +781,13 @@ static cJSON *inv_collect_block_devices(void)
 			char idfull[128];
 			if (guid[0]) snprintf(idfull, sizeof idfull, "volguid:%s", guid); else snprintf(idfull, sizeof idfull, "name:%s", volu);
 			wchar_t fsw[16] = {0}; char fst[16] = {0};
-			GetVolumeInformationW(vol, NULL, 0, NULL, NULL, NULL, fsw, 16);
+			wchar_t labelw[128] = {0}; DWORD volserial = 0;
+			GetVolumeInformationW(vol, labelw, 128, &volserial, NULL, NULL, fsw, 16);
 			if (fsw[0]) { WideCharToMultiByte(CP_UTF8, 0, fsw, -1, fst, sizeof fst, NULL, NULL); for (char *q = fst; *q; q++) *q = (char)tolower((unsigned char)*q); }
+			char vlabel[256] = {0};
+			if (labelw[0]) WideCharToMultiByte(CP_UTF8, 0, labelw, -1, vlabel, sizeof vlabel, NULL, NULL);
+			DWORD spc = 0, bps = 0, fc = 0, tc = 0; long long cluster = -1;
+			if (GetDiskFreeSpaceW(vol, &spc, &bps, &fc, &tc) && spc && bps) cluster = (long long)spc * bps;
 			wchar_t names[256] = {0}; DWORD cnt = 0; char mnt[64] = {0};
 			if (GetVolumePathNamesForVolumeNameW(vol, names, 256, &cnt) && names[0]) {
 				WideCharToMultiByte(CP_UTF8, 0, names, -1, mnt, sizeof mnt, NULL, NULL);
@@ -472,14 +805,15 @@ static cJSON *inv_collect_block_devices(void)
 					VOLUME_DISK_EXTENTS *vde = (VOLUME_DISK_EXTENTS *)eb;
 					for (DWORD k = 0; k < vde->NumberOfDiskExtents; k++) {
 						int dn = (int)vde->Extents[k].DiskNumber;
-						const char *par = (dn >= 0 && dn < 32 && diskvalid[dn]) ? diskid[dn] : NULL;
-						bd_add_win(arr, mnt[0] ? mnt : volu, "volume", vsize, fst[0] ? fst : NULL, mnt[0] ? mnt : NULL, par, idfull);
+						const char *par = (dn >= 0 && dn < WIN_MAX_PHYSDRIVE && diskvalid[dn]) ? diskid[dn] : NULL;
+						cJSON *vn = bd_add(arr, mnt[0] ? mnt : volu, "volume", vsize, fst[0] ? fst : NULL, mnt[0] ? mnt : NULL, par, idfull);
+						win_fs_meta(vn, vlabel, volserial, cluster);
 						emitted = 1;
 					}
 				}
 				CloseHandle(vh);
 			}
-			if (!emitted) bd_add_win(arr, mnt[0] ? mnt : volu, "volume", vsize, fst[0] ? fst : NULL, mnt[0] ? mnt : NULL, NULL, idfull);
+			if (!emitted) { cJSON *vn = bd_add(arr, mnt[0] ? mnt : volu, "volume", vsize, fst[0] ? fst : NULL, mnt[0] ? mnt : NULL, NULL, idfull); win_fs_meta(vn, vlabel, volserial, cluster); }
 		} while (FindNextVolumeW(fv, vol, MAX_PATH));
 		FindVolumeClose(fv);
 	}
@@ -544,17 +878,52 @@ static cJSON *inv_collect_block_devices(void)
 	return arr;
 }
 
-/* P3 net_interfaces: GAA per-adapter -> MAC id + kind + speed + addresses[] + gateway. */
+/* 라우트: GetIpForwardTable(IPv4, NT5.2 iphlpapi)에서 ifindex 의 정적(NETMGMT) 비-default 라우트.
+   테이블 NULL(조회 실패)=null, 무매칭=[](측정 empty). */
+static cJSON *win_iface_routes(const MIB_IPFORWARDTABLE *ipf, DWORD ifindex)
+{
+	if (!ipf) return NULL;
+	cJSON *arr = cJSON_CreateArray();
+	for (DWORD i = 0; i < ipf->dwNumEntries; i++) {
+		const MIB_IPFORWARDROW *r = &ipf->table[i];
+		if (r->dwForwardIfIndex != ifindex) continue;
+		if (r->dwForwardDest == 0) continue;          /* default */
+		if (r->dwForwardNextHop == 0) continue;       /* 링크 자동 */
+		if (r->dwForwardProto != MIB_IPPROTO_NETMGMT) continue; /* 정적만(3) */
+		unsigned d = r->dwForwardDest, m = r->dwForwardMask, g = r->dwForwardNextHop;
+		unsigned pfx = 0, mm = m;
+		while (mm) { pfx += mm & 1; mm >>= 1; }
+		char cidr[32], via[16];
+		snprintf(cidr, sizeof cidr, "%u.%u.%u.%u/%u", d & 0xFF, (d >> 8) & 0xFF, (d >> 16) & 0xFF, (d >> 24) & 0xFF, pfx);
+		snprintf(via, sizeof via, "%u.%u.%u.%u", g & 0xFF, (g >> 8) & 0xFF, (g >> 16) & 0xFF, (g >> 24) & 0xFF);
+		cJSON *ro = cJSON_CreateObject();
+		cJSON_AddStringToObject(ro, "dest", cidr);
+		cJSON_AddStringToObject(ro, "via", via);
+		cJSON_AddItemToArray(arr, ro);
+	}
+	return arr;
+}
+
+/* net_interfaces: GAA per-adapter -> MAC id + kind + speed + addresses[] + gateway. */
 static cJSON *inv_collect_net_interfaces(void)
 {
 	cJSON *arr = cJSON_CreateArray();
-	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+	/* 정적 라우트 테이블 1회 조회(iface 별 필터) */
+	MIB_IPFORWARDTABLE *ipf = NULL;
+	{
+		ULONG sz = 0;
+		if (GetIpForwardTable(NULL, &sz, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+			ipf = (MIB_IPFORWARDTABLE *)malloc(sz);
+			if (ipf && GetIpForwardTable(ipf, &sz, FALSE) != NO_ERROR) { free(ipf); ipf = NULL; }
+		}
+	}
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
 	if (agent_is_nt6()) flags |= GAA_FLAG_INCLUDE_GATEWAYS;
 	ULONG buf_len = 16 * 1024; IP_ADAPTER_ADDRESSES *aa = malloc(buf_len);
-	if (!aa) return arr;
+	if (!aa) { if (ipf) free(ipf); return arr; }
 	ULONG ret = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, aa, &buf_len);
-	if (ret == ERROR_BUFFER_OVERFLOW) { free(aa); aa = malloc(buf_len); if (!aa) return arr; ret = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, aa, &buf_len); }
-	if (ret != NO_ERROR) { free(aa); return arr; }
+	if (ret == ERROR_BUFFER_OVERFLOW) { free(aa); aa = malloc(buf_len); if (!aa) { if (ipf) free(ipf); return arr; } ret = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, aa, &buf_len); }
+	if (ret != NO_ERROR) { free(aa); if (ipf) free(ipf); return arr; }
 	for (IP_ADAPTER_ADDRESSES *p = aa; p; p = p->Next) {
 		if (p->OperStatus != IfOperStatusUp) continue;
 		if (p->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
@@ -584,6 +953,12 @@ static cJSON *inv_collect_net_interfaces(void)
 			cJSON_AddStringToObject(ad, "address", ip);
 			if (prefix >= 0) cJSON_AddNumberToObject(ad, "prefix", (double)prefix); else cJSON_AddNullToObject(ad, "prefix");
 			cJSON_AddStringToObject(ad, "family", family);
+			/* origin: PrefixOrigin(Vista+). Manual=static, Dhcp=dhcp. NT5.2/기타=null */
+			if (agent_is_nt6()) {
+				if (u->PrefixOrigin == IpPrefixOriginManual)    cJSON_AddStringToObject(ad, "origin", "static");
+				else if (u->PrefixOrigin == IpPrefixOriginDhcp) cJSON_AddStringToObject(ad, "origin", "dhcp");
+				else                                            cJSON_AddNullToObject(ad, "origin");
+			} else cJSON_AddNullToObject(ad, "origin");
 			cJSON_AddItemToArray(addrs, ad);
 		}
 		cJSON_AddItemToObject(o, "addresses", addrs);
@@ -600,8 +975,32 @@ static cJSON *inv_collect_net_interfaces(void)
 			char gb[INET_ADDRSTRLEN]; if (legacy_ipv4_gateway(p->IfIndex, gb, sizeof gb)) gw = cJSON_CreateString(gb);
 		}
 		cJSON_AddItemToObject(o, "gateway", gw ? gw : cJSON_CreateNull());
+		/* mtu */
+		if (p->Mtu && p->Mtu != 0xFFFFFFFFUL) cJSON_AddNumberToObject(o, "mtu", (double)p->Mtu);
+		else                                  cJSON_AddNullToObject(o, "mtu");
+		/* dns: per-adapter DNS 서버(FirstDnsServerAddress, XP+) */
+		cJSON *dnsarr = NULL;
+		for (IP_ADAPTER_DNS_SERVER_ADDRESS *ds = p->FirstDnsServerAddress; ds; ds = ds->Next) {
+			if (!ds->Address.lpSockaddr) continue;
+			int df = ds->Address.lpSockaddr->sa_family;
+			char db[INET6_ADDRSTRLEN] = {0};
+			if (df == AF_INET)       inet_ntop(AF_INET, &((struct sockaddr_in *)ds->Address.lpSockaddr)->sin_addr, db, sizeof db);
+			else if (df == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ds->Address.lpSockaddr)->sin6_addr, db, sizeof db);
+			else continue;
+			if (!db[0]) continue;
+			if (!dnsarr) dnsarr = cJSON_CreateArray();
+			cJSON_AddItemToArray(dnsarr, cJSON_CreateString(db));
+		}
+		cJSON_AddItemToObject(o, "dns", dnsarr ? dnsarr : cJSON_CreateNull());
+		/* routes: 정적 비-default(IPv4) */
+		cJSON *rts = win_iface_routes(ipf, p->IfIndex ? p->IfIndex : p->Ipv6IfIndex);
+		cJSON_AddItemToObject(o, "routes", rts ? rts : cJSON_CreateNull());
+		/* bond_mode/vlan_id: Windows 팀ing/VLAN 은 별도 스택 -> null(위조 금지) */
+		cJSON_AddNullToObject(o, "bond_mode");
+		cJSON_AddNullToObject(o, "vlan_id");
 		cJSON_AddItemToArray(arr, o);
 	}
 	free(aa);
+	if (ipf) free(ipf);
 	return arr;
 }
