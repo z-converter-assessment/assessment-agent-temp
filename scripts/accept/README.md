@@ -1,4 +1,4 @@
-# accept — v2 값 정합/시계열 불변식 acceptance 하네스
+# accept — 값 정합/시계열 불변식 acceptance 하네스
 
 check-contract.sh(구조: 필드/타입/null)와 별개로, emit 값이 맞는지·시계열 델타가 정합적인지를
 검증한다. 구현 페이즈마다 아래 probe를 testbed에서 돌려 게이트로 쓴다(scratchpad 아닌 추적 경로).

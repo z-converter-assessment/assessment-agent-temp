@@ -28,7 +28,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define AGENT_VERSION_FALLBACK "0.0.0-dev"
 #include "collect_internal.h"
 
 static void metrics_collect_cgroup(cJSON *root);
@@ -41,7 +40,7 @@ static void metrics_collect_memory_errors(cJSON *root);
 static void metrics_collect_network(cJSON *root);
 static void metrics_collect_pressure(cJSON *root);
 
-/* v2 system.disk: /proc/diskstats raw counters(base 단위). throughput+io_time(%util)+operation_time(await)+queue.
+/* system.disk: /proc/diskstats raw counters(base 단위). throughput+io_time(%util)+operation_time(await)+queue.
  * diskstats(name 이후): f1 reads f2 rd_merge f3 sectors_rd f4 ms_rd | f5 writes f6 wr_merge f7 sectors_wr f8 ms_wr | f9 in_flight f10 io_ticks f11 weighted. */
 static void metrics_collect_disk(cJSON *root)
 {
@@ -87,7 +86,7 @@ static void metrics_collect_disk(cJSON *root)
 	free(content);
 }
 
-/* P2 system.cpu: /proc/stat per-cpu jiffies(->s) + run_queue/blocked + logical.count. */
+/* system.cpu: /proc/stat per-cpu jiffies(->s) + run_queue/blocked + logical.count. */
 static void metrics_collect_cpu(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.cpu");
@@ -138,7 +137,7 @@ static void metrics_collect_cpu(cJSON *root)
 	wire_metric_scalar(ns, "cpu.logical.count", "gauge", "cpu", ncpu > 0, (double)ncpu);
 }
 
-/* P2 system.memory + paging: /proc/meminfo + /proc/vmstat. base 단위 By. */
+/* system.memory + paging: /proc/meminfo + /proc/vmstat. base 단위 By. */
 static void metrics_collect_memory(cJSON *root)
 {
 	char *mi = read_file_all("/proc/meminfo");
@@ -187,7 +186,7 @@ static void metrics_collect_memory(cJSON *root)
 	if (pmaj >= 0) { cJSON *p = wire_point(po); wire_point_attr(p, "direction", "in"); wire_point_attr(p, "type", "major"); wire_point_value(p, (double)pmaj); }
 }
 
-/* P3 system.network: /proc/net/dev per-iface(io/packets/errors/dropped) + link.speed(util 분모)
+/* system.network: /proc/net/dev per-iface(io/packets/errors/dropped) + link.speed(util 분모)
  * + tcp.retransmits(전역) + conntrack. device attr=MAC 안정키. lo 제외. */
 static void metrics_collect_network(cJSON *root)
 {
@@ -240,7 +239,7 @@ static void metrics_collect_network(cJSON *root)
 	wire_metric_scalar(ns, "network.conntrack.limit", "gauge", "entries", ctm >= 0, (double)ctm);
 }
 
-/* P3 system.pressure: PSI(4.20+) /proc/pressure/{cpu,memory,io}. stall.time(counter,s; total us->s,
+/* system.pressure: PSI(4.20+) /proc/pressure/{cpu,memory,io}. stall.time(counter,s; total us->s,
  * 14일 saturation canonical) + stall.ratio(gauge,1; avg10/60/300). 미지원 -> namespace null. */
 static void metrics_collect_pressure(cJSON *root)
 {
@@ -269,7 +268,7 @@ static void metrics_collect_pressure(cJSON *root)
 	if (!any) { cJSON_DeleteItemFromObject(root, "system.pressure"); cJSON_AddNullToObject(root, "system.pressure"); }
 }
 
-/* P4 system.filesystem: statvfs over 실 마운트. usage(gauge,By; used/free/reserved) + inodes(gauge,count). */
+/* system.filesystem: statvfs over 실 마운트. usage(gauge,By; used/free/reserved) + inodes(gauge,count). */
 static void metrics_collect_filesystem(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.filesystem");
@@ -296,7 +295,7 @@ static void metrics_collect_filesystem(cJSON *root)
 	free_mount_entries(mounts, n);
 }
 
-/* P5 E축(disk): mdraid mismatch_cnt + ext4 errors_count. RAID 배열/fs 레벨 참조라 device 스킴 md:/name:. */
+/* E축(disk): mdraid mismatch_cnt + ext4 errors_count. RAID 배열/fs 레벨 참조라 device 스킴 md:/name:. */
 static void metrics_collect_disk_errors(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.disk");
@@ -334,7 +333,7 @@ static void metrics_collect_disk_errors(cJSON *root)
 	}
 }
 
-/* P5 E축(memory): EDAC correctable/uncorrectable 누적. VM/가상칩셋은 EDAC 미노출 -> null(측정불가). */
+/* E축(memory): EDAC correctable/uncorrectable 누적. VM/가상칩셋은 EDAC 미노출 -> null(측정불가). */
 static void metrics_collect_memory_errors(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.memory");
@@ -358,7 +357,7 @@ static void metrics_collect_memory_errors(cJSON *root)
 	p=wire_point(m); wire_point_attr(p,"type","uncorrectable"); if (ue >= 0) wire_point_value(p,(double)ue); else wire_point_null(p);
 }
 
-/* P6 system.cgroup: v2(unified) 우선 + v1 폴백. cpu throttling + memory usage/limit.
+/* system.cgroup: v2(unified) 우선 + v1 폴백. cpu throttling + memory usage/limit.
  * fleet VM 은 대개 root cgroup(제한 없음) -> 있는 신호만 발행, 전무하면 namespace null. */
 static void metrics_collect_cgroup(cJSON *root)
 {

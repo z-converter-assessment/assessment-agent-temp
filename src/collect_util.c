@@ -28,7 +28,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define AGENT_VERSION_FALLBACK "0.0.0-dev"
 #include "collect_internal.h"
 
 int is_excluded_block_dev(const char *name)

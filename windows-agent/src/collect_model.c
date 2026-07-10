@@ -31,7 +31,7 @@ static char g_boot_time_iso[32]      = {0};
 static char g_agent_started_iso[32]  = {0};
 static int  g_times_cached           = 0;
 
-void cache_process_times(void)
+static void cache_process_times(void)
 {
 	if (g_times_cached) return;
 	get_boot_time_iso8601(g_boot_time_iso, sizeof g_boot_time_iso);
@@ -40,7 +40,7 @@ void cache_process_times(void)
 	g_times_cached = 1;
 }
 
-/* --- v2 datapoint-array 빌더 (Linux 트리와 동형) --- */
+/* --- datapoint-array 빌더 (Linux 트리와 동형) --- */
 cJSON *wire_ns(cJSON *root, const char *ns)
 {
 	cJSON *o = cJSON_GetObjectItemCaseSensitive(root, ns);
@@ -98,7 +98,7 @@ void wire_add_envelope(cJSON *root, const char *msg_type,
 {
 	cache_process_times();
 
-	cJSON_AddStringToObject(root, "schema_version", "2.0");
+	cJSON_AddStringToObject(root, "schema_version", "1.0");
 	cJSON_AddStringToObject(root, "message_type", msg_type);
 	/* machine_id 못 구하면 null(위조 금지). 식별·라우팅은 agent_id, 유니크는 mac 기반 composite_id가 유지. */
 	if (machine_id && *machine_id)
@@ -166,14 +166,14 @@ char *resolve_machine_id(void)
 	return out;
 }
 
-int mac_cmp(const void *a, const void *b)
+static int mac_cmp(const void *a, const void *b)
 {
 	return strcmp(*(const char **)a, *(const char **)b);
 }
 
 /* GAA에서 물리 MAC(6바이트, up·non-loopback·non-tunnel)을 dedup·정렬해 mac_list에 채운다(원소 malloc, 반환=개수).
  * mac_addresses와 composite_id 해시 입력이 이 목록을 공유하므로 필터/정렬을 이 한 곳에서만 정의(두 MAC 집합 동일 보장). */
-int collect_mac_list(IP_ADAPTER_ADDRESSES *aa, char *mac_list[], int cap)
+static int collect_mac_list(IP_ADAPTER_ADDRESSES *aa, char *mac_list[], int cap)
 {
 	int mac_count = 0;
 	for (IP_ADAPTER_ADDRESSES *p = aa; p; p = p->Next) {

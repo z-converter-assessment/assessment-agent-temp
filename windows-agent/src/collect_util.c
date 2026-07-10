@@ -48,7 +48,7 @@ int agent_is_nt6(void)
 }
 
 /* NT5.2 ws2_32엔 inet_ntop이 없어(Vista+ export) 이 완전형 폴백을 쓴다. */
-const char *compat_inet_ntop(int af, const void *src, char *dst, size_t size)
+static const char *compat_inet_ntop(int af, const void *src, char *dst, size_t size)
 {
 	const unsigned char *b = (const unsigned char *)src;
 	if (af == AF_INET) {
@@ -406,11 +406,12 @@ void mac_to_devid(const unsigned char *mac, unsigned len, const char *fallback, 
 
 const char *win_id_type(const char *full)
 {
-	if (!strncmp(full, "gptid:", 6))   return "gptid";
-	if (!strncmp(full, "mbrsig:", 7))  return "mbrsig";
-	if (!strncmp(full, "serial:", 7))  return "serial";
-	if (!strncmp(full, "volguid:", 8)) return "volguid";
-	if (!strncmp(full, "wwid:", 5))    return "wwid";
+	if (!strncmp(full, "gptid:", 6))    return "gptid";
+	if (!strncmp(full, "mbrsig:", 7))   return "mbrsig";
+	if (!strncmp(full, "serial:", 7))   return "serial";
+	if (!strncmp(full, "volguid:", 8))  return "volguid";
+	if (!strncmp(full, "partuuid:", 9)) return "partuuid";
+	if (!strncmp(full, "wwid:", 5))     return "wwid";
 	return "name";
 }
 

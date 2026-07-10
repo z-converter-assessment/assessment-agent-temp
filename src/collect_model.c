@@ -77,7 +77,7 @@ const char *cached_agent_started_at_iso(void)
 	return buf;
 }
 
-/* --- v2 datapoint-array 빌더 --- system.<ns> -> metric{type,unit,points:[{attr,value}]}.
+/* --- datapoint-array 빌더 --- system.<ns> -> metric{type,unit,points:[{attr,value}]}.
  * 에이전트는 raw 누적/순간값만 싣고 delta/rate/util 은 엔진. base 단위(s/By/1/count). */
 cJSON *wire_ns(cJSON *root, const char *ns)
 {
@@ -137,7 +137,7 @@ void wire_add_envelope(cJSON *obj,
                                 const char *machine_id,
                                 const char *agent_version)
 {
-	cJSON_AddStringToObject(obj, "schema_version", "2.0");
+	cJSON_AddStringToObject(obj, "schema_version", "1.0");
 	cJSON_AddStringToObject(obj, "message_type", message_type);
 	/* machine_id 없으면 null(측정 불가) — 식별·라우팅은 agent_id, 유니크는 mac 기반 composite_id. */
 	if (machine_id && *machine_id)

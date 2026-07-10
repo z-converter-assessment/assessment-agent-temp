@@ -50,7 +50,7 @@ cJSON *build_error_payload(const char *machine_id, const char *agent_version,
 	return m;
 }
 
-/* P2 system.cpu: per-cpu = NtQuery(SystemProcessorPerformanceInformation, class 8) 동적버퍼(L2, 고코어 무음드롭 방지).
+/* system.cpu: per-cpu = NtQuery(SystemProcessorPerformanceInformation, class 8) 동적버퍼(L2, 고코어 무음드롭 방지).
  * run_queue = perflib System\Processor Queue Length. logical.count = GetNativeSystemInfo. blocked = Windows null. */
 static void metrics_collect_cpu(cJSON *root)
 {
@@ -121,7 +121,7 @@ static void metrics_collect_cpu(cJSON *root)
 	wire_point_value(wire_point(m_lc), (double)ncpu);
 }
 
-/* P2 system.memory + paging: GlobalMemoryStatusEx + perflib Memory(commit/pages). */
+/* system.memory + paging: GlobalMemoryStatusEx + perflib Memory(commit/pages). */
 static void metrics_collect_memory(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.memory");
@@ -159,7 +159,7 @@ static void metrics_collect_memory(cJSON *root)
 	}
 	wire_metric_scalar(ns, "memory.commit.usage", "gauge", "By", have_cu, (double)cu);
 	wire_metric_scalar(ns, "memory.commit.limit", "gauge", "By", have_cl, (double)cl);
-	/* oom_kill/hardware_corrupted/edac: Windows 개념 없음 -> null(WHEA 는 P5). edac 는 correctable/
+	/* oom_kill/hardware_corrupted/edac: Windows 개념 없음 -> null. edac 는 correctable/
 	 * uncorrectable 2점 null 로 발행해 Linux 트리와 필드셋 패리티를 맞춘다(값 위조 아님, 측정불가=null). */
 	wire_metric_scalar(ns, "memory.oom_kill", "counter", "events", 0, 0);
 	wire_metric_scalar(ns, "memory.hardware_corrupted", "gauge", "By", 0, 0);
@@ -176,7 +176,7 @@ static void metrics_collect_memory(cJSON *root)
 	if (have_pout) { cJSON *p = wire_point(po); wire_point_attr(p, "direction", "out"); wire_point_value(p, (double)pout); }
 }
 
-/* v2 system.disk: throughput=NtQuery(시스템 전역·diskperf 독립·단조, device PhysicalDrive0),
+/* system.disk: throughput=NtQuery(시스템 전역·diskperf 독립·단조, device PhysicalDrive0),
  * saturation(io_time/operation_time/pending)=perflib PhysicalDisk per-disk + 유효성 게이트(raw!=0/idle>0, 가짜0 금지).
  * NOTE(accept 게이트): perflib counter-type 수식(% Idle Time=100ns 역산, Avg.Disk sec=PERF_AVERAGE_TIMER raw/PerfFreq)의
  * 값 정확성은 dp-win2016 raw-vs-cooked 대조로 검증 필요. divisor(PerfFreq vs 1e7)는 그 대조로 확정. */
@@ -193,7 +193,6 @@ static void metrics_collect_disk(cJSON *root)
 	 * device 키 충돌 방지 위해 'aggregate:system'. await 는 perflib per-disk operation_time/operations 로 페어. */
 	unsigned long long rop = 0, wop = 0, rby = 0, wby = 0;
 	if (query_system_io(&rop, &wop, &rby, &wby)) {
-		cJSON *p;
 		wire_point_dev_dir(m_io, "aggregate:system", "read", (double)rby);
 		wire_point_dev_dir(m_io, "aggregate:system", "write", (double)wby);
 		wire_point_dev_dir(m_ops, "aggregate:system", "read", (double)rop);
@@ -252,7 +251,16 @@ static void metrics_collect_disk(cJSON *root)
 	free(buf);
 }
 
-/* P3 system.network: GetIfTable2(NT6, GetProcAddress) / GetIfTable(NT5.2 폴백). device=MAC.
+/* E축(disk): Linux 는 mdraid mismatch/ext4 errors_count 를 발행하나 Windows 는 그 소스 개념이
+ * 부재하다(eventlog/WHEA 파싱 미구현). disk.errors metric 키만 두어 Linux 와 필드셋 패리티를
+ * 맞춘다 — points 는 소스 부재라 빈 배열(값 위조 아님, Linux 도 md/ext4 부재 시 빈 metric). */
+static void metrics_collect_disk_errors(cJSON *root)
+{
+	cJSON *ns = wire_ns(root, "system.disk");
+	wire_metric(ns, "disk.errors", "counter", "errors");
+}
+
+/* system.network: GetIfTable2(NT6, GetProcAddress) / GetIfTable(NT5.2 폴백). device=MAC.
  * io/packets/errors/dropped/link.speed + tcp.retransmits(GetTcpStatistics). conntrack 는 Windows 부재. */
 static void metrics_collect_network(cJSON *root)
 {
@@ -325,16 +333,21 @@ static void metrics_collect_network(cJSON *root)
 		wire_metric_scalar(ns, "network.tcp.retransmits", "counter", "segments", 1, (double)ts.dwRetransSegs);
 	else
 		wire_metric_scalar(ns, "network.tcp.retransmits", "counter", "segments", 0, 0);
+	/* conntrack: Windows 개념 부재 -> null 2점(Linux 필드셋 패리티, 값 위조 아님). */
+	wire_metric_scalar(ns, "network.conntrack.usage", "gauge", "entries", 0, 0);
+	wire_metric_scalar(ns, "network.conntrack.limit", "gauge", "entries", 0, 0);
 }
 
-/* P4 system.filesystem: 고정 볼륨 usage(used/free). NTFS 는 inode 개념 부재 -> inodes null. */
+/* system.filesystem: 고정 볼륨 usage(used/free). NTFS 는 inode 개념 부재 -> inodes null. */
 static void metrics_collect_filesystem(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.filesystem");
 	cJSON *m_use = wire_metric(ns, "filesystem.usage",  "gauge", "By");
 	cJSON *m_ino = wire_metric(ns, "filesystem.inodes", "gauge", "count");
-	wchar_t drives[256]; DWORD len = GetLogicalDriveStringsW(256, drives);
-	if (len == 0 || len > 256) return;
+	wchar_t drives[256];
+	DWORD cap = (DWORD)(sizeof drives / sizeof drives[0]);
+	DWORD len = GetLogicalDriveStringsW(cap, drives);
+	if (len == 0 || len > cap) return;
 	for (wchar_t *p = drives; *p; p += wcslen(p) + 1) {
 		if (GetDriveTypeW(p) != DRIVE_FIXED) continue;
 		char mount[16] = {0}; WideCharToMultiByte(CP_UTF8, 0, p, -1, mount, sizeof mount, NULL, NULL);
@@ -359,6 +372,7 @@ cJSON *collect_metrics_payload(const char *machine_id, const char *agent_version
 	metrics_collect_memory(m);   /* + system.paging */
 	metrics_collect_network(m);
 	metrics_collect_disk(m);
+	metrics_collect_disk_errors(m);         /* disk.errors (E축, Linux 필드셋 패리티) */
 	metrics_collect_filesystem(m);
 	cJSON_AddNullToObject(m, "system.pressure");   /* Windows: PSI 부재(스키마 강제 null) */
 	cJSON_AddNullToObject(m, "system.cgroup");     /* Windows: cgroup 부재 */

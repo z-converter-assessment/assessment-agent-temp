@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://z-converter-assessment/wire.schema.json",
-  "title": "assessment-agent wire v2 (USE Method, OTel system.* aligned)",
-  "$comment": "메시지 4종. metrics/inventory 는 v2 재설계(envelope + system.* / block_devices, datapoint-array). task.result/error 는 v1 body 를 v2 envelope 아래 그대로 유지(system.* 재설계 대상 아님) + schema_version. counter=monotonic 누적(엔진 델타), gauge=순간. base 단위 s/By/bit/s/1(ratio)/count. null=측정불가(0과 구분).",
+  "title": "assessment-agent wire (schema_version 1.0, USE Method / OTel system.* aligned)",
+  "$comment": "메시지 4종. envelope + schema_version. metrics/inventory 는 system.*/block_devices datapoint-array, task.result/error 는 실행 결과·실패 body(system.* 대상 아님). counter=monotonic 누적(엔진 델타), gauge=순간. base 단위 s/By/bit/s/1(ratio)/count. null=측정불가(0과 구분).",
 
   "type": "object",
   "$defs": {
@@ -41,7 +41,55 @@
         "mountpoint": { "type": ["string", "null"], "$comment": "swap 노드는 [SWAP] 또는 pagefile 경로" },
         "parent": { "type": ["string", "null"], "$comment": "부모의 id(불안정 name/dm-N 아님). root=null. 복수면 노드 반복" },
         "id": { "type": ["string", "null"] },
-        "id_type": { "enum": ["dm", "partuuid", "wwid", "serial", "by-id", "by-path", "fsuuid", "gptid", "mbrsig", "volguid", "mac", "ifguid", "name", null] }
+        "id_type": { "enum": ["dm", "partuuid", "wwid", "serial", "by-id", "by-path", "fsuuid", "gptid", "mbrsig", "volguid", "mac", "ifguid", "name", null] },
+        "partition_table": { "enum": ["gpt", "mbr", null], "$comment": "재현 확장 키. 자연 노드타입에만 발행(비해당 노드 키 생략). disk 노드. 파티션 테이블 방식" },
+        "sector_size": { "type": ["integer", "null"], "$comment": "disk. 논리 섹터 크기(파티션 오프셋 해석 기준)" },
+        "serial": { "type": ["string", "null"], "$comment": "disk. 디스크 시리얼(id_type 'serial' scheme 과 별개 필드)" },
+        "wwn": { "type": ["string", "null"], "$comment": "disk. 0x+소문자 hex" },
+        "rotational": { "type": ["boolean", "null"], "$comment": "disk. true=HDD false=SSD" },
+        "part_number": { "type": ["integer", "null"], "$comment": "part 노드. 파티션 번호" },
+        "part_start_bytes": { "type": ["integer", "null"], "$comment": "part. 시작 오프셋(바이트)" },
+        "part_type": { "type": ["string", "null"], "$comment": "part. MBR='0x'+소문자hex / GPT=소문자 무중괄호 GUID" },
+        "part_name": { "type": ["string", "null"], "$comment": "part. GPT 파티션 레이블" },
+        "part_flags": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "part. [boot,esp,bios_grub,lvm,raid,swap]. 무플래그=[], 파싱실패=null" },
+        "fs_uuid": { "type": ["string", "null"], "$comment": "fs 얹힌 노드. 파일시스템 UUID" },
+        "fs_label": { "type": ["string", "null"] },
+        "block_size": { "type": ["integer", "null"], "$comment": "fs 블록 크기" },
+        "mount_options": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "fstab 마운트 옵션" },
+        "fs_freq": { "type": ["integer", "null"], "$comment": "fstab 5번째(보통 0)" },
+        "fs_passno": { "type": ["integer", "null"], "$comment": "fstab 6번째(root=1 나머지=2)" },
+        "lvm_vg": { "type": ["string", "null"], "$comment": "lvm 노드. 소속 VG 이름" },
+        "lvm_lv": { "type": ["string", "null"] },
+        "lvm_segtype": { "type": ["string", "null"], "$comment": "linear|striped|mirror|thin|... (unknown pass-through)" },
+        "lvm_stripes": { "type": ["integer", "null"] },
+        "lvm_stripe_size_kib": { "type": ["integer", "null"] },
+        "raid_level": { "type": ["integer", "null"], "$comment": "raid 노드. 0|1|5|6|10. 비수치(linear/multipath)=null" },
+        "raid_chunk_kib": { "type": ["integer", "null"] },
+        "raid_metadata": { "type": ["string", "null"], "$comment": "예 '1.2'" },
+        "raid_uuid": { "type": ["string", "null"] },
+        "crypt_type": { "enum": ["luks1", "luks2", null], "$comment": "crypt 노드. 그 외(PLAIN/VERITY/BITLK 등)=null" }
+      },
+      "additionalProperties": false
+    },
+    "route": {
+      "type": "object",
+      "required": ["dest", "via"],
+      "properties": {
+        "dest": { "type": "string", "$comment": "목적지 CIDR(예 10.60.0.0/16)" },
+        "via": { "type": "string", "$comment": "게이트웨이 IP" }
+      },
+      "additionalProperties": false
+    },
+    "nonblock_mount": {
+      "type": "object",
+      "required": ["source", "target", "fstype"],
+      "properties": {
+        "source": { "type": "string", "$comment": "마운트 소스(tmpfs / nfs 서버:경로 / bind 원본경로)" },
+        "target": { "type": "string", "$comment": "마운트포인트" },
+        "fstype": { "type": "string" },
+        "options": { "type": ["array", "null"], "items": { "type": "string" } },
+        "fs_freq": { "type": ["integer", "null"], "$comment": "fstab 부재면 0" },
+        "fs_passno": { "type": ["integer", "null"] }
       },
       "additionalProperties": false
     },
@@ -51,7 +99,8 @@
       "properties": {
         "address": { "type": "string", "minLength": 1 },
         "prefix": { "type": ["integer", "null"], "minimum": 0, "maximum": 128 },
-        "family": { "enum": ["ipv4", "ipv6"] }
+        "family": { "enum": ["ipv4", "ipv6"] },
+        "origin": { "enum": ["static", "dhcp", null], "$comment": "주소 배정 방식(재현). 판별 불가=null" }
       },
       "additionalProperties": false
     },
@@ -65,7 +114,12 @@
         "kind": { "type": ["string", "null"], "$comment": "physical/loopback/bridge/veth/bond_master/bond_member/vlan/tunnel/virtual" },
         "speed_mbps": { "type": ["integer", "null"], "$comment": "링크속도(util 분모). virtio 부재 -> null" },
         "addresses": { "type": "array", "items": { "$ref": "#/$defs/net_address" }, "$comment": "인터페이스 IP 목록(토폴로지·표시·필터)" },
-        "gateway": { "type": ["string", "null"], "$comment": "default route gateway IP(없으면 null)" }
+        "gateway": { "type": ["string", "null"], "$comment": "default route gateway IP(없으면 null)" },
+        "mtu": { "type": ["integer", "null"], "$comment": "재현. /sys/class/net/<if>/mtu" },
+        "dns": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "재현. resolv.conf nameserver(전역, 물리 인터페이스에 복제)" },
+        "routes": { "type": ["array", "null"], "items": { "$ref": "#/$defs/route" }, "$comment": "재현. default 외 static route" },
+        "bond_mode": { "type": ["string", "null"], "$comment": "재현. raw 커널 토큰(802.3ad 등), 엔진이 enum 정규화" },
+        "vlan_id": { "type": ["integer", "null"] }
       },
       "additionalProperties": false
     },
@@ -101,17 +155,20 @@
         "size_bytes": { "type": ["integer", "null"] },
         "free_bytes": { "type": ["integer", "null"] },
         "data_percent": { "type": ["number", "null"] },
-        "metadata_percent": { "type": ["number", "null"] }
+        "metadata_percent": { "type": ["number", "null"] },
+        "vg_uuid": { "type": ["string", "null"], "$comment": "재현. /etc/lvm/backup 파싱" },
+        "extent_size_bytes": { "type": ["integer", "null"], "$comment": "PE 크기(LV 재생성 기준)" },
+        "pv_ids": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "구성 PV(block_device id 참조). 1차 null" }
       },
       "additionalProperties": false
     },
 
     "task_result": {
-      "$comment": "v1 body 유지 + schema_version + task_policy. task_id 로 매칭(composite_id 불요). boot_time/agent_started_at 은 워커 컨텍스트라 nullable(수집 캐시와 분리). exit_code/signal_no 상호배타(정상종료=exit_code / 시그널종료=signal_no / 미포착 둘다 null; Windows signal_no 항상 null). task_policy(bool|null) 는 exit_code 보다 우선.",
+      "$comment": "실행 결과 body + schema_version + task_policy. task_id 로 매칭(composite_id 불요). boot_time/agent_started_at 은 워커 컨텍스트라 nullable(수집 캐시와 분리). exit_code/signal_no 상호배타(정상종료=exit_code / 시그널종료=signal_no / 미포착 둘다 null; Windows signal_no 항상 null). task_policy(bool|null) 는 exit_code 보다 우선.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "schema_version":   { "const": "2.0" },
+        "schema_version":   { "const": "1.0" },
         "message_type":     { "const": "task.result" },
         "message_id":       { "type": "string", "minLength": 1 },
         "hostname":         { "type": "string" },
@@ -144,11 +201,11 @@
     },
 
     "error": {
-      "$comment": "v1 body 유지 + schema_version. 수집/발행 실패 이벤트. envelope(composite_id 포함) + error_code/error_message/failed_component. retry_count/first_failed_at/recovered_at 옵셔널.",
+      "$comment": "실패 body + schema_version. 수집/발행 실패 이벤트. envelope(composite_id 포함) + error_code/error_message/failed_component. retry_count/first_failed_at/recovered_at 옵셔널.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "schema_version":   { "const": "2.0" },
+        "schema_version":   { "const": "1.0" },
         "message_type":     { "const": "error" },
         "message_id":       { "type": "string", "minLength": 1 },
         "hostname":         { "type": "string", "$comment": "add_common_metadata 공통 경로가 항상 발행(inventory/metrics/error)" },
@@ -174,13 +231,13 @@
 
   "required": ["schema_version", "message_type"],
   "properties": {
-    "schema_version": { "const": "2.0" },
+    "schema_version": { "const": "1.0" },
     "message_type": { "enum": ["inventory", "metrics", "task.result", "error"] }
   },
 
   "allOf": [
     {
-      "$comment": "metrics/inventory: v2 envelope + system.* / block_devices.",
+      "$comment": "metrics/inventory: envelope + system.*/block_devices.",
       "if": { "properties": { "message_type": { "enum": ["metrics", "inventory"] } } },
       "then": {
         "required": ["agent_id", "message_id", "collected_at", "boot_time", "agent_started_at", "os_family"],
@@ -199,12 +256,19 @@
           "os_version": { "type": ["string", "null"] },
           "os_codename": { "type": ["string", "null"] },
           "kernel_version": { "type": ["string", "null"] },
+          "arch": { "type": ["string", "null"], "$comment": "재현. uname machine / wProcessorArchitecture (이미지 ISA 분기, 부팅 크리티컬)" },
+          "bits": { "type": ["integer", "null"], "$comment": "32|64. arch 파생" },
+          "boot_firmware": { "enum": ["uefi", "bios", null], "$comment": "재현. /sys/firmware/efi / GetFirmwareType (틀리면 안 뜸)" },
+          "secure_boot": { "type": ["boolean", "null"] },
+          "edition": { "type": ["string", "null"], "$comment": "Windows EditionID(SKU 코드). Linux null" },
+          "timezone": { "type": ["string", "null"], "$comment": "Linux=IANA / Windows=tz 키명(엔진이 IANA 매핑)" },
+          "rtc_utc": { "type": ["boolean", "null"], "$comment": "RTC 가 UTC 인가(재현 시계). 미측정 null" },
           "cpu_model": { "type": ["string", "null"] },
           "cpu_cores": { "type": ["integer", "null"], "$comment": "논리 코어 수(정적). metrics 는 system.cpu cpu.logical.count(gauge, unit cpu)로도 발행" },
           "mem_total_bytes": { "type": ["integer", "null"], "$comment": "총 물리 메모리(By). metrics memory.limit 와 동치이나 inventory 시점 저장용" },
           "ip_external": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "외부 공인 IP(IMDS best-effort, 없으면 null)" },
-          "services": { "type": ["array", "null"], "items": { "$ref": "#/$defs/service" }, "$comment": "서비스 카탈로그(service_classifier 뱃지). 열거 불가면 null(빈배열과 구분). v1 형태 유지" },
-          "listen_ports": { "type": "array", "items": { "$ref": "#/$defs/listen_port" }, "$comment": "리슨 소켓(포트 기반 서비스 분류). v1 형태 유지" },
+          "services": { "type": ["array", "null"], "items": { "$ref": "#/$defs/service" }, "$comment": "서비스 카탈로그(service_classifier 뱃지). 열거 불가면 null(빈배열과 구분)" },
+          "listen_ports": { "type": "array", "items": { "$ref": "#/$defs/listen_port" }, "$comment": "리슨 소켓(포트 기반 서비스 분류)" },
           "system.cpu":        { "$ref": "#/$defs/namespace", "$comment": "cpu.time(counter,s; attr cpu,state) | cpu.run_queue(gauge; source procs_running|processor_queue) | cpu.blocked(gauge; Linux, Windows null) | cpu.logical.count(gauge,cpu)" },
           "system.memory":     { "$ref": "#/$defs/namespace", "$comment": "memory.usage(gauge,By; state free/cached/buffers/available) | .limit | .commit.usage/.limit | .oom_kill(4.13+) | .hardware_corrupted | .edac(VM null)" },
           "system.paging":     { "$ref": "#/$defs/namespace" },
@@ -215,7 +279,18 @@
           "system.cgroup":     { "$ref": "#/$defs/namespace" },
           "block_devices":     { "type": "array", "items": { "$ref": "#/$defs/block_device" } },
           "net_interfaces":    { "type": "array", "items": { "$ref": "#/$defs/net_interface" } },
-          "lvm_vgs":           { "type": "array", "items": { "$ref": "#/$defs/lvm_vg" } }
+          "lvm_vgs":           { "type": "array", "items": { "$ref": "#/$defs/lvm_vg" } },
+          "boot": {
+            "type": ["object", "null"],
+            "$comment": "재현. 부트로더 재구성. 최상위 신규 노드(reproduction.boot 로 reshape).",
+            "properties": {
+              "kernel_cmdline": { "type": ["string", "null"], "$comment": "/proc/cmdline" },
+              "root_ref_type": { "enum": ["uuid", "label", "partuuid", "path", null], "$comment": "root= 참조 방식" },
+              "grub_install_target": { "type": ["string", "null"], "$comment": "부트로더 설치 디스크 id(불확실 null)" }
+            },
+            "additionalProperties": false
+          },
+          "nonblock_mounts":   { "type": ["array", "null"], "items": { "$ref": "#/$defs/nonblock_mount" }, "$comment": "재현. block_device 없는 마운트(tmpfs/nfs/cifs/bind/9p). fstab 재생성" }
         }
       }
     },
