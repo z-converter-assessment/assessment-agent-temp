@@ -39,6 +39,7 @@ int agent_is_nt6(void);
 int iface_is_hardware(DWORD if_index);
 int legacy_ipv4_gateway(DWORD if_index, char *out, size_t out_sz);
 int legacy_ipv4_prefix(DWORD if_index, unsigned addr_be, int *out_prefix);
+int legacy_iface_speed(DWORD if_index, ULONG64 *out_bps);
 int perf_disk_num(const wchar_t *name);
 int query_system_io(unsigned long long *read_ops, unsigned long long *write_ops,
                            unsigned long long *read_bytes, unsigned long long *write_bytes);
