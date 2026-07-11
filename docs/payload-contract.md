@@ -97,6 +97,7 @@ collection_interval_sec + 아래 네임스페이스. metrics 는 `system.cpu`/`s
 | cpu.run_queue | gauge | tasks | source(procs_running\|processor_queue) | procs_running | perflib System Processor Queue Length | - |
 | cpu.blocked | gauge | tasks | source(procs_blocked) | procs_blocked | (Windows null) | Windows |
 | cpu.logical.count | gauge | cpu | - | /proc/stat cpuN 개수 | NtQuery per-cpu 개수 | - |
+| cpu.mce | counter | events | - | /proc/interrupts MCE 행 per-cpu 합산 | (WHEA=NT6+ 로드가드 -> null) | Windows |
 
 ### system.memory / system.paging
 
@@ -183,7 +184,7 @@ parent(부모의 id 값; root=null; 부모 복수면 노드 반복), id + id_typ
   디스크별로 노드 반복). 레이아웃 IOCTL(DRIVE_LAYOUT_EX)은 구세대 viostor 에서도 동작.
 
 재현(reproduction) 확장 키는 자연 노드타입에만 발행하고 비해당 노드는 키를 생략한다(엔진 OUTPUT 에서 null).
-- disk 노드: partition_table(gpt|mbr|null), sector_size, serial, wwn(0x+소문자hex; Windows 대부분 null),
+- disk 노드: partition_table(gpt|mbr|null), sector_size, serial, wwn(0x+소문자hex; Linux by-id, Windows VPD 0x83 시도·장치 미제공 시 null),
   rotational(true HDD/false SSD). Linux sysfs queue/*, Windows geometry/STORAGE_DEVICE_DESCRIPTOR/seek-penalty(NT5.2 null).
 - part 노드: part_number, part_start_bytes, part_type(MBR '0x'+hex / GPT 소문자무중괄호 GUID), part_name(GPT 레이블),
   part_flags(esp/bios_grub/lvm/raid/swap/msftres + required/legacy_boot/hidden/no_automount/boot; 무플래그=[], 파싱실패=null).
@@ -216,7 +217,7 @@ Windows GetAdaptersAddresses(MAC id).
   Windows GetIpForwardTable NETMGMT). 조회실패 null, 무라우트 [].
 - dns[]: Linux 전역 /etc/resolv.conf 를 default-route 인터페이스에만 부착(그 외 null), Windows per-adapter FirstDnsServerAddress.
 - bond_mode: Linux sysfs bonding/mode raw 토큰(엔진 정규화), Windows null. vlan_id: Linux /proc/net/vlan VID, Windows null.
-- origin(static|dhcp): Windows NT6+ PrefixOrigin 실측(NT5.2 null), Linux null(getifaddrs 미구분, netlink IFA_F_PERMANENT 후속).
+- origin(static|dhcp): Windows NT6+ PrefixOrigin 실측(NT5.2 null), Linux netlink RTM_GETADDR IFA_F_PERMANENT(permanent=static, else dhcp).
 
 ### device 안정키 (계층 폴백)
 
@@ -266,7 +267,7 @@ envelope + 실행 결과·실패 body. 상세 필드/조건은 스키마 $defs(t
 
 - system.pressure: Windows 는 null(스키마 `os_family=windows -> system.pressure:null`).
 - lvm_vgs: Windows 는 미발행(스키마 `not required lvm_vgs`).
-- system.cgroup: Windows null. cpu.blocked/memory.oom_kill/edac/conntrack: Windows null.
+- system.cgroup: Windows null. cpu.blocked/cpu.mce/memory.oom_kill/edac/conntrack: Windows null.
 - os_codename: Windows null. task.result 의 Windows signal_no 항상 null.
 
 ## 빌드/릴리즈

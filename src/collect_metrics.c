@@ -86,7 +86,33 @@ static void metrics_collect_disk(cJSON *root)
 	free(content);
 }
 
-/* system.cpu: /proc/stat per-cpu jiffies(->s) + run_queue/blocked + logical.count. */
+/* /proc/interrupts 의 "MCE:" 행(머신체크 예외)을 per-CPU 합산. 순수 파일·외부명령 불요·단조 counter.
+   행 부재 시 -1(측정불가 null). */
+static long long proc_interrupts_mce(void)
+{
+	char *buf = read_file_all("/proc/interrupts");
+	if (!buf) return -1;
+	long long sum = -1;
+	char *save = NULL;
+	for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		const char *p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (strncmp(p, "MCE:", 4) != 0) continue;
+		p += 4;
+		sum = 0;
+		while (*p) {
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p < '0' || *p > '9') break;   /* 설명 텍스트 만나면 종료 */
+			sum += strtoll(p, NULL, 10);
+			while (*p >= '0' && *p <= '9') p++;
+		}
+		break;
+	}
+	free(buf);
+	return sum;
+}
+
+/* system.cpu: /proc/stat per-cpu jiffies(->s) + run_queue/blocked + logical.count + mce. */
 static void metrics_collect_cpu(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.cpu");
@@ -135,6 +161,9 @@ static void metrics_collect_cpu(cJSON *root)
 	  cJSON *pts = cJSON_GetObjectItemCaseSensitive(bq, "points");
 	  if (cJSON_GetArraySize(pts)) wire_point_attr(cJSON_GetArrayItem(pts,0), "source", "procs_blocked"); }
 	wire_metric_scalar(ns, "cpu.logical.count", "gauge", "cpu", ncpu > 0, (double)ncpu);
+	/* cpu.mce: 머신체크 예외 누적(E축). 행 부재(구커널/아키텍처)면 null. */
+	long long mce = proc_interrupts_mce();
+	wire_metric_scalar(ns, "cpu.mce", "counter", "events", mce >= 0, (double)mce);
 }
 
 /* system.memory + paging: /proc/meminfo + /proc/vmstat. base 단위 By. */

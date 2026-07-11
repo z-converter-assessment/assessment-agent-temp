@@ -11,6 +11,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <ifaddrs.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -1855,7 +1857,57 @@ static cJSON *resolv_dns(void)
 	return arr;
 }
 
-/* net_interfaces: /sys/class/net 열거 -> MAC id + kind + speed + addresses[](getifaddrs) + gateway(default route). */
+/* netlink RTM_GETADDR 덤프 -> (ifindex,family,addr) 별 IFA_F_PERMANENT.
+   getifaddrs 는 주소 플래그를 안 줘서 netlink 로 permanent 비트를 읽어 static/dhcp 를 구분한다. */
+struct addr_origin { int ifindex; int family; unsigned char addr[16]; int permanent; };
+
+static size_t netlink_addr_origins(struct addr_origin *out, size_t cap)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (fd < 0) return 0;
+	struct { struct nlmsghdr nh; struct ifaddrmsg ifa; } req;
+	memset(&req, 0, sizeof req);
+	req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
+	req.nh.nlmsg_type = RTM_GETADDR;
+	req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	req.nh.nlmsg_seq = 1;
+	req.ifa.ifa_family = AF_UNSPEC;
+	if (send(fd, &req, req.nh.nlmsg_len, 0) < 0) { close(fd); return 0; }
+	char buf[16384];
+	size_t n = 0;
+	int done = 0;
+	while (!done) {
+		ssize_t rl = recv(fd, buf, sizeof buf, 0);
+		if (rl <= 0) break;
+		int len = (int)rl;
+		struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+		for (; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
+			if (nh->nlmsg_type == NLMSG_DONE || nh->nlmsg_type == NLMSG_ERROR) { done = 1; break; }
+			if (nh->nlmsg_type != RTM_NEWADDR) continue;
+			struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
+			if (ifa->ifa_family != AF_INET && ifa->ifa_family != AF_INET6) continue;
+			struct rtattr *rta = IFA_RTA(ifa);
+			int rtalen = IFA_PAYLOAD(nh);
+			const unsigned char *addr = NULL; int addrlen = 0;
+			unsigned int flags = ifa->ifa_flags;
+			for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
+				if (rta->rta_type == IFA_ADDRESS)    { addr = (const unsigned char *)RTA_DATA(rta); addrlen = RTA_PAYLOAD(rta); }
+				else if (rta->rta_type == IFA_FLAGS) flags = *(unsigned int *)RTA_DATA(rta);
+			}
+			if (!addr || n >= cap) continue;
+			out[n].ifindex = (int)ifa->ifa_index;
+			out[n].family = ifa->ifa_family;
+			memset(out[n].addr, 0, sizeof out[n].addr);
+			memcpy(out[n].addr, addr, addrlen > 16 ? 16 : addrlen);
+			out[n].permanent = (flags & IFA_F_PERMANENT) ? 1 : 0;
+			n++;
+		}
+	}
+	close(fd);
+	return n;
+}
+
+/* net_interfaces: /sys/class/net 열거 -> MAC id + kind + speed + addresses[](getifaddrs) + origin(netlink) + gateway. */
 static cJSON *inv_collect_net_interfaces(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -1863,6 +1915,8 @@ static cJSON *inv_collect_net_interfaces(void)
 	cJSON *dns = resolv_dns(); /* 전역 DNS. default-route iface 에 부착 */
 	struct ifaddrs *ifap = NULL;
 	getifaddrs(&ifap);
+	static struct addr_origin origins[256];
+	size_t n_origin = netlink_addr_origins(origins, sizeof origins / sizeof origins[0]);
 
 	DIR *d = opendir("/sys/class/net");
 	if (d) {
@@ -1884,6 +1938,7 @@ static cJSON *inv_collect_net_interfaces(void)
 				cJSON_AddNumberToObject(o, "speed_mbps", (double)strtol(spv, NULL, 10));
 			else cJSON_AddNullToObject(o, "speed_mbps");
 			/* addresses[] */
+			unsigned int ifidx = if_nametoindex(iff);
 			cJSON *addrs = cJSON_CreateArray();
 			for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
 				if (!ifa->ifa_addr || !ifa->ifa_name || strcmp(ifa->ifa_name, iff) != 0) continue;
@@ -1902,7 +1957,21 @@ static cJSON *inv_collect_net_interfaces(void)
 				cJSON_AddStringToObject(a, "address", ip);
 				cJSON_AddNumberToObject(a, "prefix", (double)prefix);
 				cJSON_AddStringToObject(a, "family", family);
-				cJSON_AddNullToObject(a, "origin"); /* getifaddrs 는 static/dhcp 미구분 -> null(netlink IFA_F_PERMANENT 후속) */
+				/* origin: netlink IFA_F_PERMANENT 조회. permanent=static, 아니면 dhcp, 미매칭=null. */
+				const char *origin = NULL;
+				const unsigned char *ab = (fam == AF_INET)
+					? (const unsigned char *)&((struct sockaddr_in *)ifa->ifa_addr)->sin_addr
+					: (const unsigned char *)&((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+				int ablen = (fam == AF_INET) ? 4 : 16;
+				for (size_t k = 0; k < n_origin; k++) {
+					if (origins[k].ifindex == (int)ifidx && origins[k].family == fam &&
+					    memcmp(origins[k].addr, ab, ablen) == 0) {
+						origin = origins[k].permanent ? "static" : "dhcp";
+						break;
+					}
+				}
+				if (origin) cJSON_AddStringToObject(a, "origin", origin);
+				else        cJSON_AddNullToObject(a, "origin");
 				cJSON_AddItemToArray(addrs, a);
 			}
 			cJSON_AddItemToObject(o, "addresses", addrs);

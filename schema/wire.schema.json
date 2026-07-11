@@ -269,7 +269,7 @@
           "ip_external": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "외부 공인 IP(IMDS best-effort, 없으면 null)" },
           "services": { "type": ["array", "null"], "items": { "$ref": "#/$defs/service" }, "$comment": "서비스 카탈로그(service_classifier 뱃지). 열거 불가면 null(빈배열과 구분)" },
           "listen_ports": { "type": "array", "items": { "$ref": "#/$defs/listen_port" }, "$comment": "리슨 소켓(포트 기반 서비스 분류)" },
-          "system.cpu":        { "$ref": "#/$defs/namespace", "$comment": "cpu.time(counter,s; attr cpu,state) | cpu.run_queue(gauge; source procs_running|processor_queue) | cpu.blocked(gauge; Linux, Windows null) | cpu.logical.count(gauge,cpu)" },
+          "system.cpu":        { "$ref": "#/$defs/namespace", "$comment": "cpu.time(counter,s; attr cpu,state) | cpu.run_queue(gauge; source procs_running|processor_queue) | cpu.blocked(gauge; Linux, Windows null) | cpu.logical.count(gauge,cpu) | cpu.mce(counter,events; Linux /proc/interrupts, Windows null)" },
           "system.memory":     { "$ref": "#/$defs/namespace", "$comment": "memory.usage(gauge,By; state free/cached/buffered/available) | .limit | .commit.usage/.limit | .oom_kill(4.13+) | .hardware_corrupted | .edac(VM null)" },
           "system.paging":     { "$ref": "#/$defs/namespace" },
           "system.disk":       { "$ref": "#/$defs/namespace", "$comment": "device attr = '<scheme>:<value>' 안정 id(non-null). scheme 카탈로그(D4): gptid|mbrsig|serial|wwid|by-path|dm|partuuid(물리/파티션) + md|btrfsuuid|fsuuid(disk.errors 는 RAID 배열/fs 레벨 참조). io/operations/io_time(%util)/operation_time(await)/pending_operations(queue)/errors(mdraid/btrfs/ext4/ioerr)" },

@@ -119,6 +119,9 @@ static void metrics_collect_cpu(cJSON *root)
 	wire_point_null(wire_point(m_bl));
 	cJSON *m_lc = wire_metric(ns, "cpu.logical.count", "gauge", "cpu");
 	wire_point_value(wire_point(m_lc), (double)ncpu);
+	/* cpu.mce: WHEA 는 NT6+ API/이벤트로그라 NT5.2 로드가드상 하드임포트 불가 -> null(측정불가, 2트리 패리티). */
+	cJSON *m_mce = wire_metric(ns, "cpu.mce", "counter", "events");
+	wire_point_null(wire_point(m_mce));
 }
 
 /* system.memory + paging: GlobalMemoryStatusEx + perflib Memory(commit/pages). */

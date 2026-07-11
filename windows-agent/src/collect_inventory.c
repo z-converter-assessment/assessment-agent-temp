@@ -627,11 +627,11 @@ static BYTE *win_read_drive_layout(HANDLE h)
 }
 
 /* disk 상세: sector_size(geometry)/serial(STORAGE_DEVICE_DESCRIPTOR)/rotational(seek penalty). 핸들 살아있을 때 수집. */
-struct wdmeta { long long sector; int have_sector; char serial[160]; int rot; }; /* rot: -1 unknown, 0 ssd, 1 hdd */
+struct wdmeta { long long sector; int have_sector; char serial[160]; char wwn[80]; int rot; }; /* rot: -1 unknown, 0 ssd, 1 hdd */
 
 static void win_read_disk_meta(HANDLE h, struct wdmeta *m)
 {
-	m->have_sector = 0; m->serial[0] = '\0'; m->rot = -1;
+	m->have_sector = 0; m->serial[0] = '\0'; m->wwn[0] = '\0'; m->rot = -1;
 	DWORD ret = 0;
 	DISK_GEOMETRY geo;
 	if (DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, &geo, sizeof geo, &ret, NULL) && geo.BytesPerSector) {
@@ -654,6 +654,30 @@ static void win_read_disk_meta(HANDLE h, struct wdmeta *m)
 	struct { DWORD Version; DWORD Size; BOOLEAN IncursSeekPenalty; } sp; memset(&sp, 0, sizeof sp);
 	if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q2, sizeof q2, &sp, sizeof sp, &ret, NULL) && ret >= sizeof sp)
 		m->rot = sp.IncursSeekPenalty ? 1 : 0;
+	/* wwn: VPD 0x83 device identifiers(StorageDeviceIdProperty=8). NAA(3)/EUI64(2) 바이너리 -> hex.
+	   장치 미제공(virtio 등)이면 IOCTL 실패/식별자 0 -> wwn 빈값(=null). 바이트오프셋 파싱 + bounds 로 malformed 방어.
+	   STORAGE_IDENTIFIER 레이아웃: CodeSet(4) Type(4) IdentifierSize(2) NextOffset(2) Association(4) Identifier[]. */
+	STORAGE_PROPERTY_QUERY q3; memset(&q3, 0, sizeof q3); q3.PropertyId = (STORAGE_PROPERTY_ID)8; q3.QueryType = PropertyStandardQuery;
+	BYTE ibuf[2048] = {0}; ret = 0;
+	if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q3, sizeof q3, ibuf, sizeof ibuf, &ret, NULL) && ret >= 12) {
+		DWORD nids = *(DWORD *)(ibuf + 8);   /* NumberOfIdentifiers */
+		DWORD off = 12;                       /* Identifiers[] 시작 */
+		for (DWORD i = 0; i < nids && off + 16 <= ret; i++) {
+			DWORD type = *(DWORD *)(ibuf + off + 4);
+			WORD  isz  = *(WORD  *)(ibuf + off + 8);
+			WORD  next = *(WORD  *)(ibuf + off + 10);
+			DWORD idoff = off + 16;
+			if ((DWORD)idoff + isz > ret) break;
+			if ((type == 3 || type == 2) && isz > 0 && isz <= 32) {
+				int w = snprintf(m->wwn, sizeof m->wwn, "0x");   /* Linux(by-id wwn-0x..)와 포맷 통일 */
+				for (WORD b = 0; b < isz && (size_t)(w + 3) < sizeof m->wwn; b++)
+					w += snprintf(m->wwn + w, sizeof m->wwn - w, "%02x", ibuf[idoff + b]);
+				break;
+			}
+			if (next == 0) break;
+			off += next;
+		}
+	}
 }
 
 static void win_attach_disk_meta(cJSON *node, const struct wdmeta *m)
@@ -662,7 +686,8 @@ static void win_attach_disk_meta(cJSON *node, const struct wdmeta *m)
 	else                cJSON_AddNullToObject(node, "sector_size");
 	if (m->serial[0]) cJSON_AddStringToObject(node, "serial", m->serial);
 	else              cJSON_AddNullToObject(node, "serial");
-	cJSON_AddNullToObject(node, "wwn"); /* virtio/하이퍼바이저 미제공 -> null */
+	if (m->wwn[0]) cJSON_AddStringToObject(node, "wwn", m->wwn); /* VPD 0x83 있으면 실측 */
+	else           cJSON_AddNullToObject(node, "wwn");           /* 장치 미제공(virtio 등) -> null */
 	if (m->rot < 0) cJSON_AddNullToObject(node, "rotational");
 	else            cJSON_AddBoolToObject(node, "rotational", m->rot ? 1 : 0);
 }
