@@ -53,9 +53,9 @@
 ## 3. Errors 축 — 추가 이유 + 예상 소비 (사이징 아님)
 
 발행하는 E축(disk.errors=mdraid mismatch + ext4 errors_count, network errors/dropped/tcp.retransmits/conntrack,
-memory.hardware_corrupted, memory.edac[VM null])을 넣은 이유와 예상 소비를 명확히 한다 — 이건 사이징 숫자로
-가지 않는다. 미발행 소스(btrfs error_stats, scsi ioerr_cnt, cpu MCE)는 간단한 카운터 부재/미구현이라 null 대신
-아예 발행하지 않는다(메모리 에러는 hardware_corrupted 가 대체 커버).
+memory.hardware_corrupted, memory.edac[VM null], cpu.mce[Linux /proc/interrupts MCE, Windows null])을 넣은 이유와
+예상 소비를 명확히 한다 — 이건 사이징 숫자로 가지 않는다. 미발행 소스(btrfs error_stats, scsi ioerr_cnt)는 간단한
+카운터 부재/미구현이라 null 대신 아예 발행하지 않는다(메모리 에러는 hardware_corrupted 가 대체 커버).
 
 - 예상 소비 1) confidence 오염 게이트: 자원에 fault 가 있으면 그 자원의 U/S 읽기가 오염됐을 수 있다 ->
   분류를 막지 말고 신뢰도만 하향(엔진의 steal_biased 패턴과 동형). 예: disk fault(mdraid degraded/btrfs

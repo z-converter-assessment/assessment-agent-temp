@@ -154,8 +154,8 @@
         "name": { "type": "string" },
         "size_bytes": { "type": ["integer", "null"] },
         "free_bytes": { "type": ["integer", "null"] },
-        "data_percent": { "type": ["number", "null"] },
-        "metadata_percent": { "type": ["number", "null"] },
+        "data_percent": { "type": ["number", "null"], "$comment": "씬풀 충전율(used/total data blocks %). DM_TABLE_STATUS ioctl(외부명령 없이). VG당 thin-pool 1개일 때만, 아니면 null" },
+        "metadata_percent": { "type": ["number", "null"], "$comment": "씬풀 메타데이터 충전율(%). data_percent 와 같은 소스" },
         "vg_uuid": { "type": ["string", "null"], "$comment": "재현. /etc/lvm/backup 파싱" },
         "extent_size_bytes": { "type": ["integer", "null"], "$comment": "PE 크기(LV 재생성 기준)" },
         "pv_ids": { "type": ["array", "null"], "items": { "type": "string" }, "$comment": "구성 PV = 각 PV device 를 resolve 한 block_device 안정 id(join-ready). PV 부재 시 null" }

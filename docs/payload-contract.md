@@ -197,14 +197,16 @@ parent(부모의 id 값; root=null; 부모 복수면 노드 반복), id + id_typ
 
 ### lvm_vgs[] (Linux; /etc/lvm/backup 존재 시)
 
-{name, vg_uuid, extent_size_bytes, size_bytes, free_bytes, pv_ids} 발행 + {data_percent, metadata_percent}=null.
+{name, vg_uuid, extent_size_bytes, size_bytes, free_bytes, pv_ids, data_percent, metadata_percent} 발행.
 /etc/lvm/backup/<vg> 텍스트 메타데이터 파싱(device raw read·외부명령 없이)으로 뽑는다: name/vg_uuid/extent_size,
 size=sum(pe_count)*extent_size*512, free=(sum(pe_count)-alloc_pe)*extent_size*512. alloc_pe 는 물리 PE 를 소비하는
 세그먼트(type=striped/linear)의 extent_count 만 합산한다 — thin/raid/cache/snapshot 의 상위·가상 세그먼트 extent_count 는
 가상 크기라 PE 를 안 쓰고 실제 소비는 hidden sub-LV(_tdata/_rimage/_cdata 등)의 striped 세그먼트에 있어 그것만 센다
 (전 세그먼트 합산 시 이중계산으로 free 가 음수->0 위조). pv_ids=각 PV device 를
-resolve 한 block_device 안정 id(join-ready). thin data%/metadata% 는 런타임 할당 상태라 정적 백업에 없고 lvm2 툴/
-dmsetup(외부명령)이 필요해 null. LVM 토폴로지는 block_devices 의 type=lvm 노드(dm/uuid parent 체인 + lvm_vg/lvm_lv/
+resolve 한 block_device 안정 id(join-ready). data_percent/metadata_percent 는 런타임 충전율이라 정적 백업엔 없어,
+device-mapper ioctl(/dev/mapper/control DM_TABLE_STATUS — dmsetup 같은 외부명령 없이)로 thin-pool 타깃 status 의
+used/total 블록을 직접 읽어 percent 로 발행한다. VG 당 thin-pool 정확히 1개일 때만 반영(0/다수/status 포맷 불일치 -> null).
+LVM 토폴로지는 block_devices 의 type=lvm 노드(dm/uuid parent 체인 + lvm_vg/lvm_lv/
 segtype/stripes)로도 커버된다. /etc/lvm/backup 부재 시 키 생략.
 
 ### net_interfaces[]

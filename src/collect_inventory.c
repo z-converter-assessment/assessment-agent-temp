@@ -13,6 +13,8 @@
 #include <ifaddrs.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/dm-ioctl.h>
+#include <sys/ioctl.h>
 #include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -1517,12 +1519,131 @@ static void attach_dm_type_meta(cJSON *node, const char *dev, const char *type, 
 	/* dm/mpath: 추가 필드 없음 */
 }
 
-/* 최상위 lvm_vgs: /etc/lvm/backup/<vg> 각각 -> name/vg_uuid/extent_size_bytes. 나머지 1차 null. */
+/* /dev/mapper/control DM_TABLE_STATUS 로 thin-pool 타깃 status 를 뽑아 충전율(percent) 계산.
+   dmsetup(외부명령) 없이 ioctl 직접. status: "<txn> <used_meta>/<total_meta> <used_data>/<total_data> ...".
+   포맷 불일치/실패/에러상태(Fail 등)면 sscanf 5필드 매칭 실패 -> 0 반환(호출측 null). 버전 관용. */
+static int dm_thinpool_status(const char *dm_name, double *data_pct, double *meta_pct)
+{
+	int fd = open("/dev/mapper/control", O_RDWR | O_CLOEXEC);
+	if (fd < 0) return 0;
+	size_t bufsz = 8192;
+	char *buf = calloc(1, bufsz);
+	if (!buf) { close(fd); return 0; }
+	struct dm_ioctl *dmi = (struct dm_ioctl *)buf;
+	dmi->version[0] = DM_VERSION_MAJOR;
+	dmi->version[1] = 0;
+	dmi->version[2] = 0;
+	dmi->data_size = (uint32_t)bufsz;
+	dmi->data_start = sizeof(struct dm_ioctl);
+	snprintf(dmi->name, sizeof dmi->name, "%s", dm_name);
+	int ok = 0;
+	if (ioctl(fd, DM_TABLE_STATUS, dmi) == 0 && dmi->target_count >= 1) {
+		struct dm_target_spec *spec = (struct dm_target_spec *)(buf + dmi->data_start);
+		if (strcmp(spec->target_type, "thin-pool") == 0) {
+			const char *status = (const char *)spec + sizeof(struct dm_target_spec);
+			unsigned long long um = 0, tm = 0, ud = 0, td = 0;
+			long long txn = 0;
+			if (sscanf(status, "%lld %llu/%llu %llu/%llu", &txn, &um, &tm, &ud, &td) == 5 && tm > 0 && td > 0) {
+				*meta_pct = (double)um / (double)tm * 100.0;
+				*data_pct = (double)ud / (double)td * 100.0;
+				ok = 1;
+			}
+		}
+	}
+	free(buf);
+	close(fd);
+	return ok;
+}
+
+/* /sys/block/dm-* 중 uuid 가 "-tpool" 로 끝나는 LVM thin-pool 타깃을 찾아 (소속 vg, data%, meta%) 수집.
+   dm 이름 "<vg>-<pool>-tpool" 을 lvm_split_dmname 으로 vg 분리. lvm_vgs 는 VG 당 tpool 1개일 때만 반영. */
+struct thinpool_fill { char vg[160]; double data_pct; double meta_pct; };
+
+static size_t collect_thinpool_fills(struct thinpool_fill *out, size_t cap)
+{
+	size_t n = 0;
+	DIR *dd = opendir("/sys/block");
+	if (!dd) return 0;
+	struct dirent *e;
+	while ((e = readdir(dd)) && n < cap) {
+		if (strncmp(e->d_name, "dm-", 3) != 0) continue;
+		char p[320], uuid[300], name[300];
+		snprintf(p, sizeof p, "/sys/block/%s/dm/uuid", e->d_name);
+		if (!read_sysfs_str(p, uuid, sizeof uuid)) continue;
+		size_t ul = strlen(uuid);
+		if (ul < 6 || strcmp(uuid + ul - 6, "-tpool") != 0) continue;
+		snprintf(p, sizeof p, "/sys/block/%s/dm/name", e->d_name);
+		if (!read_sysfs_str(p, name, sizeof name)) continue;
+		double dp = 0, mp = 0;
+		if (!dm_thinpool_status(name, &dp, &mp)) continue;
+		char vg[160], lv[160];
+		lvm_split_dmname(name, vg, sizeof vg, lv, sizeof lv);
+		if (!vg[0]) continue;
+		snprintf(out[n].vg, sizeof out[n].vg, "%s", vg);
+		out[n].data_pct = dp;
+		out[n].meta_pct = mp;
+		n++;
+	}
+	closedir(dd);
+	return n;
+}
+
+/* data_percent/metadata_percent: VG 에 thin-pool 이 정확히 1개일 때만 반영(0/다수는 per-VG 필드라 모호 -> null). */
+static void lvm_emit_thinpool_fill(cJSON *o, const struct thinpool_fill *fills, size_t n_fills, const char *vg)
+{
+	int np = 0;
+	double dpct = 0, mpct = 0;
+	for (size_t k = 0; k < n_fills; k++)
+		if (strcmp(fills[k].vg, vg) == 0) { np++; dpct = fills[k].data_pct; mpct = fills[k].meta_pct; }
+	if (np == 1) {
+		cJSON_AddNumberToObject(o, "data_percent", dpct);
+		cJSON_AddNumberToObject(o, "metadata_percent", mpct);
+	} else {
+		cJSON_AddNullToObject(o, "data_percent");
+		cJSON_AddNullToObject(o, "metadata_percent");
+	}
+}
+
+/* pv_ids: physical_volumes 의 각 device="/dev/X" 를 basename -> resolve_block_id 로 block_device
+   안정 id 값(join-ready)으로 발행 -> block_devices[].id 와 조인. 없으면 null. */
+static void lvm_emit_pv_ids(cJSON *o, const char *buf)
+{
+	cJSON *pv_ids = cJSON_CreateArray();
+	const char *pat = "device = \"";
+	size_t patlen = strlen(pat);
+	const char *dp = buf;
+	while ((dp = strstr(dp, pat)) != NULL) {
+		dp += patlen;
+		const char *end = strchr(dp, '"');
+		if (!end) break;
+		char devpath[300];
+		size_t n = (size_t)(end - dp);
+		if (n >= sizeof devpath) n = sizeof devpath - 1;
+		memcpy(devpath, dp, n);
+		devpath[n] = '\0';
+		const char *base = strrchr(devpath, '/');
+		base = base ? base + 1 : devpath;
+		char sid[320];
+		resolve_block_id(base, sid, sizeof sid);
+		cJSON_AddItemToArray(pv_ids, cJSON_CreateString(dev_id_value(sid)));
+		dp = end + 1;
+	}
+	if (cJSON_GetArraySize(pv_ids) > 0) {
+		cJSON_AddItemToObject(o, "pv_ids", pv_ids);
+	} else {
+		cJSON_Delete(pv_ids);
+		cJSON_AddNullToObject(o, "pv_ids");
+	}
+}
+
+/* 최상위 lvm_vgs: /etc/lvm/backup/<vg> 각각 -> name/vg_uuid/extent_size_bytes/size/free/pv_ids/data_percent. */
 static cJSON *inv_collect_lvm_vgs(void)
 {
 	DIR *d = opendir("/etc/lvm/backup");
 	if (!d) return NULL;
 	cJSON *arr = cJSON_CreateArray();
+	struct thinpool_fill fills[64];
+	size_t n_fills = collect_thinpool_fills(fills, 64);
 	struct dirent *e;
 	while ((e = readdir(d))) {
 		if (e->d_name[0] == '.') continue;
@@ -1549,41 +1670,11 @@ static cJSON *inv_collect_lvm_vgs(void)
 			cJSON_AddNullToObject(o, "size_bytes");
 			cJSON_AddNullToObject(o, "free_bytes");
 		}
-		/* data_percent/metadata_percent: thin pool 런타임 할당 상태라 정적 백업에 없음 -> null(외부명령 금지). */
-		cJSON_AddNullToObject(o, "data_percent");
-		cJSON_AddNullToObject(o, "metadata_percent");
+		/* data_percent/metadata_percent: 씬풀 충전율. DM_TABLE_STATUS(ioctl, 외부명령 없이)로 뽑는다. */
+		lvm_emit_thinpool_fill(o, fills, n_fills, e->d_name);
 		if (vgid[0])  cJSON_AddStringToObject(o, "vg_uuid", vgid); else cJSON_AddNullToObject(o, "vg_uuid");
 		if (have_ext) cJSON_AddNumberToObject(o, "extent_size_bytes", (double)(ext * 512)); else cJSON_AddNullToObject(o, "extent_size_bytes");
-		/* pv_ids: physical_volumes 의 각 device="/dev/X" 를 basename -> resolve_block_id 로 block_device
-		   안정 id 값(join-ready)으로 발행 -> block_devices[].id 와 조인된다. 없으면 null. */
-		{
-			cJSON *pv_ids = cJSON_CreateArray();
-			const char *pat = "device = \"";
-			size_t patlen = strlen(pat);
-			const char *dp = buf;
-			while ((dp = strstr(dp, pat)) != NULL) {
-				dp += patlen;
-				const char *end = strchr(dp, '"');
-				if (!end) break;
-				char devpath[300];
-				size_t n = (size_t)(end - dp);
-				if (n >= sizeof devpath) n = sizeof devpath - 1;
-				memcpy(devpath, dp, n);
-				devpath[n] = '\0';
-				const char *base = strrchr(devpath, '/');
-				base = base ? base + 1 : devpath;
-				char sid[320];
-				resolve_block_id(base, sid, sizeof sid);
-				cJSON_AddItemToArray(pv_ids, cJSON_CreateString(dev_id_value(sid)));
-				dp = end + 1;
-			}
-			if (cJSON_GetArraySize(pv_ids) > 0) {
-				cJSON_AddItemToObject(o, "pv_ids", pv_ids);
-			} else {
-				cJSON_Delete(pv_ids);
-				cJSON_AddNullToObject(o, "pv_ids");
-			}
-		}
+		lvm_emit_pv_ids(o, buf);
 		cJSON_AddItemToArray(arr, o);
 		free(buf);
 	}
