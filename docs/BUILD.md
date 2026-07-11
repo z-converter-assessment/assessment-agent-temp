@@ -51,11 +51,11 @@ scripts/check-contract.sh dist/assessment-agent-linux-x86_64            # 네이
 scripts/check-contract.sh dist/assessment-agent-windows-x86.exe wine    # 로컬 wine
 ```
 
-`check-contract.sh`가 4종 `emit` 출력을 스키마로 검증한다(`scripts/validate-wire.py`). 필드/타입/null 의미론과 os_family 조건부(saturation은 Windows 전용, task.result의 Windows os_codename=null 등)를 강제해, 리눅스-윈도우 트리 간 드리프트와 자기계약 위반을 잡는다.
+`check-contract.sh`가 4종 `emit` 출력을 두 검사에 태운다. (1) 스키마 검증(`scripts/validate-wire.py`): 필드/타입/null 의미론과 os_family 조건부(saturation은 Windows 전용, task.result의 Windows os_codename=null 등). (2) 어휘 검증(`scripts/check-vocab.py` + 정본 `schema/metric-vocab.json`): system.* metric 이름과 attr 키가 어휘 화이트리스트의 부분집합인지 — 스키마가 개방형으로 두는 metric/attr 이름 드리프트(키 오타로 소비자가 조용히 드롭)를 잡는다. 둘 다 리눅스-윈도우 트리 간 드리프트와 자기계약 위반을 릴리즈 전에 막는다.
 
 ## 릴리즈 (CI)
 
-`.github/workflows/release.yml`이 `v*` 태그 push를 받아 2종을 빌드하고 해당 태그의 GitHub Release에 게시한다(softprops upsert). 릴리즈는 최신 단일 태그 하나로 유지하고, 재릴리즈는 그 태그를 덮어쓴다.
+`.github/workflows/release.yml`이 `v*` 태그 push를 받아 2종을 빌드하고 해당 태그의 GitHub Release에 게시한다(softprops upsert). 릴리즈는 버전 태그별로 누적 보존한다 — 각 태그가 자기 릴리즈와 바이너리를 갖고, 구 릴리즈는 지우지 않는다. 재릴리즈(같은 태그 재푸시)만 그 태그를 덮어쓴다.
 
 ```bash
 git tag -f vX.Y.Z && git push -f origin vX.Y.Z

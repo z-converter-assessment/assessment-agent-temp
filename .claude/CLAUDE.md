@@ -41,6 +41,7 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 - 계층 규칙: metrics 와 inventory 는 서로 호출하지 않는다. 둘 다 model+util 만 의존(단방향). 두 곳에서 쓰는 헬퍼는 util(공유 파싱)이나 model 로 올린다. 공개 API 만 collect.h, 파일간 공유 내부 심볼은 non-static + collect_internal.h 선언.
 - 네이밍 스킴(양 트리 통일): wire 프리미티브 `wire_*`(wire_ns/wire_metric/wire_point/wire_point_attr/wire_point_value/wire_point_null/wire_metric_scalar/wire_add_envelope), metrics 수집기 `metrics_collect_*`, inventory 수집기 `inv_collect_*`. 파싱 헬퍼는 서술적 이름 유지(disk_device_id 등).
 - datapoint 발행: device(+direction)+value 패턴은 `wire_point_dev_dir(metric, device, direction, value)` 한 줄로. 단일값은 `wire_metric_scalar(ns, name, type, unit, have, value)`. 조건부 null 등 헬퍼에 안 맞는 경우만 wire_point + wire_point_attr + wire_point_value/wire_point_null 를 쓴다.
+- 어휘 정본: 신규 `system.*` metric 이름이나 attr 키를 발행하면 `schema/metric-vocab.json` 도 같이 갱신한다(양 트리 합집합). CI `check-vocab.py` 가 emit 어휘를 이 정본의 부분집합으로 강제하므로, 정본 미갱신 시 릴리즈가 막힌다. 이름 변경(리네이밍)은 소비자 키와의 계약이라 엔진과 합의 후 정본·양 트리 동시 반영.
 - 코드 스타일: 한 줄에 한 문장(세미콜론으로 여러 문장 뭉치지 않는다). 3회 이상 반복되는 발행 패턴은 헬퍼로 추출. collect 계층 주석은 한국어(다이어그램 제외).
 - 2트리 대칭: 파일 레이아웃/네이밍/필드셋을 Linux(`src/`)와 Windows(`windows-agent/src/`) 동일하게 유지. 한쪽에 신호를 추가하면 다른 쪽도 실측 발행하거나 측정불가 null 로 필드셋을 맞춘다(예: memory.edac 는 Windows 도 null 2점 발행).
 
@@ -50,7 +51,7 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 
 - 값(0 포함)은 실측이고 null은 측정 불가다. OS에 개념이 없는 필드를 가짜값으로 채우지 않고 null로 둔다.
 - 정본은 `schema/wire.schema.json`이다. 스키마나 직렬화를 바꾸면 정본도 같이 고친다. 메시지별 필드 셋 상세는 스키마 `$comment`와 `docs/payload-contract.md`에 있다.
-- CI가 두 바이너리의 `emit` dry-run 4종(inventory/metrics/task.result/error)을 이 스키마로 검증한다(`scripts/check-contract.sh`). 필드/타입/null과 os_family 조건부(saturation은 Windows 전용, task.result의 Windows os_codename=null 등)를 어기면 릴리즈가 막힌다.
+- CI가 두 바이너리의 `emit` dry-run 4종(inventory/metrics/task.result/error)을 두 검사로 강제한다(`scripts/check-contract.sh`). (1) 스키마(`schema/wire.schema.json`): 필드/타입/null과 os_family 조건부(saturation은 Windows 전용, task.result의 Windows os_codename=null 등). (2) 어휘 화이트리스트(`schema/metric-vocab.json` + `scripts/check-vocab.py`): system.* metric 이름·attr 키가 어휘 정본의 부분집합인지 — 스키마가 개방형으로 두는 producer 이름 드리프트를 잡는다. 어느 하나라도 어기면 릴리즈가 막힌다.
 - 2트리 간 필드 셋 드리프트를 두지 않는다. Windows 소스 변경의 정당한 용처는 그 OS가 실측 가능한 값을 세대 무관하게 뽑는 것이지, 리눅스 필드를 흉내내는 값 위조가 아니다.
 
 ### 계약 버저닝 (시스템 통일 major 축)
@@ -77,7 +78,7 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 - 문서는 현황 선언형으로만 쓴다. 과거·변화 이력 서술("이전엔 X였는데 바뀌었다")을 넣지 않는다.
 - 결정과 제약은 이 문서 또는 `docs/`에 누적 기록한다. auto-memory는 쓰지 않는다(글로벌 정책).
 - 저장소는 github `z-converter-assessment/assessment-agent-temp`(public). 빌드 아티팩트(`vendor/`, `dist/`, `build/`, `*.o`, `*.exe`, `*.res`)는 `.gitignore` 대상이고 추적 파일만 커밋한다.
-- 릴리즈는 최신 단일 태그 하나로 유지한다(재릴리즈는 태그 덮어쓰기). 상세는 [docs/BUILD.md](../docs/BUILD.md).
+- 릴리즈는 버전 태그별로 누적 보존한다 — 각 `vX.Y.Z` 태그가 자기 GitHub Release와 바이너리를 갖고 구 릴리즈를 지우지 않는다. 재릴리즈(같은 태그 재푸시)만 그 태그의 릴리즈를 덮어쓴다. 상세는 [docs/BUILD.md](../docs/BUILD.md).
 
 ## wire 계약
 

@@ -4,7 +4,11 @@
 기계검증 가능한 정본(source of truth)은 `schema/wire.schema.json`(JSON Schema, `schema_version:"1.0"`)이다.
 CI가 두 바이너리의 `emit` dry-run 출력(inventory / metrics / task.result / error 4종 전부)을 이
 스키마로 강제해(`scripts/check-contract.sh`), 리눅스-윈도우 트리 간 드리프트와 자기계약 위반을
-릴리즈 전에 잡는다. 로컬 검증:
+릴리즈 전에 잡는다. 스키마는 구조(네임스페이스/타입/단위/attr맵/null/os_family)를 강제하지만 metric
+이름과 attr 키 어휘는 개방형이라, metric/attr 이름이 소비자 키와 어긋나는 producer 드리프트(값은
+맞는데 키 오타로 조용히 드롭)는 못 잡는다. 그래서 어휘 정본 `schema/metric-vocab.json` + 검사
+`scripts/check-vocab.py`를 같은 게이트에 얹어, emit 의 system.* metric 이름과 attr 키가 어휘의
+부분집합인지 강제한다(OS/커널 조건부 미발행은 허용). 로컬 검증:
 `scripts/check-contract.sh dist/assessment-agent-linux-x86_64` /
 `... dist/assessment-agent-windows-x86.exe wine`.
 
@@ -215,6 +219,7 @@ segtype/stripes)로도 커버된다. /etc/lvm/backup 부재 시 키 생략.
 addresses[]={address, prefix, family, origin}. Linux getifaddrs + /sys/class/net(MAC id, 폴백 by-path/name).
 Windows GetAdaptersAddresses(MAC id).
 
+- speed_mbps: Linux /sys/class/net/*/speed, Windows NT6+ Transmit/ReceiveLinkSpeed(Mbps 환산). Windows NT5.2 및 virtio/가상 NIC 등 속도 부재 시 null. 그 호스트 링크속도는 metrics `network.link.speed`(bit/s)에 실리므로, 소비자는 inventory speed_mbps 가 null 이면 link.speed 로 폴백한다(중복 발행 회피 -> 한쪽만 실측).
 - mtu: Linux sysfs mtu / Windows Mtu. routes[]: 정적 비-default IPv4 {dest CIDR, via}(Linux /proc/net/route dest!=0 & gw!=0,
   Windows GetIpForwardTable NETMGMT). 조회실패 null, 무라우트 [].
 - dns[]: Linux 전역 /etc/resolv.conf 를 default-route 인터페이스에만 부착(그 외 null), Windows per-adapter FirstDnsServerAddress.
@@ -231,7 +236,7 @@ metric 의 device attr 와 block_devices/net_interfaces 의 id/parent 는 이름
 - 디스크(Linux): dm/uuid -> serial -> by-path -> name. 파티션: partuuid -> name.
 - 디스크(Windows): GPT DiskId(gptid) -> MBR Signature(mbrsig) -> serial -> name. 볼륨: volume GUID(volguid).
 - 네트워크: MAC(mac). 폴백 Windows ifguid, Linux by-path, 최후 name.
-- id_type enum: dm/partuuid/wwid/serial/by-id/by-path/fsuuid/gptid/mbrsig/volguid/mac/ifguid/name/null.
+- id_type enum(디스크/블록 축): dm/partuuid/wwid/serial/by-id/by-path/fsuuid/gptid/mbrsig/volguid/name/null. 네트워크 축: mac/ifguid/by-path/name/null. mac/ifguid 는 네트워크 전용이라 디스크 축 enum 에 없다(축별 분리).
 
 ## USE 매핑 (Layer 2; 엔진 해석 참조)
 

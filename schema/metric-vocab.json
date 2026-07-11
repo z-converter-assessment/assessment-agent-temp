@@ -1,0 +1,14 @@
+{
+  "$comment": "wire 계약 metric 어휘 정본. wire.schema.json 은 구조(네임스페이스/타입/단위/attr맵/null/os_family)를 강제하지만 metric 이름과 attr 키 어휘는 개방형이라 producer 드리프트(오타·소비자 키와의 어긋남)를 잡지 못한다. 이 파일이 그 어휘를 핀한다. check-vocab.py 가 emit 출력의 system.* metric 이름과 attr 키가 이 집합의 부분집합인지 검증한다(CI 게이트). OS/커널 조건부로 일부 metric 미발행은 허용(부분집합만 강제). 신규 metric/attr 추가는 additive 이며 이 파일을 같이 갱신한다. 어휘는 양 트리(Linux/Windows) 발행 코드의 합집합이다.",
+  "namespaces": {
+    "system.cpu": ["cpu.time", "cpu.run_queue", "cpu.blocked", "cpu.logical.count", "cpu.mce"],
+    "system.memory": ["memory.usage", "memory.limit", "memory.commit.usage", "memory.commit.limit", "memory.oom_kill", "memory.hardware_corrupted", "memory.edac"],
+    "system.paging": ["paging.operations"],
+    "system.disk": ["disk.io", "disk.operations", "disk.io_time", "disk.operation_time", "disk.pending_operations", "disk.errors"],
+    "system.filesystem": ["filesystem.usage", "filesystem.inodes.usage"],
+    "system.network": ["network.io", "network.packets", "network.errors", "network.dropped", "network.link.speed", "network.tcp.retransmits", "network.conntrack.usage", "network.conntrack.limit"],
+    "system.pressure": ["pressure.stall.ratio", "pressure.stall.time"],
+    "system.cgroup": ["cgroup.cpu.throttled.count", "cgroup.cpu.throttled.time", "cgroup.memory.usage", "cgroup.memory.limit"]
+  },
+  "attr_keys": ["class", "cpu", "device", "direction", "kind", "mountpoint", "resource", "scope", "source", "state", "type", "window"]
+}

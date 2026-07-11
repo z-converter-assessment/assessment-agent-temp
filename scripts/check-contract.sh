@@ -14,6 +14,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCHEMA="$HERE/../schema/wire.schema.json"
+VOCAB="$HERE/../schema/metric-vocab.json"
 BIN="${1:?usage: check-contract.sh <binary> [runner...]}"; shift || true
 RUNNER=("$@")   # 비면 네이티브, 아니면 앞에 붙임(예: wine)
 
@@ -27,9 +28,10 @@ run() {
 rc=0
 for kind in inventory metrics task.result error; do
 	echo "[contract] ${RUNNER[*]:-native} $(basename "$BIN") emit $kind"
-	if ! run emit "$kind" 2>/dev/null | "$PY" "$HERE/validate-wire.py" "$SCHEMA"; then
-		rc=1
-	fi
+	# emit 출력을 한 번 태워, 구조(스키마)와 어휘(metric명/attr키 화이트리스트) 둘 다에 건다.
+	out="$(run emit "$kind" 2>/dev/null)" || { echo "[contract] emit $kind 실행 실패" >&2; rc=1; continue; }
+	printf '%s' "$out" | "$PY" "$HERE/validate-wire.py" "$SCHEMA" || rc=1
+	printf '%s' "$out" | "$PY" "$HERE/check-vocab.py" "$VOCAB" || rc=1
 done
 
 if [ "$rc" -eq 0 ]; then

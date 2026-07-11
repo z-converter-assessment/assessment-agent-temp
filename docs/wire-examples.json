@@ -56,9 +56,7 @@
       "disk.operation_time":{ "type": "counter", "unit": "s", "points": [ { "attr": { "device": "serial:897bb3a7-77a3-48ed", "direction": "write" }, "value": 9.21 } ] },
       "disk.pending_operations": { "type": "gauge", "unit": "operations", "points": [ { "attr": { "device": "serial:897bb3a7-77a3-48ed" }, "value": 1 } ] },
       "disk.errors":        { "type": "counter", "unit": "errors", "points": [
-        { "attr": { "device": "md:md5", "kind": "mdraid", "class": "member_errors", "member": "vdf" }, "value": 0 },
-        { "attr": { "device": "md:md5", "kind": "mdraid", "class": "degraded" }, "value": 0 },
-        { "attr": { "device": "btrfsuuid:0578dc74", "kind": "btrfs", "class": "corruption" }, "value": 0 },
+        { "attr": { "device": "md:md5", "kind": "mdraid", "class": "mismatch_cnt" }, "value": 0 },
         { "attr": { "device": "serial:897bb3a7-77a3-48ed", "kind": "ext4", "class": "errors_count" }, "value": 0 } ] }
     },
     "system.filesystem": {
@@ -127,7 +125,7 @@
     },
     "system.filesystem": {
       "filesystem.usage": { "type": "gauge", "unit": "By", "points": [ { "attr": { "mountpoint": "C:", "state": "used" }, "value": 9500000000 } ] },
-      "filesystem.inodes": { "type": "gauge", "unit": "count", "points": [ { "attr": { "mountpoint": "C:", "state": "used" }, "value": null } ] }
+      "filesystem.inodes.usage": { "type": "gauge", "unit": "count", "points": [ { "attr": { "mountpoint": "C:", "state": "used" }, "value": null } ] }
     },
     "system.network": {
       "network.io":     { "type": "counter", "unit": "By", "points": [ { "attr": { "device": "mac:FA:16:3E:FA:9B:A7", "direction": "receive" }, "value": 12000000 } ] },

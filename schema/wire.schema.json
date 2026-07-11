@@ -41,7 +41,7 @@
         "mountpoint": { "type": ["string", "null"], "$comment": "swap 노드는 [SWAP] 또는 pagefile 경로" },
         "parent": { "type": ["string", "null"], "$comment": "부모의 id(불안정 name/dm-N 아님). root=null. 복수면 노드 반복" },
         "id": { "type": ["string", "null"] },
-        "id_type": { "enum": ["dm", "partuuid", "wwid", "serial", "by-id", "by-path", "fsuuid", "gptid", "mbrsig", "volguid", "mac", "ifguid", "name", null] },
+        "id_type": { "enum": ["dm", "partuuid", "wwid", "serial", "by-id", "by-path", "fsuuid", "gptid", "mbrsig", "volguid", "name", null], "$comment": "디스크 축 안정키 scheme. mac/ifguid 는 네트워크 전용이라 net_interface.id_type 에만 존재(디스크 축 미포함)" },
         "partition_table": { "enum": ["gpt", "mbr", null], "$comment": "재현 확장 키. 자연 노드타입에만 발행(비해당 노드 키 생략). disk 노드. 파티션 테이블 방식" },
         "sector_size": { "type": ["integer", "null"], "$comment": "disk. 논리 섹터 크기(파티션 오프셋 해석 기준)" },
         "serial": { "type": ["string", "null"], "$comment": "disk. 디스크 시리얼(id_type 'serial' scheme 과 별개 필드)" },

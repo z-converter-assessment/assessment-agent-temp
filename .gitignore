@@ -23,6 +23,3 @@ windows-agent/build-forbidden.txt
 
 .env
 .DS_Store
-
-# 작업용 스크래치(협의 중 문서)
-docs/temp/

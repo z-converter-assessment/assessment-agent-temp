@@ -18,7 +18,7 @@ def main() -> int:
     try:
         from jsonschema import Draft202012Validator
     except ImportError:
-        print("jsonschema 미설치: pip install 'jsonschema>=4.18'", file=sys.stderr)
+        print("jsonschema not installed: pip install 'jsonschema>=4.18'", file=sys.stderr)
         return 2
 
     with open(sys.argv[1], encoding="utf-8") as f:
