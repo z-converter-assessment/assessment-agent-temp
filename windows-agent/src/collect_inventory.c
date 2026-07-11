@@ -967,13 +967,9 @@ static cJSON *inv_collect_net_interfaces(void)
 		cJSON_AddStringToObject(o, "id_type", (!strncmp(idfull, "mac:", 4)) ? "mac" : "name");
 		DWORD if_idx = p->IfIndex ? p->IfIndex : p->Ipv6IfIndex;
 		cJSON_AddStringToObject(o, "kind", iface_is_hardware(if_idx) ? win_net_kind(p->IfType) : "virtual");
-		ULONG64 spd_bps = 0;
 		if (agent_is_nt6() && p->TransmitLinkSpeed && p->TransmitLinkSpeed != 0xFFFFFFFFFFFFFFFFULL)
-			spd_bps = p->TransmitLinkSpeed;
-		else
-			legacy_iface_speed(if_idx, &spd_bps);   /* NT5.2 폴백: MIB_IFROW.dwSpeed */
-		if (spd_bps > 0) cJSON_AddNumberToObject(o, "speed_mbps", (double)(spd_bps / 1000000ULL));
-		else             cJSON_AddNullToObject(o, "speed_mbps");
+			cJSON_AddNumberToObject(o, "speed_mbps", (double)(p->TransmitLinkSpeed / 1000000ULL));
+		else cJSON_AddNullToObject(o, "speed_mbps");
 		cJSON *addrs = cJSON_CreateArray();
 		for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress; u; u = u->Next) {
 			if (!u->Address.lpSockaddr) continue;

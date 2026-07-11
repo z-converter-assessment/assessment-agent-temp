@@ -309,30 +309,6 @@ int legacy_ipv4_prefix(DWORD if_index, unsigned addr_be, int *out_prefix)
 	return found;
 }
 
-/* NT5.2 GAA엔 TransmitLinkSpeed가 없어 GetIfTable(NT4+) MIB_IFROW.dwSpeed(bit/s)로 실측. NT6+는 직접 사용. */
-int legacy_iface_speed(DWORD if_index, ULONG64 *out_bps)
-{
-	ULONG sz = 0;
-	if (GetIfTable(NULL, &sz, FALSE) != ERROR_INSUFFICIENT_BUFFER)
-		return 0;
-	MIB_IFTABLE *t = malloc(sz);
-	if (!t)
-		return 0;
-	int found = 0;
-	if (GetIfTable(t, &sz, FALSE) == NO_ERROR) {
-		for (DWORD i = 0; i < t->dwNumEntries; i++) {
-			MIB_IFROW *r = &t->table[i];
-			if (r->dwIndex == if_index && r->dwSpeed > 0) {
-				*out_bps = r->dwSpeed;
-				found = 1;
-				break;
-			}
-		}
-	}
-	free(t);
-	return found;
-}
-
 size_t http_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
 	struct http_sink *s = (struct http_sink *)userdata;
