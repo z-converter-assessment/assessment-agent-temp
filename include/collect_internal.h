@@ -54,6 +54,10 @@ long snmp_tcp_retranssegs(void);
 struct mount_entry *list_real_mounts(size_t *out_count);
 void dedup_mounts(struct mount_entry *arr, size_t *count);
 void disk_device_id(const char *dev, char *out, size_t outsz);
+/* block_device 안정키 resolver(파티션 partuuid / whole-disk disk_device_id). inventory + metrics 공유. */
+const char *dev_id_value(const char *full);
+void part_device_id(const char *part, char *out, size_t outsz);
+void resolve_block_id(const char *name, char *out, size_t outsz);
 void free_mount_entries(struct mount_entry *arr, size_t n);
 void net_device_id(const char *iface, char *out, size_t outsz);
 void wire_add_envelope(cJSON *obj,

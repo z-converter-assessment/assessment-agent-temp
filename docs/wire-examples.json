@@ -62,10 +62,10 @@
     },
     "system.filesystem": {
       "filesystem.usage": { "type": "gauge", "unit": "By", "points": [
-        { "attr": { "mountpoint": "/", "state": "used" }, "value": 8123456789 },
-        { "attr": { "mountpoint": "/", "state": "free" }, "value": 2000000000 },
-        { "attr": { "mountpoint": "/", "state": "reserved" }, "value": 400000000 } ] },
-      "filesystem.inodes": { "type": "gauge", "unit": "count", "points": [
+        { "attr": { "device": "partuuid:5f2a1c90-01", "mountpoint": "/", "type": "ext4", "state": "used" }, "value": 8123456789 },
+        { "attr": { "device": "partuuid:5f2a1c90-01", "mountpoint": "/", "type": "ext4", "state": "free" }, "value": 2000000000 },
+        { "attr": { "device": "partuuid:5f2a1c90-01", "mountpoint": "/", "type": "ext4", "state": "reserved" }, "value": 400000000 } ] },
+      "filesystem.inodes.usage": { "type": "gauge", "unit": "count", "points": [
         { "attr": { "mountpoint": "/", "state": "used" }, "value": 103956 },
         { "attr": { "mountpoint": "/", "state": "free" }, "value": 1186284 } ] }
     },

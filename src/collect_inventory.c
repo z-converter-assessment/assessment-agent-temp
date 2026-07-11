@@ -48,7 +48,6 @@ static cJSON *inv_collect_nonblock_mounts(void);
 static cJSON *inv_collect_services(void);
 static cJSON *inv_collect_services_sysv(void);
 static const char *dev_id_type(const char *full);
-static const char *dev_id_value(const char *full);
 static int add_cpu_cores(cJSON *root);
 static int add_debian_version_fallback(cJSON *root);
 static int add_kernel_version(cJSON *root);
@@ -67,8 +66,6 @@ static cJSON *bd_add(cJSON *arr, const char *name, const char *type, long long s
                    const char *fst, const char *mnt, const char *parent, const char *idfull);
 static void parse_tcp_v4_hex_addr(const char *hex8, char *out, size_t out_len);
 static void parse_tcp_v6_hex_addr(const char *hex32, char *out, size_t out_len);
-static void part_device_id(const char *part, char *out, size_t outsz);
-static void resolve_block_id(const char *name, char *out, size_t outsz);
 static void scan_proto_sockets(const char *path, const char *proto,
                                int is_v6, int is_udp,
                                cJSON *arr,
@@ -941,41 +938,6 @@ static const char *dev_id_type(const char *full)
 	if (!strncmp(full, "by-path:", 8))  return "by-path";
 	if (!strncmp(full, "fsuuid:", 7))   return "fsuuid";
 	return "name";
-}
-
-static const char *dev_id_value(const char *full)
-{
-	const char *c = strchr(full, ':');
-	return c ? c + 1 : full;
-}
-
-/* 파티션 안정키: by-partuuid -> name. */
-static void part_device_id(const char *part, char *out, size_t outsz)
-{
-	DIR *d = opendir("/dev/disk/by-partuuid");
-	if (d) {
-		struct dirent *e; char lp[600], tgt[300];
-		while ((e = readdir(d))) {
-			if (e->d_name[0] == '.') continue;
-			snprintf(lp, sizeof lp, "/dev/disk/by-partuuid/%s", e->d_name);
-			ssize_t r = readlink(lp, tgt, sizeof tgt - 1);
-			if (r <= 0) continue;
-			tgt[r] = '\0';
-			const char *base = strrchr(tgt, '/'); base = base ? base + 1 : tgt;
-			if (strcmp(base, part) == 0) { snprintf(out, outsz, "partuuid:%s", e->d_name); closedir(d); return; }
-		}
-		closedir(d);
-	}
-	snprintf(out, outsz, "name:%s", part);
-}
-
-/* 슬레이브/PV 는 파티션일 수도 whole-disk 일 수도 -> 각각의 안정키로 해석. */
-static void resolve_block_id(const char *name, char *out, size_t outsz)
-{
-	char pth[320];
-	snprintf(pth, sizeof pth, "/sys/class/block/%s/partition", name);
-	if (access(pth, F_OK) == 0) part_device_id(name, out, outsz);
-	else                        disk_device_id(name, out, outsz);
 }
 
 /* /proc/mounts 에서 device basename 의 fstype/mountpoint. /dev/mapper 심볼릭은 realpath 로 dm-N 해석. */

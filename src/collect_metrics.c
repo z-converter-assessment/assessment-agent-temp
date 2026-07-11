@@ -152,7 +152,7 @@ static void metrics_collect_memory(cJSON *root)
 	long commitlim = mi ? meminfo_get_kb(mi, "CommitLimit") : -1;
 	long hwcorrupt = mi ? meminfo_get_kb(mi, "HardwareCorrupted") : -1;
 	struct { const char *st; long kb; } states[] = {
-		{ "free", freek }, { "cached", cached }, { "buffers", buffers }, { "available", avail },
+		{ "free", freek }, { "cached", cached }, { "buffered", buffers }, { "available", avail },
 	};
 	for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
 		cJSON *p = wire_point(usage); wire_point_attr(p, "state", states[i].st);
@@ -273,7 +273,7 @@ static void metrics_collect_filesystem(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.filesystem");
 	cJSON *m_use = wire_metric(ns, "filesystem.usage",  "gauge", "By");
-	cJSON *m_ino = wire_metric(ns, "filesystem.inodes", "gauge", "count");
+	cJSON *m_ino = wire_metric(ns, "filesystem.inodes.usage", "gauge", "count");
 	size_t n = 0;
 	struct mount_entry *mounts = list_real_mounts(&n);
 	for (size_t i = 0; i < n; i++) {
@@ -283,10 +283,32 @@ static void metrics_collect_filesystem(cJSON *root)
 		double total = (double)st.f_blocks * frsize;
 		double freeb = (double)st.f_bfree  * frsize;
 		double availb= (double)st.f_bavail * frsize;
+		/* device: major:minor -> /sys/dev/block 심링크 -> kname -> resolve_block_id(block_devices 조인 id). type: fstype. */
+		char devid[320] = {0};
+		if (mounts[i].major >= 0 && mounts[i].minor >= 0) {
+			char link[64], tgt[300];
+			snprintf(link, sizeof link, "/sys/dev/block/%d:%d", mounts[i].major, mounts[i].minor);
+			ssize_t r = readlink(link, tgt, sizeof tgt - 1);
+			if (r > 0) {
+				tgt[r] = '\0';
+				const char *kn = strrchr(tgt, '/'); kn = kn ? kn + 1 : tgt;
+				char idfull[320]; resolve_block_id(kn, idfull, sizeof idfull);
+				snprintf(devid, sizeof devid, "%s", dev_id_value(idfull));
+			}
+		}
+		const char *fst = mounts[i].fstype;
+		struct { const char *state; double val; } us[3] = {
+			{ "used", total - freeb }, { "free", availb }, { "reserved", freeb - availb },
+		};
 		cJSON *p;
-		p=wire_point(m_use); wire_point_attr(p,"mountpoint",mounts[i].mount); wire_point_attr(p,"state","used");     wire_point_value(p, total - freeb);
-		p=wire_point(m_use); wire_point_attr(p,"mountpoint",mounts[i].mount); wire_point_attr(p,"state","free");     wire_point_value(p, availb);
-		p=wire_point(m_use); wire_point_attr(p,"mountpoint",mounts[i].mount); wire_point_attr(p,"state","reserved"); wire_point_value(p, freeb - availb);
+		for (int k = 0; k < 3; k++) {
+			p = wire_point(m_use);
+			wire_point_attr(p, "mountpoint", mounts[i].mount);
+			if (devid[0])    wire_point_attr(p, "device", devid);
+			if (fst && *fst) wire_point_attr(p, "type", fst);
+			wire_point_attr(p, "state", us[k].state);
+			wire_point_value(p, us[k].val);
+		}
 		p=wire_point(m_ino); wire_point_attr(p,"mountpoint",mounts[i].mount); wire_point_attr(p,"state","used");
 		if (st.f_files > 0) wire_point_value(p, (double)(st.f_files - st.f_ffree)); else wire_point_null(p);
 		p=wire_point(m_ino); wire_point_attr(p,"mountpoint",mounts[i].mount); wire_point_attr(p,"state","free");
@@ -310,7 +332,7 @@ static void metrics_collect_disk_errors(cJSON *root)
 			if (read_sysfs_str(pth, val, sizeof val)) {
 				cJSON *p = wire_point(m_err);
 				char dev[80]; snprintf(dev, sizeof dev, "md:%s", e->d_name);
-				wire_point_attr(p, "device", dev); wire_point_attr(p, "type", "mismatch");
+				wire_point_attr(p, "device", dev); wire_point_attr(p, "kind", "mdraid"); wire_point_attr(p, "class", "mismatch_cnt");
 				wire_point_value(p, (double)strtoll(val, NULL, 10));
 			}
 		}
@@ -324,8 +346,8 @@ static void metrics_collect_disk_errors(cJSON *root)
 			char pth[300]; snprintf(pth, sizeof pth, "/sys/fs/ext4/%s/errors_count", e->d_name);
 			if (read_sysfs_str(pth, val, sizeof val)) {
 				cJSON *p = wire_point(m_err);
-				char dev[80]; snprintf(dev, sizeof dev, "name:%s", e->d_name);
-				wire_point_attr(p, "device", dev); wire_point_attr(p, "type", "fs");
+				char idfull[320]; resolve_block_id(e->d_name, idfull, sizeof idfull);
+				wire_point_attr(p, "device", dev_id_value(idfull)); wire_point_attr(p, "kind", "ext4"); wire_point_attr(p, "class", "errors_count");
 				wire_point_value(p, (double)strtoll(val, NULL, 10));
 			}
 		}

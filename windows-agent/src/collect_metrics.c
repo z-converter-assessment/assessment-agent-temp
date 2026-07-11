@@ -357,7 +357,7 @@ static void metrics_collect_filesystem(cJSON *root)
 {
 	cJSON *ns = wire_ns(root, "system.filesystem");
 	cJSON *m_use = wire_metric(ns, "filesystem.usage",  "gauge", "By");
-	cJSON *m_ino = wire_metric(ns, "filesystem.inodes", "gauge", "count");
+	cJSON *m_ino = wire_metric(ns, "filesystem.inodes.usage", "gauge", "count");
 	wchar_t drives[256];
 	DWORD cap = (DWORD)(sizeof drives / sizeof drives[0]);
 	DWORD len = GetLogicalDriveStringsW(cap, drives);
@@ -368,9 +368,23 @@ static void metrics_collect_filesystem(cJSON *root)
 		size_t ml = strlen(mount); if (ml && mount[ml-1] == '\\') mount[ml-1] = '\0';
 		ULARGE_INTEGER avail, total, tfree;
 		if (!GetDiskFreeSpaceExW(p, &avail, &total, &tfree)) continue;
+		/* device: 볼륨 GUID({...}, block_devices volume 노드 id 와 조인). type: fs 이름(소문자). */
+		char devid[128] = {0};
+		wchar_t volnm[MAX_PATH] = {0};
+		if (GetVolumeNameForVolumeMountPointW(p, volnm, MAX_PATH)) {
+			char vn[160] = {0}; WideCharToMultiByte(CP_UTF8, 0, volnm, -1, vn, sizeof vn, NULL, NULL);
+			char *b = strchr(vn, '{');
+			if (b) { char *e = strchr(b, '}'); if (e) { int gl = (int)(e - b + 1); if (gl < (int)sizeof devid) { memcpy(devid, b, gl); devid[gl] = '\0'; } } }
+		}
+		char fst[16] = {0};
+		wchar_t fsw[16] = {0}, lbl[128] = {0}; DWORD vsn = 0;
+		if (GetVolumeInformationW(p, lbl, 128, &vsn, NULL, NULL, fsw, 16) && fsw[0]) {
+			WideCharToMultiByte(CP_UTF8, 0, fsw, -1, fst, sizeof fst, NULL, NULL);
+			for (char *q = fst; *q; q++) *q = (char)tolower((unsigned char)*q);
+		}
 		cJSON *pt;
-		pt=wire_point(m_use); wire_point_attr(pt,"mountpoint",mount); wire_point_attr(pt,"state","used"); wire_point_value(pt,(double)total.QuadPart - (double)tfree.QuadPart);
-		pt=wire_point(m_use); wire_point_attr(pt,"mountpoint",mount); wire_point_attr(pt,"state","free"); wire_point_value(pt,(double)avail.QuadPart);
+		pt=wire_point(m_use); wire_point_attr(pt,"mountpoint",mount); if(devid[0])wire_point_attr(pt,"device",devid); if(fst[0])wire_point_attr(pt,"type",fst); wire_point_attr(pt,"state","used"); wire_point_value(pt,(double)total.QuadPart - (double)tfree.QuadPart);
+		pt=wire_point(m_use); wire_point_attr(pt,"mountpoint",mount); if(devid[0])wire_point_attr(pt,"device",devid); if(fst[0])wire_point_attr(pt,"type",fst); wire_point_attr(pt,"state","free"); wire_point_value(pt,(double)avail.QuadPart);
 		pt=wire_point(m_ino); wire_point_attr(pt,"mountpoint",mount); wire_point_attr(pt,"state","used"); wire_point_null(pt);
 	}
 }

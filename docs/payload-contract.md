@@ -102,7 +102,7 @@ collection_interval_sec + 아래 네임스페이스. metrics 는 `system.cpu`/`s
 
 | metric | type | unit | attr | Linux | Windows | null |
 |---|---|---|---|---|---|---|
-| memory.usage | gauge | By | state(free/cached/buffers/available) | /proc/meminfo(available 3.14+ 실측) | GlobalMemoryStatusEx + perflib | 미지원 state |
+| memory.usage | gauge | By | state(free/cached/buffered/available) | /proc/meminfo(available 3.14+ 실측) | GlobalMemoryStatusEx + perflib | 미지원 state |
 | memory.limit | gauge | By | - | MemTotal | ullTotalPhys | - |
 | memory.commit.usage/.limit | gauge | By | - | Committed_AS / CommitLimit | perflib Committed Bytes / Commit Limit | - |
 | memory.oom_kill | counter | events | - | /proc/vmstat oom_kill(4.13+) | (null) | 커널<4.13; Windows |
@@ -122,7 +122,7 @@ Windows saturation 은 죽은 IOCTL_DISK_PERFORMANCE 대신 perflib PhysicalDisk
 | disk.io_time | counter | s | device | diskstats io_ticks(ms->s) | perflib % Idle Time raw(busy=uptime-idle) | perflib 인스턴스 부재 |
 | disk.operation_time | counter | s | device, direction | diskstats time_reading/writing(ms->s) | perflib Avg. Disk sec/Read,Write raw(ticks/PerfFreq->s) | 인스턴스 부재 |
 | disk.pending_operations | gauge | operations | device | diskstats in_flight | perflib Current Disk Queue Length | 인스턴스 부재 |
-| disk.errors | counter | errors | device, type(mismatch/fs) | mdraid mismatch_cnt + ext4 errors_count | (개념 부재 -> 빈 metric) | metric 키 항상 발행; 소스 부재 시 빈 points |
+| disk.errors | counter | errors | device, kind, class, (member) | mdraid mismatch_cnt(kind=mdraid class=mismatch_cnt) + ext4 errors_count(kind=ext4 class=errors_count) | (개념 부재 -> 빈 metric) | metric 키 항상 발행; 소스 부재 시 빈 points |
 
 - Windows 전역 집계는 `device="aggregate:system"`, per-disk 는 `device="name:PhysicalDriveN"`.
   둘을 분리해 await(Δoperation_time/Δoperations)가 per-disk 에서 정확히 페어된다.
@@ -154,8 +154,8 @@ Windows saturation 은 죽은 IOCTL_DISK_PERFORMANCE 대신 perflib PhysicalDisk
 
 | metric | type | unit | attr | Linux | Windows |
 |---|---|---|---|---|---|
-| filesystem.usage | gauge | By | mountpoint, state(used/free/reserved) | statvfs | GetDiskFreeSpaceEx |
-| filesystem.inodes | gauge | count | mountpoint, state(used/free) | statvfs f_files/f_ffree | (NTFS inode 개념 부재 -> null) |
+| filesystem.usage | gauge | By | device, mountpoint, type, state(used/free/reserved) | statvfs + major:minor->block_devices 조인 id + fstype | GetDiskFreeSpaceEx + 볼륨 GUID + fs명 |
+| filesystem.inodes.usage | gauge | count | mountpoint, state(used/free) | statvfs f_files/f_ffree | (NTFS inode 개념 부재 -> null) |
 
 ### system.cgroup (컨테이너 배포 시; VM/부재 시 null)
 
