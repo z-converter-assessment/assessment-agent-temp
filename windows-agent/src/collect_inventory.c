@@ -788,10 +788,16 @@ static cJSON *inv_collect_block_devices(void)
 			if (labelw[0]) WideCharToMultiByte(CP_UTF8, 0, labelw, -1, vlabel, sizeof vlabel, NULL, NULL);
 			DWORD spc = 0, bps = 0, fc = 0, tc = 0; long long cluster = -1;
 			if (GetDiskFreeSpaceW(vol, &spc, &bps, &fc, &tc) && spc && bps) cluster = (long long)spc * bps;
-			wchar_t names[256] = {0}; DWORD cnt = 0; char mnt[64] = {0};
+			/* mnt 는 폴더 마운트 경로(드라이브문자 없는 볼륨)까지 담아야 한다 — 64바이트로는
+			   긴 경로가 비종단으로 채워져 OOB read/write 를 낸다. names[256] wide -> 최대 ~1020 UTF-8 바이트. */
+			wchar_t names[256] = {0}; DWORD cnt = 0; char mnt[MAX_PATH * 4] = {0};
 			if (GetVolumePathNamesForVolumeNameW(vol, names, 256, &cnt) && names[0]) {
-				WideCharToMultiByte(CP_UTF8, 0, names, -1, mnt, sizeof mnt, NULL, NULL);
-				size_t l = strlen(mnt); if (l && mnt[l-1] == '\\') mnt[l-1] = '\0';
+				int mn = WideCharToMultiByte(CP_UTF8, 0, names, -1, mnt, sizeof mnt, NULL, NULL);
+				if (mn > 0) {
+					size_t l = strlen(mnt); if (l && mnt[l-1] == '\\') mnt[l-1] = '\0';
+				} else {
+					mnt[0] = '\0';   /* 변환 실패 -> mountpoint null(zero-init 보장) */
+				}
 			}
 			long long vsize = -1; ULARGE_INTEGER a, t, f;
 			if (GetDiskFreeSpaceExW(vol, &a, &t, &f)) vsize = (long long)t.QuadPart;

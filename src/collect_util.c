@@ -202,6 +202,24 @@ void free_mount_entries(struct mount_entry *arr, size_t n)
 	free(arr);
 }
 
+/* /proc/mounts·mountinfo 의 octal 이스케이프(\040 공백, \011 탭, \012 개행, \134 백슬래시)를 원문
+   바이트로 in-place 디코드. 커널 mangle_path 의 역. 미디코드 시 mountpoint 오값 + statvfs ENOENT. */
+void mount_unescape(char *s)
+{
+	if (!s) return;
+	char *w = s;
+	for (const char *r = s; *r; ) {
+		if (r[0] == '\\' && r[1] >= '0' && r[1] <= '7'
+		    && r[2] >= '0' && r[2] <= '7' && r[3] >= '0' && r[3] <= '7') {
+			*w++ = (char)(((r[1] - '0') << 6) | ((r[2] - '0') << 3) | (r[3] - '0'));
+			r += 4;
+		} else {
+			*w++ = *r++;
+		}
+	}
+	*w = '\0';
+}
+
 int parse_mountinfo_line(const char *line,
                                 int *major, int *minor,
                                 char **mount_out, char **fstype_out)
@@ -223,6 +241,7 @@ int parse_mountinfo_line(const char *line,
 		} else if (idx == 5) {
 			mnt = strdup(tok);
 			if (!mnt) goto fail;
+			mount_unescape(mnt);
 		} else if (!seen_dash && idx >= 7
 		           && tok[0] == '-' && tok[1] == '\0') {
 			seen_dash = 1;
@@ -448,6 +467,12 @@ void disk_device_id(const char *dev, char *out, size_t outsz)
 	if (read_sysfs_str(path, val, sizeof val)) { snprintf(out, outsz, "dm:%s", val); return; }
 	snprintf(path, sizeof path, "/sys/block/%s/serial", dev);
 	if (read_sysfs_str(path, val, sizeof val)) { snprintf(out, outsz, "serial:%s", val); return; }
+	/* NVMe 네임스페이스는 /device/serial 이 컨트롤러 공유라 네임스페이스간 안정키 충돌 -> 네임스페이스
+	   고유 wwid(eui./nvme.) 를 우선한다. 비-NVMe 는 기존 device/serial 유지(기존 키 불변). */
+	if (strncmp(dev, "nvme", 4) == 0) {
+		snprintf(path, sizeof path, "/sys/block/%s/wwid", dev);
+		if (read_sysfs_str(path, val, sizeof val)) { snprintf(out, outsz, "wwid:%s", val); return; }
+	}
 	snprintf(path, sizeof path, "/sys/block/%s/device/serial", dev);
 	if (read_sysfs_str(path, val, sizeof val)) { snprintf(out, outsz, "serial:%s", val); return; }
 	DIR *d = opendir("/dev/disk/by-path");

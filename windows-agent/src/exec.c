@@ -106,11 +106,35 @@ static void append_quoted(char *dst, size_t dst_sz, const char *src)
 {
 	size_t cur = strlen(dst);
 	if (cur + 1 >= dst_sz) return;
-	int needs_quote = (strchr(src, ' ') || strchr(src, '\t'));
+	/* 인자 구분 공백 */
 	if (cur > 0 && cur + 1 < dst_sz) dst[cur++] = ' ';
-	if (needs_quote && cur + 1 < dst_sz) dst[cur++] = '"';
-	for (const char *p = src; *p && cur + 1 < dst_sz; p++) dst[cur++] = *p;
-	if (needs_quote && cur + 1 < dst_sz) dst[cur++] = '"';
+	/* 빈 인자거나 space/tab/" 포함이면 인용. 순진한 인용은 트레일링 백슬래시·내장 따옴표·빈 인자에서
+	   자식이 인자를 병합/드롭/변형한다. 표준 Windows argv 인용(백슬래시 run 2배 + \" 이스케이프)으로
+	   CommandLineToArgvW round-trip 을 보장해 Linux execve 의 원형 argv 전달과 맞춘다. */
+	if (*src != '\0' && strpbrk(src, " \t\"") == NULL) {
+		for (const char *p = src; *p && cur + 1 < dst_sz; p++) dst[cur++] = *p;
+		dst[cur] = '\0';
+		return;
+	}
+	if (cur + 1 < dst_sz) dst[cur++] = '"';
+	for (const char *p = src; *p; ) {
+		size_t nbs = 0;
+		while (*p == '\\') { nbs++; p++; }
+		if (*p == '\0') {
+			for (size_t k = 0; k < nbs * 2 && cur + 1 < dst_sz; k++) dst[cur++] = '\\';
+			break;
+		} else if (*p == '"') {
+			for (size_t k = 0; k < nbs * 2 && cur + 1 < dst_sz; k++) dst[cur++] = '\\';
+			if (cur + 1 < dst_sz) dst[cur++] = '\\';
+			if (cur + 1 < dst_sz) dst[cur++] = '"';
+			p++;
+		} else {
+			for (size_t k = 0; k < nbs && cur + 1 < dst_sz; k++) dst[cur++] = '\\';
+			if (cur + 1 < dst_sz) dst[cur++] = *p;
+			p++;
+		}
+	}
+	if (cur + 1 < dst_sz) dst[cur++] = '"';
 	dst[cur] = '\0';
 }
 

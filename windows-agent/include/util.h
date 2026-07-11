@@ -21,6 +21,9 @@ unsigned long long monotonic_ms(void);
 
 char *uuid_v4(char *buf, size_t len);
 
+/* 컴퓨터 이름을 UTF-8 로 반환(wide 읽기 + CP_UTF8). GetComputerNameA 의 ANSI 코드페이지 오염 회피. */
+void get_hostname_utf8(char *out, size_t outsz);
+
 int jitter_seconds(int base_sec, double frac);
 
 char *get_boot_time_iso8601(char *buf, size_t len);

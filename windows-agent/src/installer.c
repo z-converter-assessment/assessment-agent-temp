@@ -461,12 +461,28 @@ static int read_file_all(const wchar_t *path, char **out, size_t *out_len)
     return 0;
 }
 
-static int write_env_file(const wchar_t *path, const kv_arr_t *a, int skip_commented)
+static int write_env_file(const wchar_t *path, const kv_arr_t *a, int skip_commented, int secret)
 {
     wchar_t tmp[MAX_PATH];
     _snwprintf(tmp, MAX_PATH, L"%ls.tmp", path);
-    HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL,
+    /* 비밀파일(agent.env.local): SYSTEM+Administrators 만 허용하는 보호 DACL(상속 차단)로 생성한다.
+       미지정 시 %ProgramData% 기본 DACL(BUILTIN\Users:RX)을 상속해 비특권 유저가 broker/worker 비번을
+       평문 열람한다(Linux 는 0600 root:root). ConvertStringSecurityDescriptor..W 는 XP/2003(advapi32)부터라 NT5.2 안전. */
+    SECURITY_ATTRIBUTES sa;
+    SECURITY_ATTRIBUTES *psa = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (secret &&
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;FA;;;SY)(A;;FA;;;BA)", SDDL_REVISION_1, &sd, NULL)) {
+        sa.nLength = sizeof sa;
+        sa.lpSecurityDescriptor = sd;
+        sa.bInheritHandle = FALSE;
+        psa = &sa;
+        DeleteFileW(tmp);   /* stale tmp 제거 - CREATE_ALWAYS 는 기존 파일에 SA 를 적용하지 않는다 */
+    }
+    HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, psa,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (sd) LocalFree(sd);
     if (f == INVALID_HANDLE_VALUE) return -1;
     for (size_t i = 0; i < a->len; i++) {
         if (skip_commented && a->items[i].commented) continue;
@@ -557,7 +573,7 @@ static int env_setup_run(const char *example, size_t example_len)
             kv_arr_set(&env_state, k, def);
         }
     }
-    if (write_env_file(p_env(), &env_state, 1) != 0) {
+    if (write_env_file(p_env(), &env_state, 1, 0) != 0) {
         fprintf(stderr, "[install] writing %ls failed\n", p_env());
         kv_arr_free(&schema); kv_arr_free(&env_state);
         return -1;
@@ -587,7 +603,7 @@ static int env_setup_run(const char *example, size_t example_len)
         if (read_console_line(input, sizeof input, 0) == 0 && *input)
             kv_arr_set(&local_state, *k, input);
     }
-    if (write_env_file(p_env_local(), &local_state, 0) != 0) {
+    if (write_env_file(p_env_local(), &local_state, 0, 1) != 0) {
         fprintf(stderr, "[install] writing %ls failed\n", p_env_local());
         kv_arr_free(&schema); kv_arr_free(&env_state); kv_arr_free(&local_state);
         return -1;

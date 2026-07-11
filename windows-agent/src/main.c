@@ -141,7 +141,7 @@ static time_t next_inventory_deadline(time_t now, int refresh_sec)
 
 static int publish_with_retry(const publish_config_t *cfg, const char *rk,
                               cJSON *msg, const char *machine_id,
-                              int max_backoff)
+                              int max_backoff, worker_ctx_t *worker)
 {
 	if (!msg) return -1;
 	char *body = cJSON_PrintUnformatted(msg);
@@ -181,7 +181,18 @@ static int publish_with_retry(const publish_config_t *cfg, const char *rk,
 		fprintf(stderr, "[agent] publish failed, retry %d in %us\n",
 		        retry_count, backoff);
 
-		interruptible_sleep((int)backoff, NULL);
+		/* backoff 대기 중 worker 서비스: interruptible_sleep 이 초당 heartbeat 를 흘리고 chunk 마다
+		 * worker_tick 으로 task 도 처리해 metrics 장애가 worker(heartbeat/task)를 굶기지 않게 한다.
+		 * worker 는 별도 exchange/계정이라 metrics 장애와 독립적으로 살아있을 수 있다. */
+		{
+			int rem = (int)backoff;
+			while (rem > 0 && !stop_requested()) {
+				int s = rem > 5 ? 5 : rem;
+				interruptible_sleep(s, worker);
+				rem -= s;
+				if (worker) worker_tick(worker);
+			}
+		}
 		if (stop_requested()) { free(body); return -1; }
 		backoff *= 2;
 	}
@@ -248,7 +259,7 @@ int agent_run(void)
 		fprintf(stderr, "[agent] inventory collect failed; continuing with metrics only\n");
 	} else {
 		int max_backoff = interval > 0 ? interval : 60;
-		if (publish_with_retry(&cfg, rk_inv, inv, machine_id, max_backoff) == 0)
+		if (publish_with_retry(&cfg, rk_inv, inv, machine_id, max_backoff, NULL) == 0)
 			fprintf(stderr, "[agent] published inventory\n");
 	}
 
@@ -294,7 +305,7 @@ int agent_run(void)
 			           "core metrics source unreadable", "collect",
 			           -1, NULL, NULL);
 		} else {
-			publish_with_retry(&cfg, rk_met, m, machine_id, interval);
+			publish_with_retry(&cfg, rk_met, m, machine_id, interval, worker);
 		}
 
 		if (inv_refresh > 0 && time(NULL) >= inv_next) {
@@ -303,7 +314,7 @@ int agent_run(void)
 				emit_error(&cfg, machine_id, "COLLECT_INVENTORY_FAILED",
 				           "core inventory source unreadable", "collect",
 				           -1, NULL, NULL);
-			} else if (publish_with_retry(&cfg, rk_inv, iv, machine_id, interval) == 0) {
+			} else if (publish_with_retry(&cfg, rk_inv, iv, machine_id, interval, worker) == 0) {
 				fprintf(stderr, "[agent] republished inventory (periodic)\n");
 			}
 			inv_next = next_inventory_deadline(time(NULL), inv_refresh);

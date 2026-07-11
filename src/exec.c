@@ -252,7 +252,15 @@ exec_status_t exec_install_script(const char  *extract_dir,
 		if (err_pipe[0] >= 0) { FD_SET(err_pipe[0], &rfds); if (err_pipe[0] > maxfd) maxfd = err_pipe[0]; }
 
 		struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
-		int sr = (maxfd >= 0) ? select(maxfd + 1, &rfds, NULL, NULL, &tv) : 0;
+		int sr;
+		if (maxfd >= 0) {
+			sr = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+		} else {
+			/* 양 파이프 EOF 후 자식 미수확 - select 를 건너뛰면 200ms throttle 이 없어져 busy-spin(100% CPU).
+			   블로킹 select(0)로 200ms cadence 를 유지한다(Windows 는 WaitForSingleObject(200)로 이미 안전). */
+			select(0, NULL, NULL, NULL, &tv);
+			sr = 0;
+		}
 		if (sr < 0 && errno != EINTR) break;
 
 		if (out_pipe[0] >= 0 && (sr < 0 || FD_ISSET(out_pipe[0], &rfds))) {
@@ -288,6 +296,9 @@ exec_status_t exec_install_script(const char  *extract_dir,
 
 			if (WIFEXITED(status)) {
 				out->exit_code = WEXITSTATUS(status);
+				/* timeout 후 SIGTERM 을 trap 해 종료한 경우(exit 0 포함)를 success/script_failed 로 오분류하지
+				   않게 term_sent 를 먼저 존중한다(WIFSIGNALED 분기와 대칭). */
+				if (term_sent)                                        return EXEC_ERR_SCRIPT_TIMEOUT;
 				if (out->exit_code == 0)                              return EXEC_OK;
 				if (out->exit_code == EXEC_CHILD_BOOTSTRAP_FAIL)      return EXEC_ERR_INTERNAL;
 				return EXEC_ERR_SCRIPT_FAILED;

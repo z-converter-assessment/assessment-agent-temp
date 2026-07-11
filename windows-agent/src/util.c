@@ -181,6 +181,23 @@ char *iso8601_utc(time_t t, char *buf, size_t len)
 	return buf;
 }
 
+/* 컴퓨터 이름을 UTF-8 로 반환. GetComputerNameA(시스템 ANSI 코드페이지)는 비영어 로케일(CP949 등)에서
+   invalid UTF-8 을 만들어 엔진이 envelope 를 dead-letter 하므로, wide 로 읽어 CP_UTF8 로 변환한다. 실패 시 unknown. */
+void get_hostname_utf8(char *out, size_t outsz)
+{
+	if (!out || outsz == 0) return;
+	WCHAR wbuf[256];
+	DWORD wn = (DWORD)(sizeof wbuf / sizeof wbuf[0]);
+	if (GetComputerNameW(wbuf, &wn) && wn > 0) {
+		int n = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wn, out, (int)outsz - 1, NULL, NULL);
+		if (n > 0 && (size_t)n < outsz) {
+			out[n] = '\0';
+			return;
+		}
+	}
+	snprintf(out, outsz, "unknown");
+}
+
 char *uuid_v4(char *buf, size_t len)
 {
 	GUID g;
@@ -193,9 +210,8 @@ char *uuid_v4(char *buf, size_t len)
 		return buf;
 	}
 
-	char hostname[64] = "unknown";
-	DWORD sz = (DWORD)sizeof hostname;
-	GetComputerNameA(hostname, &sz);
+	char hostname[64];
+	get_hostname_utf8(hostname, sizeof hostname);
 	SYSTEMTIME st;
 	GetSystemTime(&st);
 	snprintf(buf, len, "%s-%lu-%04d%02d%02dT%02d%02d%02d.%03d",
@@ -218,6 +234,43 @@ int jitter_seconds(int base_sec, double frac)
 
 char *get_boot_time_iso8601(char *buf, size_t len)
 {
+	/* 절대 boot time(NtQuerySystemInformation SystemTimeOfDayInformation.BootTime, 1601 기준 100ns)을
+	   1차로 쓴다 - wrap 면역. NT5.x 32비트 GetTickCount 폴백은 프로세스 시작 전 wrap 을 못 복구해
+	   uptime 을 과소보고(boot_time 이 너무 최근)한다. NtQuery 실패 시에만 now-uptime 로 폴백. */
+	{
+		typedef LONG (WINAPI *NtQSI_t)(ULONG, PVOID, ULONG, PULONG);
+		static NtQSI_t s_ntqsi = NULL;
+		static int s_res = 0;
+		if (!s_res) {
+			s_res = 1;
+			HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+			if (nt) s_ntqsi = (NtQSI_t)(void *)GetProcAddress(nt, "NtQuerySystemInformation");
+		}
+		if (s_ntqsi) {
+			BYTE tod[64];
+			/* SystemTimeOfDayInformation 은 고정크기 클래스라 오버사이즈 length 는
+			   STATUS_INFO_LENGTH_MISMATCH 로 거부되고 ReturnLength 도 안 채워진다.
+			   struct 크기는 세대별로 다르므로(NT4 28B ~ NT6 48B) 후보 length 를
+			   첫 성공까지 시도한다 - length<=struct 면 커널이 그만큼 copy+SUCCESS.
+			   BootTime 은 offset 0(8B)이라 어느 성공 크기든 채워진다. */
+			static const ULONG cand[4] = { 24, 48, 32, 28 };
+			LONG st = -1;
+			int i;
+			for (i = 0; i < 4; i++) {
+				memset(tod, 0, sizeof tod);
+				st = s_ntqsi(3 /*SystemTimeOfDayInformation*/, tod, cand[i], NULL);
+				if (st == 0) break;
+			}
+			if (st == 0) {
+				LARGE_INTEGER *bt = (LARGE_INTEGER *)tod;   /* BootTime 은 첫 필드 */
+				if (bt->QuadPart > 116444736000000000LL) {
+					ULONGLONG u = (ULONGLONG)bt->QuadPart - 116444736000000000ULL;
+					return iso8601_utc((time_t)(u / 10000000ULL), buf, len);
+				}
+			}
+		}
+	}
+
 	ULONGLONG uptime_ms = monotonic_ms();
 
 	FILETIME ft;

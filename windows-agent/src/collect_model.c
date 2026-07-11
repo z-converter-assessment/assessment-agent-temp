@@ -115,9 +115,8 @@ void wire_add_envelope(cJSON *root, const char *msg_type,
 	iso8601_utc(now, now_iso, sizeof now_iso);
 	cJSON_AddStringToObject(root, "collected_at", now_iso);
 
-	char hostname[256] = "unknown";
-	DWORD sz = (DWORD)sizeof hostname;
-	GetComputerNameA(hostname, &sz);
+	char hostname[256];
+	get_hostname_utf8(hostname, sizeof hostname);
 	cJSON_AddStringToObject(root, "hostname", hostname);
 
 	char msg_id[64];

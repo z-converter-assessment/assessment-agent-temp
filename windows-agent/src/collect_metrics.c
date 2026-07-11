@@ -215,6 +215,8 @@ static void metrics_collect_disk(cJSON *root)
 		PERF_COUNTER_DEFINITION *c_q    = perf_counter(o, perf_index("Current Disk Queue Length"));
 		PERF_COUNTER_DEFINITION *c_ro   = perf_counter(o, perf_index("Disk Reads/sec"));
 		PERF_COUNTER_DEFINITION *c_wo   = perf_counter(o, perf_index("Disk Writes/sec"));
+		PERF_COUNTER_DEFINITION *c_rb   = perf_counter(o, perf_index("Disk Read Bytes/sec"));
+		PERF_COUNTER_DEFINITION *c_wb   = perf_counter(o, perf_index("Disk Write Bytes/sec"));
 		PERF_INSTANCE_DEFINITION *inst = (PERF_INSTANCE_DEFINITION *)((BYTE *)o + o->DefinitionLength);
 		for (LONG i = 0; i < o->NumInstances; i++) {
 			wchar_t *wname = (wchar_t *)((BYTE *)inst + inst->NameOffset);
@@ -234,14 +236,25 @@ static void metrics_collect_disk(cJSON *root)
 					/* busy<0 은 시계 skew(uptime<idle) — 측정 불가라 null(가짜 0 금지). */
 					if (busy < 0) wire_point_null(p); else wire_point_value(p, busy);
 				} else wire_point_null(p);
+				/* operation_time(await 분자, saturation): perflib 는 diskperf 의존이라 raw>0 일 때만 값,
+				   아니면 null(가짜 0 금지). io_time 의 idle>0 게이트와 대칭 — raw=0 을 실측 0초로 발행하면
+				   엔진이 await=0(포화 없음)으로 오판한다. */
+				unsigned long long rt_raw = c_rt ? perf_read(cb, c_rt) : 0;
 				p = wire_point(m_opt); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "read");
-				if (c_rt && perf_freq > 0) wire_point_value(p, (double)perf_read(cb, c_rt) / (double)perf_freq); else wire_point_null(p);
+				if (c_rt && perf_freq > 0 && rt_raw > 0) wire_point_value(p, (double)rt_raw / (double)perf_freq); else wire_point_null(p);
+				unsigned long long wt_raw = c_wt ? perf_read(cb, c_wt) : 0;
 				p = wire_point(m_opt); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "write");
-				if (c_wt && perf_freq > 0) wire_point_value(p, (double)perf_read(cb, c_wt) / (double)perf_freq); else wire_point_null(p);
+				if (c_wt && perf_freq > 0 && wt_raw > 0) wire_point_value(p, (double)wt_raw / (double)perf_freq); else wire_point_null(p);
 				p = wire_point(m_ops); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "read");
 				if (c_ro) wire_point_value(p, (double)perf_read(cb, c_ro)); else wire_point_null(p);
 				p = wire_point(m_ops); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "write");
 				if (c_wo) wire_point_value(p, (double)perf_read(cb, c_wo)); else wire_point_null(p);
+				/* disk.io per-disk bytes(계약: aggregate:system NtQuery + perflib per-disk Read/Write Bytes/sec).
+				   disk.operations 형제와 동일 패턴 - Linux per-device disk.io 와 대칭. m_io 는 aggregate:system 점도 함께 갖는다. */
+				p = wire_point(m_io); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "read");
+				if (c_rb) wire_point_value(p, (double)perf_read(cb, c_rb)); else wire_point_null(p);
+				p = wire_point(m_io); wire_point_attr(p, "device", dev); wire_point_attr(p, "direction", "write");
+				if (c_wb) wire_point_value(p, (double)perf_read(cb, c_wb)); else wire_point_null(p);
 				p = wire_point(m_pnd); wire_point_attr(p, "device", dev);
 				if (c_q) wire_point_value(p, (double)perf_read(cb, c_q)); else wire_point_null(p);
 			}
@@ -285,8 +298,9 @@ static void metrics_collect_network(cJSON *root)
 				if (r->Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
 				if (r->OperStatus != IfOperStatusUp) continue;
 				if (r->InterfaceAndOperStatusFlags.FilterInterface) continue;
-				char alias[256] = {0}; WideCharToMultiByte(CP_UTF8,0,r->Alias,-1,alias,sizeof alias,NULL,NULL);
-				char id[80]; mac_to_devid(r->PhysicalAddress, r->PhysicalAddressLength, alias, id, sizeof id);
+				/* MAC-less 폴백 키를 inventory(if<IfIndex>)·NT5.2 metrics 와 통일 — Alias 는 개명 가능·비조인이라 안 쓴다. */
+				char fb[32]; snprintf(fb, sizeof fb, "if%lu", (unsigned long)r->InterfaceIndex);
+				char id[80]; mac_to_devid(r->PhysicalAddress, r->PhysicalAddressLength, fb, id, sizeof id);
 				cJSON *p;
 				wire_point_dev_dir(m_io, id, "receive", (double)r->InOctets);
 				wire_point_dev_dir(m_io, id, "transmit", (double)r->OutOctets);

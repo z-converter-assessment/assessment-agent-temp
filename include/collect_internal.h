@@ -48,6 +48,7 @@ int parse_mountinfo_line(const char *line,
                                 int *major, int *minor,
                                 char **mount_out, char **fstype_out);
 int read_sysfs_str(const char *path, char *out, size_t outsz);
+void mount_unescape(char *s);
 long meminfo_get_kb(const char *content, const char *key);
 long snmp_tcp_retranssegs(void);
 struct mount_entry *list_real_mounts(size_t *out_count);

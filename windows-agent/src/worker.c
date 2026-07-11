@@ -158,6 +158,14 @@ static int rmrf_recursive(const char *path)
 {
 	DWORD attr = GetFileAttributesA(path);
 	if (attr == INVALID_FILE_ATTRIBUTES) return 0;
+	/* reparse point(junction/심볼릭)는 leaf 로 취급 — 타겟으로 내려가지 않고 링크 자체만 제거한다.
+	   junction 은 DIRECTORY+REPARSE 비트를 함께 가지므로 REPARSE 를 먼저 본다(Linux lstat+unlink 대칭,
+	   미검사 시 SYSTEM 권한으로 junction 타겟의 실파일을 재귀 삭제하게 됨). */
+	if (attr & FILE_ATTRIBUTE_REPARSE_POINT) {
+		if (attr & FILE_ATTRIBUTE_DIRECTORY)
+			return RemoveDirectoryA(path) ? 0 : -1;
+		return DeleteFileA(path) ? 0 : -1;
+	}
 	if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
 		return DeleteFileA(path) ? 0 : -1;
 	}
@@ -240,9 +248,8 @@ static char *build_result_json_raw(const char *machine_id, const char *agent_ver
 	cJSON_AddStringToObject(root, "agent_version",    agent_version ? agent_version : AGENT_VERSION);
 	cJSON_AddStringToObject(root, "collected_at",     iso8601_now());
 
-	char hostname[256] = "unknown";
-	DWORD sz = (DWORD)sizeof hostname;
-	GetComputerNameA(hostname, &sz);
+	char hostname[256];
+	get_hostname_utf8(hostname, sizeof hostname);
 	cJSON_AddStringToObject(root, "hostname", hostname);
 
 	char msg_id[64];
@@ -868,6 +875,15 @@ static int publish_result_and_ack(worker_ctx_t *ctx)
 		char dp[1024];
 		snprintf(dp, sizeof dp, "%s\\%s.json", ctx->done_dir, ctx->inflight_task_id);
 		MoveFileExA(rp, dp, MOVEFILE_REPLACE_EXISTING);
+	} else {
+		/* 결과파일 부재로 synth 한 경우: 이동할 result 파일이 없으니 done 마커를 직접 기록한다.
+		   미기록 시 redeliver 된 task 가 done/results/running 증거를 못 찾아 이중 특권 install 된다. */
+		char dp[1024];
+		snprintf(dp, sizeof dp, "%s\\%s.json", ctx->done_dir, ctx->inflight_task_id);
+		char *synth = build_result_json(ctx, ctx->inflight_task_id, "failure",
+		                                "internal_error", 0, 0, 0, "",
+		                                "result file missing\n");
+		if (synth) { write_file_atomic(dp, synth); free(synth); }
 	}
 
 	ctx->inflight_task_id[0] = '\0';

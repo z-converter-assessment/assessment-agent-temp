@@ -991,7 +991,7 @@ static int dev_mount_info(const char *name, char *fst, size_t fsz, char *mnt, si
 		char rp[4100]; const char *base;
 		if (realpath(src, rp)) { base = strrchr(rp, '/'); base = base ? base + 1 : rp; }
 		else                   { base = strrchr(src, '/'); base = base ? base + 1 : src; }
-		if (strcmp(base, name) == 0) { snprintf(fst, fsz, "%s", t); snprintf(mnt, msz, "%s", m); found = 1; break; }
+		if (strcmp(base, name) == 0) { snprintf(fst, fsz, "%s", t); snprintf(mnt, msz, "%s", m); mount_unescape(mnt); found = 1; break; }
 	}
 	fclose(f);
 	return found;
@@ -1436,6 +1436,51 @@ static int lvm_kv_num(const char *buf, const char *key, long long *out)
 	return 1;
 }
 
+/* buf 안 "key = N" 전 occurrence 합산(pe_count/extent_count 등 VG 전체 집계). 토큰 경계(앞 공백/탭/개행) 확인. */
+static long long lvm_kv_sum(const char *buf, const char *key)
+{
+	char pat[64];
+	snprintf(pat, sizeof pat, "%s = ", key);
+	size_t plen = strlen(pat);
+	long long sum = 0;
+	const char *p = buf;
+	while ((p = strstr(p, pat)) != NULL) {
+		int boundary = (p == buf) || p[-1] == '\t' || p[-1] == '\n' || p[-1] == ' ';
+		const char *v = p + plen;
+		p = v;
+		if (boundary) sum += strtoll(v, NULL, 10);
+	}
+	return sum;
+}
+
+/* alloc_pe: 물리 PE 를 소비하는 세그먼트(type=striped/linear)의 extent_count 만 합산한다.
+   thin/raid/cache/mirror/snapshot 의 상위 세그먼트 extent_count 는 가상 크기라 PE 를 소비하지 않고,
+   실제 소비는 hidden sub-LV(_tdata/_tmeta/_rimage/_rmeta/_cdata/_cmeta)의 striped 세그먼트에만 있다.
+   extent_count 를 무조건 합산하면 이중계산으로 alloc_pe 가 부풀어 free 가 음수->0 으로 위조된다.
+   각 세그먼트는 extent_count 1개 + type 1개라, 다음 extent_count 전까지의 type 으로 짝짓는다. */
+static long long lvm_alloc_pe(const char *buf)
+{
+	long long sum = 0;
+	const char *ecpat = "extent_count = ";
+	size_t eclen = strlen(ecpat);
+	const char *p = buf;
+	while ((p = strstr(p, ecpat)) != NULL) {
+		int boundary = (p == buf) || p[-1] == '\t' || p[-1] == '\n' || p[-1] == ' ';
+		const char *v = p + eclen;
+		long long ec = strtoll(v, NULL, 10);
+		p = v;
+		if (!boundary) continue;
+		const char *nextec = strstr(v, ecpat);
+		const char *typ = strstr(v, "type = \"");
+		if (typ && (!nextec || typ < nextec)) {
+			const char *t = typ + 8; /* strlen("type = \"") */
+			if (strncmp(t, "striped\"", 8) == 0 || strncmp(t, "linear\"", 7) == 0)
+				sum += ec;
+		}
+	}
+	return sum;
+}
+
 /* dm 이름 "vg-lv"(리터럴 '-'는 '--') -> vg/lv 분리. */
 static void lvm_split_dmname(const char *s, char *vg, size_t vgsz, char *lv, size_t lvsz)
 {
@@ -1527,13 +1572,54 @@ static cJSON *inv_collect_lvm_vgs(void)
 		int have_ext = lvm_kv_num(buf, "extent_size", &ext);
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddStringToObject(o, "name", e->d_name);
-		cJSON_AddNullToObject(o, "size_bytes");
-		cJSON_AddNullToObject(o, "free_bytes");
+		/* size/free: 같은 backup 파일 재파싱. total_pe=sum(pe_count), alloc_pe=물리 세그먼트 extent_count 합,
+		   size=total_pe*extent_size(섹터)*512, free=(total_pe-alloc_pe)*extent_size*512. 추가 I/O·외부명령 없음. */
+		long long total_pe = lvm_kv_sum(buf, "pe_count");
+		long long alloc_pe = lvm_alloc_pe(buf);
+		if (have_ext && total_pe > 0) {
+			long long freepe = total_pe - alloc_pe;
+			if (freepe < 0) freepe = 0;
+			cJSON_AddNumberToObject(o, "size_bytes", (double)(total_pe * ext * 512));
+			cJSON_AddNumberToObject(o, "free_bytes", (double)(freepe * ext * 512));
+		} else {
+			cJSON_AddNullToObject(o, "size_bytes");
+			cJSON_AddNullToObject(o, "free_bytes");
+		}
+		/* data_percent/metadata_percent: thin pool 런타임 할당 상태라 정적 백업에 없음 -> null(외부명령 금지). */
 		cJSON_AddNullToObject(o, "data_percent");
 		cJSON_AddNullToObject(o, "metadata_percent");
 		if (vgid[0])  cJSON_AddStringToObject(o, "vg_uuid", vgid); else cJSON_AddNullToObject(o, "vg_uuid");
 		if (have_ext) cJSON_AddNumberToObject(o, "extent_size_bytes", (double)(ext * 512)); else cJSON_AddNullToObject(o, "extent_size_bytes");
-		cJSON_AddNullToObject(o, "pv_ids"); /* 1차 null(후속 협의) */
+		/* pv_ids: physical_volumes 의 각 device="/dev/X" 를 basename -> resolve_block_id 로 block_device
+		   안정 id 값(join-ready)으로 발행 -> block_devices[].id 와 조인된다. 없으면 null. */
+		{
+			cJSON *pv_ids = cJSON_CreateArray();
+			const char *pat = "device = \"";
+			size_t patlen = strlen(pat);
+			const char *dp = buf;
+			while ((dp = strstr(dp, pat)) != NULL) {
+				dp += patlen;
+				const char *end = strchr(dp, '"');
+				if (!end) break;
+				char devpath[300];
+				size_t n = (size_t)(end - dp);
+				if (n >= sizeof devpath) n = sizeof devpath - 1;
+				memcpy(devpath, dp, n);
+				devpath[n] = '\0';
+				const char *base = strrchr(devpath, '/');
+				base = base ? base + 1 : devpath;
+				char sid[320];
+				resolve_block_id(base, sid, sizeof sid);
+				cJSON_AddItemToArray(pv_ids, cJSON_CreateString(dev_id_value(sid)));
+				dp = end + 1;
+			}
+			if (cJSON_GetArraySize(pv_ids) > 0) {
+				cJSON_AddItemToObject(o, "pv_ids", pv_ids);
+			} else {
+				cJSON_Delete(pv_ids);
+				cJSON_AddNullToObject(o, "pv_ids");
+			}
+		}
 		cJSON_AddItemToArray(arr, o);
 		free(buf);
 	}

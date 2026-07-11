@@ -441,10 +441,10 @@ void win_disk_id(int i, char *out, size_t outsz)
 		}
 	}
 	STORAGE_PROPERTY_QUERY q; memset(&q, 0, sizeof q); q.PropertyId = StorageDeviceProperty; q.QueryType = PropertyStandardQuery;
-	BYTE sbuf[2048];
+	BYTE sbuf[2048] = {0};   /* 제로초기화 + offset<ret 로 OOB/미기록영역 read 방지(win_read_disk_meta 미러) */
 	if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, sbuf, sizeof sbuf, &ret, NULL)) {
 		STORAGE_DEVICE_DESCRIPTOR *sd = (STORAGE_DEVICE_DESCRIPTOR *)sbuf;
-		if (sd->SerialNumberOffset && sd->SerialNumberOffset < sizeof sbuf) {
+		if (sd->SerialNumberOffset && sd->SerialNumberOffset < ret) {
 			char *ser = (char *)sbuf + sd->SerialNumberOffset;
 			while (*ser == ' ') ser++;
 			char trimmed[128]; snprintf(trimmed, sizeof trimmed, "%s", ser);
