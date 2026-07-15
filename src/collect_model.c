@@ -192,6 +192,27 @@ cJSON *wire_or_null(cJSON *v)
 	return v ? v : cJSON_CreateNull();
 }
 
+/* 조건부 스칼라 발행: 값 있으면 발행, 없으면 null(키는 유지). null=측정불가 계약.
+ * 빈 문자열은 부재로 본다(측정 성공한 empty 발행 케이스는 이 파일에 없다). */
+void wire_str_or_null(cJSON *o, const char *key, const char *v)
+{
+	if (v && *v) cJSON_AddStringToObject(o, key, v);
+	else         cJSON_AddNullToObject(o, key);
+}
+
+/* number/bool 은 0 도 실측이라 값에서 부재를 추론하지 않고 have 로만 판정한다. */
+void wire_num_or_null(cJSON *o, const char *key, int have, double v)
+{
+	if (have) cJSON_AddNumberToObject(o, key, v);
+	else      cJSON_AddNullToObject(o, key);
+}
+
+void wire_bool_or_null(cJSON *o, const char *key, int have, int v)
+{
+	if (have) cJSON_AddBoolToObject(o, key, v ? 1 : 0);
+	else      cJSON_AddNullToObject(o, key);
+}
+
 int is_machine_id(const char *s)
 {
 	size_t n = 0;

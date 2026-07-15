@@ -39,8 +39,9 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 | include/collect_internal.h | collect_*.c 공용 내부 선언(model+util) + 공유 struct/매크로 | 공개 API 는 collect.h |
 
 - 계층 규칙: metrics 와 inventory 는 서로 호출하지 않는다. 둘 다 model+util 만 의존(단방향). 두 곳에서 쓰는 헬퍼는 util(공유 파싱)이나 model 로 올린다. 공개 API 만 collect.h, 파일간 공유 내부 심볼은 non-static + collect_internal.h 선언.
-- 네이밍 스킴(양 트리 통일): wire 프리미티브 `wire_*`(wire_ns/wire_metric/wire_point/wire_point_attr/wire_point_value/wire_point_null/wire_metric_scalar/wire_add_envelope), metrics 수집기 `metrics_collect_*`, inventory 수집기 `inv_collect_*`. 파싱 헬퍼는 서술적 이름 유지(disk_device_id 등).
+- 네이밍 스킴(양 트리 통일): wire 프리미티브 `wire_*`(wire_ns/wire_metric/wire_point/wire_point_attr/wire_point_value/wire_point_null/wire_metric_scalar/wire_add_envelope, 조건부 발행 wire_str_or_null/wire_num_or_null/wire_bool_or_null/wire_or_null/wire_or_empty_array), metrics 수집기 `metrics_collect_*`, inventory 수집기 `inv_collect_*`. 파싱 헬퍼는 서술적 이름 유지(disk_device_id 등).
 - datapoint 발행: device(+direction)+value 패턴은 `wire_point_dev_dir(metric, device, direction, value)` 한 줄로. 단일값은 `wire_metric_scalar(ns, name, type, unit, have, value)`. 조건부 null 등 헬퍼에 안 맞는 경우만 wire_point + wire_point_attr + wire_point_value/wire_point_null 를 쓴다.
+- inventory 서술자 스칼라 발행: 값 있으면 실측, 없으면 null 인 필드는 `wire_str_or_null(o, key, v)`(빈 문자열=부재), `wire_num_or_null(o, key, have, v)`, `wire_bool_or_null(o, key, have, v)`로 발행한다(number/bool 은 0 도 실측이라 값에서 추론하지 않고 have 로 판정). 배열/객체 자식은 `wire_or_null(ptr)`. 단 "값 있으면 발행, 없으면 키 생략"(예: fs_uuid/fs_label)은 이 헬퍼로 바꾸지 않는다 — null 발행과 키 생략은 다른 계약이다.
 - 어휘 정본: 신규 `system.*` metric 이름이나 attr 키를 발행하면 `schema/metric-vocab.json` 도 같이 갱신한다(양 트리 합집합). CI `check-vocab.py` 가 emit 어휘를 이 정본의 부분집합으로 강제하므로, 정본 미갱신 시 릴리즈가 막힌다. 이름 변경(리네이밍)은 소비자 키와의 계약이라 엔진과 합의 후 정본·양 트리 동시 반영.
 - 코드 스타일: 한 줄에 한 문장(세미콜론으로 여러 문장 뭉치지 않는다). 3회 이상 반복되는 발행 패턴은 헬퍼로 추출. collect 계층 주석은 한국어(다이어그램 제외).
 - 2트리 대칭: 파일 레이아웃/네이밍/필드셋을 Linux(`src/`)와 Windows(`windows-agent/src/`) 동일하게 유지. 한쪽에 신호를 추가하면 다른 쪽도 실측 발행하거나 측정불가 null 로 필드셋을 맞춘다(예: memory.edac 는 Windows 도 null 2점 발행).

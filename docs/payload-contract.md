@@ -80,6 +80,8 @@ CI 가 git 태그에서 주입한다(`v1.0.0` -> `1.0.0`). 로컬/dev 빌드는 
 - OS 재현 서술자(flat 최상위): arch(uname machine / wProcessorArchitecture), bits(32|64, arch 파생),
   boot_firmware(uefi|bios|null; Linux /sys/firmware/efi, Windows GetFirmwareType/env 폴백),
   secure_boot(bool|null; Linux efivars, Windows SecureBoot\State), edition(Windows EditionID, Linux null),
+  product_name(Windows CurrentVersion ProductName 원문 — 에이전트 교정 없음, Win11 을 "Windows 10 Pro" 로
+  오보하는 등 OS 자체가 부정확할 수 있어 엔진이 kernel_version(빌드번호)과 대조해 해석. Linux null),
   timezone(Linux IANA / Windows tz 키명 원문, 엔진이 IANA 매핑), rtc_utc(bool|null; Linux /etc/adjtime, Windows RealTimeIsUniversal).
 - boot(object|null): kernel_cmdline, root_ref_type(uuid|label|partuuid|path), grub_install_target. Linux /proc/cmdline,
   Windows null(GRUB/cmdline 개념 부재).

@@ -93,6 +93,38 @@ void wire_metric_scalar(cJSON *ns, const char *name, const char *type,
 	if (have) wire_point_value(p, v); else wire_point_null(p);
 }
 
+cJSON *wire_or_empty_array(cJSON *arr)
+{
+	return arr ? arr : cJSON_CreateArray();
+}
+
+/* 측정불가 필드(services 등)를 키 드롭 대신 null 로 유지한다. cJSON 은 NULL item add 를 무시한다. */
+cJSON *wire_or_null(cJSON *v)
+{
+	return v ? v : cJSON_CreateNull();
+}
+
+/* 조건부 스칼라 발행: 값 있으면 발행, 없으면 null(키는 유지). null=측정불가 계약.
+ * 빈 문자열은 부재로 본다(측정 성공한 empty 발행 케이스는 이 파일에 없다). */
+void wire_str_or_null(cJSON *o, const char *key, const char *v)
+{
+	if (v && *v) cJSON_AddStringToObject(o, key, v);
+	else         cJSON_AddNullToObject(o, key);
+}
+
+/* number/bool 은 0 도 실측이라 값에서 부재를 추론하지 않고 have 로만 판정한다. */
+void wire_num_or_null(cJSON *o, const char *key, int have, double v)
+{
+	if (have) cJSON_AddNumberToObject(o, key, v);
+	else      cJSON_AddNullToObject(o, key);
+}
+
+void wire_bool_or_null(cJSON *o, const char *key, int have, int v)
+{
+	if (have) cJSON_AddBoolToObject(o, key, v ? 1 : 0);
+	else      cJSON_AddNullToObject(o, key);
+}
+
 void wire_add_envelope(cJSON *root, const char *msg_type,
                                 const char *machine_id, const char *agent_version)
 {

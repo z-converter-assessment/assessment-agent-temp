@@ -25,7 +25,12 @@ PERF_COUNTER_DEFINITION *perf_counter(PERF_OBJECT_TYPE *o, DWORD idx);
 PERF_OBJECT_TYPE *perf_object(PERF_DATA_BLOCK *db, DWORD idx);
 cJSON *wire_metric(cJSON *ns, const char *name, const char *type, const char *unit);
 cJSON *wire_ns(cJSON *root, const char *ns);
+cJSON *wire_or_empty_array(cJSON *arr);
+cJSON *wire_or_null(cJSON *v);
 cJSON *wire_point(cJSON *metric);
+void wire_str_or_null(cJSON *o, const char *key, const char *v);
+void wire_num_or_null(cJSON *o, const char *key, int have, double v);
+void wire_bool_or_null(cJSON *o, const char *key, int have, int v);
 char *fetch_imds_chain(const char *aws_metadata_url,
                               const char *azure_url, const char *gcp_url);
 char *http_get_short(const char *url, const char *header, int put_request);

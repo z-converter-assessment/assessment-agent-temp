@@ -24,6 +24,9 @@ cJSON *wire_metric(cJSON *ns, const char *name, const char *type, const char *un
 cJSON *wire_ns(cJSON *root, const char *ns);
 cJSON *wire_or_empty_array(cJSON *arr);
 cJSON *wire_or_null(cJSON *v);
+void wire_str_or_null(cJSON *o, const char *key, const char *v);
+void wire_num_or_null(cJSON *o, const char *key, int have, double v);
+void wire_bool_or_null(cJSON *o, const char *key, int have, int v);
 cJSON *wire_point(cJSON *metric);
 char *fetch_cloud_metadata(const char *aws_path, const char *azure_path,
                                   const char *gcp_path);

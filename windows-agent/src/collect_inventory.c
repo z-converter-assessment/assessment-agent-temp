@@ -188,12 +188,10 @@ static cJSON *inv_collect_services(void)
 			cJSON_AddStringToObject(o, "unit", name);
 			cJSON_AddStringToObject(o, "sub",  "running");
 			DWORD spid = es[i].ServiceStatusProcess.dwProcessId;
-			if (spid) cJSON_AddNumberToObject(o, "pid", (double)spid);
-			else      cJSON_AddNullToObject  (o, "pid");
+			wire_num_or_null(o, "pid", spid != 0, (double)spid);
 			char exe[256];
 			fill_comm_for_pid(spid, exe, sizeof exe);
-			if (exe[0]) cJSON_AddStringToObject(o, "exe", exe);
-			else        cJSON_AddNullToObject  (o, "exe");
+			wire_str_or_null(o, "exe", exe);
 			cJSON_AddItemToArray(arr, o);
 		}
 	}
@@ -267,12 +265,10 @@ static void add_listen_entry(cJSON *arr, const char *proto, const char *addr,
 	cJSON_AddNumberToObject(o, "port",  port);
 	cJSON_AddNullToObject  (o, "uid");
 	/* pid 0은 System Idle이라 소켓 소유자일 수 없다 -> 소유자 미상 null(추측 금지). */
-	if (pid) cJSON_AddNumberToObject(o, "pid", (double)pid);
-	else     cJSON_AddNullToObject  (o, "pid");
+	wire_num_or_null(o, "pid", pid != 0, (double)pid);
 	char comm[256];
 	fill_comm_for_pid(pid, comm, sizeof comm);
-	if (comm[0]) cJSON_AddStringToObject(o, "comm", comm);
-	else         cJSON_AddNullToObject  (o, "comm");
+	wire_str_or_null(o, "comm", comm);
 	cJSON_AddItemToArray(arr, o);
 }
 
@@ -410,6 +406,22 @@ static int reg_read_dword(HKEY root, const char *path, const char *val, DWORD *o
 	return (rc == ERROR_SUCCESS && type == REG_DWORD) ? 1 : 0;
 }
 
+/* HKLM REG_SZ 를 읽어 있으면 string, 없으면 null 발행. os_repro 서술자 공통 패턴. */
+static void reg_emit_sz(cJSON *o, const char *key, const char *path, const char *val)
+{
+	char buf[256] = {0};
+	reg_read_sz(HKEY_LOCAL_MACHINE, path, val, buf, sizeof buf);
+	wire_str_or_null(o, key, buf);
+}
+
+/* HKLM REG_DWORD 를 읽어 있으면 bool, 없으면 null 발행. */
+static void reg_emit_dword_bool(cJSON *o, const char *key, const char *path, const char *val)
+{
+	DWORD v = 0;
+	int have = reg_read_dword(HKEY_LOCAL_MACHINE, path, val, &v);
+	wire_bool_or_null(o, key, have, v ? 1 : 0);
+}
+
 /* boot_firmware: GetFirmwareType(NT6.2+) 1차, GetFirmwareEnvironmentVariableA 트릭(XP+) 폴백 */
 static void os_add_boot_firmware(cJSON *m)
 {
@@ -460,43 +472,27 @@ static void inv_collect_os_repro(cJSON *m)
 	}
 	os_add_boot_firmware(m);
 	/* secure_boot: SecureBoot\State UEFISecureBootEnabled DWORD. 부재=null */
-	{
-		DWORD v = 0;
-		if (reg_read_dword(HKEY_LOCAL_MACHINE,
-		    "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", "UEFISecureBootEnabled", &v))
-			cJSON_AddBoolToObject(m, "secure_boot", v ? 1 : 0);
-		else
-			cJSON_AddNullToObject(m, "secure_boot");
-	}
+	reg_emit_dword_bool(m, "secure_boot",
+	    "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", "UEFISecureBootEnabled");
 	/* edition: CurrentVersion EditionID(SKU 코드). 부재=null */
-	{
-		char ed[64] = {0};
-		if (reg_read_sz(HKEY_LOCAL_MACHINE,
-		    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "EditionID", ed, sizeof ed))
-			cJSON_AddStringToObject(m, "edition", ed);
-		else
-			cJSON_AddNullToObject(m, "edition");
-	}
+	reg_emit_sz(m, "edition",
+	    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "EditionID");
+	/* product_name: CurrentVersion ProductName 원문 그대로. 교정 없음(Win11 을 "Windows 10 Pro" 로
+	 * 오보하는 등 OS 자체 부정확 가능 — 매핑/추론은 엔진 몫, 에이전트는 실측 원문만 싣는다). 부재=null */
+	reg_emit_sz(m, "product_name",
+	    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductName");
 	/* timezone: TimeZoneKeyName(Vista+) 1차, StandardName(XP/2003) 폴백. 원문(엔진이 CLDR 매핑) */
 	{
 		char tz[128] = {0};
-		if (reg_read_sz(HKEY_LOCAL_MACHINE,
+		reg_read_sz(HKEY_LOCAL_MACHINE,
 		        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "TimeZoneKeyName", tz, sizeof tz)
 		    || reg_read_sz(HKEY_LOCAL_MACHINE,
-		        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "StandardName", tz, sizeof tz))
-			cJSON_AddStringToObject(m, "timezone", tz);
-		else
-			cJSON_AddNullToObject(m, "timezone");
+		        "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "StandardName", tz, sizeof tz);
+		wire_str_or_null(m, "timezone", tz);
 	}
 	/* rtc_utc: RealTimeIsUniversal DWORD. 부재=null(위조 금지 — 기본 local 을 false 로 위조하지 않음) */
-	{
-		DWORD v = 0;
-		if (reg_read_dword(HKEY_LOCAL_MACHINE,
-		    "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "RealTimeIsUniversal", &v))
-			cJSON_AddBoolToObject(m, "rtc_utc", v ? 1 : 0);
-		else
-			cJSON_AddNullToObject(m, "rtc_utc");
-	}
+	reg_emit_dword_bool(m, "rtc_utc",
+	    "SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation", "RealTimeIsUniversal");
 }
 
 cJSON *collect_inventory_payload(const char *machine_id, const char *agent_version)
@@ -509,11 +505,9 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 
 	char display[64] = {0}, build[64] = {0};
 	os_version_info(display, sizeof display, build, sizeof build);
-	if (display[0]) cJSON_AddStringToObject(m, "os_version", display);
-	else            cJSON_AddNullToObject  (m, "os_version");
-	cJSON_AddNullToObject  (m, "os_codename");
-	if (build[0]) cJSON_AddStringToObject(m, "kernel_version", build);
-	else          cJSON_AddNullToObject  (m, "kernel_version");
+	wire_str_or_null(m, "os_version", display);
+	cJSON_AddNullToObject(m, "os_codename");
+	wire_str_or_null(m, "kernel_version", build);
 
 	inv_collect_os_repro(m);
 
@@ -552,9 +546,9 @@ static cJSON *bd_add(cJSON *arr, const char *name, const char *type, long long s
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "name", name);
 	cJSON_AddStringToObject(o, "type", type);
-	if (size >= 0) cJSON_AddNumberToObject(o, "size_bytes", (double)size); else cJSON_AddNullToObject(o, "size_bytes");
-	if (fst && *fst) cJSON_AddStringToObject(o, "fstype", fst); else cJSON_AddNullToObject(o, "fstype");
-	if (mnt && *mnt) cJSON_AddStringToObject(o, "mountpoint", mnt); else cJSON_AddNullToObject(o, "mountpoint");
+	wire_num_or_null(o, "size_bytes", size >= 0, (double)size);
+	wire_str_or_null(o, "fstype", fst);
+	wire_str_or_null(o, "mountpoint", mnt);
 	if (parent) cJSON_AddStringToObject(o, "parent", parent); else cJSON_AddNullToObject(o, "parent");
 	cJSON_AddStringToObject(o, "id", win_id_value(idfull));
 	cJSON_AddStringToObject(o, "id_type", win_id_type(idfull));
@@ -682,14 +676,10 @@ static void win_read_disk_meta(HANDLE h, struct wdmeta *m)
 
 static void win_attach_disk_meta(cJSON *node, const struct wdmeta *m)
 {
-	if (m->have_sector) cJSON_AddNumberToObject(node, "sector_size", (double)m->sector);
-	else                cJSON_AddNullToObject(node, "sector_size");
-	if (m->serial[0]) cJSON_AddStringToObject(node, "serial", m->serial);
-	else              cJSON_AddNullToObject(node, "serial");
-	if (m->wwn[0]) cJSON_AddStringToObject(node, "wwn", m->wwn); /* VPD 0x83 있으면 실측 */
-	else           cJSON_AddNullToObject(node, "wwn");           /* 장치 미제공(virtio 등) -> null */
-	if (m->rot < 0) cJSON_AddNullToObject(node, "rotational");
-	else            cJSON_AddBoolToObject(node, "rotational", m->rot ? 1 : 0);
+	wire_num_or_null(node, "sector_size", m->have_sector, (double)m->sector);
+	wire_str_or_null(node, "serial", m->serial);
+	wire_str_or_null(node, "wwn", m->wwn);      /* VPD 0x83 있으면 실측, 장치 미제공(virtio 등) -> null */
+	wire_bool_or_null(node, "rotational", m->rot >= 0, m->rot ? 1 : 0);
 }
 
 /* disk 노드에 partition_table 부착 + part 노드 발행. layout NULL 이면 partition_table=null. */
@@ -731,8 +721,7 @@ static void win_emit_layout(cJSON *arr, cJSON *dn, const BYTE *layout,
 			cJSON_AddStringToObject(pn, "part_type", tguid);
 			char nm[160]; /* GPT Name 36 WCHAR * 3(UTF-8 BMP) + NUL 여유 */
 			win_gpt_name(pe->Gpt.Name, nm, sizeof nm);
-			if (nm[0]) cJSON_AddStringToObject(pn, "part_name", nm);
-			else       cJSON_AddNullToObject(pn, "part_name");
+			wire_str_or_null(pn, "part_name", nm);
 			cJSON *fl = cJSON_CreateArray();
 			const char *tf = gpt_type_flag(tguid);
 			if (tf) cJSON_AddItemToArray(fl, cJSON_CreateString(tf));
@@ -967,9 +956,9 @@ static cJSON *inv_collect_net_interfaces(void)
 		cJSON_AddStringToObject(o, "id_type", (!strncmp(idfull, "mac:", 4)) ? "mac" : "name");
 		DWORD if_idx = p->IfIndex ? p->IfIndex : p->Ipv6IfIndex;
 		cJSON_AddStringToObject(o, "kind", iface_is_hardware(if_idx) ? win_net_kind(p->IfType) : "virtual");
-		if (agent_is_nt6() && p->TransmitLinkSpeed && p->TransmitLinkSpeed != 0xFFFFFFFFFFFFFFFFULL)
-			cJSON_AddNumberToObject(o, "speed_mbps", (double)(p->TransmitLinkSpeed / 1000000ULL));
-		else cJSON_AddNullToObject(o, "speed_mbps");
+		wire_num_or_null(o, "speed_mbps",
+		    agent_is_nt6() && p->TransmitLinkSpeed && p->TransmitLinkSpeed != 0xFFFFFFFFFFFFFFFFULL,
+		    (double)(p->TransmitLinkSpeed / 1000000ULL));
 		cJSON *addrs = cJSON_CreateArray();
 		for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress; u; u = u->Next) {
 			if (!u->Address.lpSockaddr) continue;
@@ -982,7 +971,7 @@ static cJSON *inv_collect_net_interfaces(void)
 			else if (fam == AF_INET) { unsigned ab = ((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.S_un.S_addr; int pfx; if (legacy_ipv4_prefix(p->IfIndex, ab, &pfx)) prefix = pfx; }
 			cJSON *ad = cJSON_CreateObject();
 			cJSON_AddStringToObject(ad, "address", ip);
-			if (prefix >= 0) cJSON_AddNumberToObject(ad, "prefix", (double)prefix); else cJSON_AddNullToObject(ad, "prefix");
+			wire_num_or_null(ad, "prefix", prefix >= 0, (double)prefix);
 			cJSON_AddStringToObject(ad, "family", family);
 			/* origin: PrefixOrigin(Vista+). Manual=static, Dhcp=dhcp. NT5.2/기타=null */
 			if (agent_is_nt6()) {
@@ -1005,10 +994,9 @@ static cJSON *inv_collect_net_interfaces(void)
 		} else {
 			char gb[INET_ADDRSTRLEN]; if (legacy_ipv4_gateway(p->IfIndex, gb, sizeof gb)) gw = cJSON_CreateString(gb);
 		}
-		cJSON_AddItemToObject(o, "gateway", gw ? gw : cJSON_CreateNull());
+		cJSON_AddItemToObject(o, "gateway", wire_or_null(gw));
 		/* mtu */
-		if (p->Mtu && p->Mtu != 0xFFFFFFFFUL) cJSON_AddNumberToObject(o, "mtu", (double)p->Mtu);
-		else                                  cJSON_AddNullToObject(o, "mtu");
+		wire_num_or_null(o, "mtu", p->Mtu && p->Mtu != 0xFFFFFFFFUL, (double)p->Mtu);
 		/* dns: per-adapter DNS 서버(FirstDnsServerAddress, XP+) */
 		cJSON *dnsarr = NULL;
 		for (IP_ADAPTER_DNS_SERVER_ADDRESS *ds = p->FirstDnsServerAddress; ds; ds = ds->Next) {
@@ -1022,10 +1010,10 @@ static cJSON *inv_collect_net_interfaces(void)
 			if (!dnsarr) dnsarr = cJSON_CreateArray();
 			cJSON_AddItemToArray(dnsarr, cJSON_CreateString(db));
 		}
-		cJSON_AddItemToObject(o, "dns", dnsarr ? dnsarr : cJSON_CreateNull());
+		cJSON_AddItemToObject(o, "dns", wire_or_null(dnsarr));
 		/* routes: 정적 비-default(IPv4) */
 		cJSON *rts = win_iface_routes(ipf, p->IfIndex ? p->IfIndex : p->Ipv6IfIndex);
-		cJSON_AddItemToObject(o, "routes", rts ? rts : cJSON_CreateNull());
+		cJSON_AddItemToObject(o, "routes", wire_or_null(rts));
 		/* bond_mode/vlan_id: Windows 팀ing/VLAN 은 별도 스택 -> null(위조 금지) */
 		cJSON_AddNullToObject(o, "bond_mode");
 		cJSON_AddNullToObject(o, "vlan_id");

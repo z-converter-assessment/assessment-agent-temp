@@ -748,10 +748,8 @@ static void scan_proto_sockets(const char *path, const char *proto,
 		cJSON_AddStringToObject(item, "addr", addr_buf);
 		cJSON_AddNumberToObject(item, "port", (double)port);
 		cJSON_AddNumberToObject(item, "uid",  (double)uid);
-		if (pid > 0) cJSON_AddNumberToObject(item, "pid", (double)pid);
-		else         cJSON_AddNullToObject(item, "pid");
-		if (comm && *comm) cJSON_AddStringToObject(item, "comm", comm);
-		else               cJSON_AddNullToObject(item, "comm");
+		wire_num_or_null(item, "pid", pid > 0, (double)pid);
+		wire_str_or_null(item, "comm", comm);
 		cJSON_AddItemToArray(arr, item);
 	}
 	free(content);
@@ -881,6 +879,7 @@ static void inv_collect_os_repro(cJSON *root)
 		cJSON_AddNullToObject(root, "boot_firmware");
 	os_add_secure_boot(root);
 	cJSON_AddNullToObject(root, "edition"); /* Linux 없음 */
+	cJSON_AddNullToObject(root, "product_name"); /* Linux 없음(Windows ProductName 대응) */
 	os_add_timezone(root);
 	os_add_rtc_utc(root);
 }
@@ -904,8 +903,7 @@ cJSON *collect_inventory_payload(const char *machine_id, const char *agent_versi
 		char *mi = read_file_all("/proc/meminfo");
 		long kb = mi ? meminfo_get_kb(mi, "MemTotal") : -1;
 		free(mi);
-		if (kb >= 0) cJSON_AddNumberToObject(root, "mem_total_bytes", (double)kb * 1024.0);
-		else         cJSON_AddNullToObject(root, "mem_total_bytes");
+		wire_num_or_null(root, "mem_total_bytes", kb >= 0, (double)kb * 1024.0);
 	}
 
 	cJSON_AddItemToObject(root, "services",     wire_or_null(inv_collect_services()));
@@ -1337,8 +1335,7 @@ static void attach_disk_meta(cJSON *node, const char *dev)
 		snprintf(p, sizeof p, "/sys/block/%s/device/serial", dev);
 		read_sysfs_str(p, ser, sizeof ser);
 	}
-	if (ser[0]) cJSON_AddStringToObject(node, "serial", ser);
-	else        cJSON_AddNullToObject(node, "serial");
+	wire_str_or_null(node, "serial", ser);
 	char wwn[160];
 	if (disk_wwn(dev, wwn, sizeof wwn)) cJSON_AddStringToObject(node, "wwn", wwn);
 	else                                cJSON_AddNullToObject(node, "wwn");
@@ -1474,8 +1471,8 @@ static void attach_lvm_meta(cJSON *node, const char *dev)
 	char vg[160] = {0}, lv[160] = {0};
 	if (read_sysfs_str(p, dmname, sizeof dmname) && dmname[0])
 		lvm_split_dmname(dmname, vg, sizeof vg, lv, sizeof lv);
-	if (vg[0]) cJSON_AddStringToObject(node, "lvm_vg", vg); else cJSON_AddNullToObject(node, "lvm_vg");
-	if (lv[0]) cJSON_AddStringToObject(node, "lvm_lv", lv); else cJSON_AddNullToObject(node, "lvm_lv");
+	wire_str_or_null(node, "lvm_vg", vg);
+	wire_str_or_null(node, "lvm_lv", lv);
 	char segtype[40] = {0};
 	int stripes = -1, stripe_kib = -1;
 	if (vg[0] && lv[0]) {
@@ -1506,9 +1503,9 @@ static void attach_lvm_meta(cJSON *node, const char *dev)
 			free(buf);
 		}
 	}
-	if (segtype[0])    cJSON_AddStringToObject(node, "lvm_segtype", segtype); else cJSON_AddNullToObject(node, "lvm_segtype");
-	if (stripes >= 0)  cJSON_AddNumberToObject(node, "lvm_stripes", stripes); else cJSON_AddNullToObject(node, "lvm_stripes");
-	if (stripe_kib >= 0) cJSON_AddNumberToObject(node, "lvm_stripe_size_kib", stripe_kib); else cJSON_AddNullToObject(node, "lvm_stripe_size_kib");
+	wire_str_or_null(node, "lvm_segtype", segtype);
+	wire_num_or_null(node, "lvm_stripes", stripes >= 0, (double)stripes);
+	wire_num_or_null(node, "lvm_stripe_size_kib", stripe_kib >= 0, (double)stripe_kib);
 }
 
 static void attach_dm_type_meta(cJSON *node, const char *dev, const char *type, const char *dmuuid)
@@ -1672,8 +1669,8 @@ static cJSON *inv_collect_lvm_vgs(void)
 		}
 		/* data_percent/metadata_percent: 씬풀 충전율. DM_TABLE_STATUS(ioctl, 외부명령 없이)로 뽑는다. */
 		lvm_emit_thinpool_fill(o, fills, n_fills, e->d_name);
-		if (vgid[0])  cJSON_AddStringToObject(o, "vg_uuid", vgid); else cJSON_AddNullToObject(o, "vg_uuid");
-		if (have_ext) cJSON_AddNumberToObject(o, "extent_size_bytes", (double)(ext * 512)); else cJSON_AddNullToObject(o, "extent_size_bytes");
+		wire_str_or_null(o, "vg_uuid", vgid);
+		wire_num_or_null(o, "extent_size_bytes", have_ext, (double)(ext * 512));
 		lvm_emit_pv_ids(o, buf);
 		cJSON_AddItemToArray(arr, o);
 		free(buf);
@@ -1771,9 +1768,9 @@ static cJSON *bd_add(cJSON *arr, const char *name, const char *type, long long s
 	cJSON *o = cJSON_CreateObject();
 	cJSON_AddStringToObject(o, "name", name);
 	cJSON_AddStringToObject(o, "type", type);
-	if (size >= 0) cJSON_AddNumberToObject(o, "size_bytes", (double)size); else cJSON_AddNullToObject(o, "size_bytes");
-	if (fst && *fst) cJSON_AddStringToObject(o, "fstype", fst); else cJSON_AddNullToObject(o, "fstype");
-	if (mnt && *mnt) cJSON_AddStringToObject(o, "mountpoint", mnt); else cJSON_AddNullToObject(o, "mountpoint");
+	wire_num_or_null(o, "size_bytes", size >= 0, (double)size);
+	wire_str_or_null(o, "fstype", fst);
+	wire_str_or_null(o, "mountpoint", mnt);
 	if (parent) cJSON_AddStringToObject(o, "parent", parent); else cJSON_AddNullToObject(o, "parent");
 	cJSON_AddStringToObject(o, "id", dev_id_value(idfull));
 	cJSON_AddStringToObject(o, "id_type", dev_id_type(idfull));
@@ -1862,11 +1859,9 @@ static cJSON *inv_collect_block_devices(void)
 						int phm = dev_mount_info(pe->d_name, pfst, sizeof pfst, pmnt, sizeof pmnt);
 						char parval[300]; snprintf(parval, sizeof parval, "%s", dev_id_value(idfull));
 						cJSON *pn = bd_add(arr, pe->d_name, "part", psize, phm ? pfst : NULL, phm ? pmnt : NULL, parval, pidfull);
-						if (partno >= 0) cJSON_AddNumberToObject(pn, "part_number", partno);
-						else             cJSON_AddNullToObject(pn, "part_number");
+						wire_num_or_null(pn, "part_number", partno >= 0, (double)partno);
 						long long start_bytes = (startsec >= 0) ? startsec * 512 : -1;
-						if (start_bytes >= 0) cJSON_AddNumberToObject(pn, "part_start_bytes", (double)start_bytes);
-						else                  cJSON_AddNullToObject(pn, "part_start_bytes");
+						wire_num_or_null(pn, "part_start_bytes", start_bytes >= 0, (double)start_bytes);
 						part_attach_meta(pn, &pt, start_bytes);
 					}
 					closedir(pd);
@@ -2093,11 +2088,10 @@ static cJSON *inv_collect_net_interfaces(void)
 				}
 				fclose(vf);
 			}
-			if (vid >= 0) cJSON_AddNumberToObject(o, "vlan_id", vid);
-			else          cJSON_AddNullToObject(o, "vlan_id");
+			wire_num_or_null(o, "vlan_id", vid >= 0, (double)vid);
 			/* routes: 정적 비-default */
 			cJSON *rts = iface_routes(iff);
-			cJSON_AddItemToObject(o, "routes", rts ? rts : cJSON_CreateNull());
+			cJSON_AddItemToObject(o, "routes", wire_or_null(rts));
 			/* dns: 전역 목록을 default-route iface 에만 부착(복제) */
 			if (has_gw && dns) cJSON_AddItemToObject(o, "dns", cJSON_Duplicate(dns, 1));
 			else               cJSON_AddNullToObject(o, "dns");

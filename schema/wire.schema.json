@@ -261,6 +261,7 @@
           "boot_firmware": { "enum": ["uefi", "bios", null], "$comment": "재현. /sys/firmware/efi / GetFirmwareType (틀리면 안 뜸)" },
           "secure_boot": { "type": ["boolean", "null"] },
           "edition": { "type": ["string", "null"], "$comment": "Windows EditionID(SKU 코드). Linux null" },
+          "product_name": { "type": ["string", "null"], "$comment": "Windows CurrentVersion ProductName 원문(에이전트 교정 없음 — Win11 을 'Windows 10 Pro' 로 오보하는 등 OS 자체가 부정확할 수 있음). Linux null" },
           "timezone": { "type": ["string", "null"], "$comment": "Linux=IANA / Windows=tz 키명(엔진이 IANA 매핑)" },
           "rtc_utc": { "type": ["boolean", "null"], "$comment": "RTC 가 UTC 인가(재현 시계). 미측정 null" },
           "cpu_model": { "type": ["string", "null"] },
