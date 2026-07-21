@@ -161,6 +161,8 @@ void wire_add_envelope(cJSON *root, const char *msg_type,
 	else                        cJSON_AddNullToObject(root, "agent_started_at");
 }
 
+static char *try_cloud_instance_id(void);
+
 char *resolve_machine_id(void)
 {
 	HKEY hKey;
@@ -359,7 +361,7 @@ const char *cached_agent_id(void)
 	return id_buf;
 }
 
-char *try_cloud_instance_id(void)
+static char *try_cloud_instance_id(void)
 {
 	char *id = fetch_imds_chain(
 		"http://169.254.169.254/latest/meta-data/instance-id",

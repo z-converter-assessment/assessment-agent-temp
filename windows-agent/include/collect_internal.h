@@ -34,7 +34,6 @@ void wire_bool_or_null(cJSON *o, const char *key, int have, int v);
 char *fetch_imds_chain(const char *aws_metadata_url,
                               const char *azure_url, const char *gcp_url);
 char *http_get_short(const char *url, const char *header, int put_request);
-char *try_cloud_instance_id(void);
 const char *agent_inet_ntop(int af, const void *src, char *dst, size_t size);
 const char *win_id_type(const char *full);
 const char *win_id_value(const char *full);
