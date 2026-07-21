@@ -19,7 +19,6 @@ struct mount_entry {
 };
 
 cJSON *build_default_gw_v4(void);
-cJSON *collect_mac_addresses(void);
 cJSON *wire_metric(cJSON *ns, const char *name, const char *type, const char *unit);
 cJSON *wire_ns(cJSON *root, const char *ns);
 cJSON *wire_or_empty_array(cJSON *arr);
@@ -30,12 +29,6 @@ void wire_bool_or_null(cJSON *o, const char *key, int have, int v);
 cJSON *wire_point(cJSON *metric);
 char *fetch_cloud_metadata(const char *aws_path, const char *azure_path,
                                   const char *gcp_path);
-char *try_cloud_instance_id(void);
-char *try_dbus_uuidgen(void);
-char *try_machine_id_file(const char *path);
-const char *cached_agent_started_at_iso(void);
-const char *cached_boot_time_iso(void);
-const char *detect_cloud_vendor(void);
 const char *net_kind(const char *ifname);
 int agent_interval_sec(void);
 int fstype_is_nodev(const char *fstype);
@@ -44,8 +37,6 @@ int ipv6_netmask_prefix(const struct sockaddr_in6 *mask);
 int is_excluded_block_dev(const char *name);
 int is_excluded_fstype(const char *fstype);
 int is_kept_deviceless_fs(const char *fstype);
-int is_machine_id(const char *s);
-int mac_str_cmp(const void *a, const void *b);
 int parse_major_minor(const char *s, int *major, int *minor);
 int parse_mountinfo_line(const char *line,
                                 int *major, int *minor,
