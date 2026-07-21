@@ -81,8 +81,6 @@ OPENSSL_SSL        := $(OPENSSL_DIR)/install/lib/libssl.a
 OPENSSL_CRYPTO     := $(OPENSSL_DIR)/install/lib/libcrypto.a
 ZLIB_LIB           := $(ZLIB_DIR)/libz.a
 
-OPENSSL_TARGET     ?= mingw64
-OPENSSL_CROSS      ?=
 # curl >= 7.77 exposes the static lib as `libcurl_static`; older curl only `libcurl`.
 CURL_STATIC_TARGET ?= libcurl_static
 
