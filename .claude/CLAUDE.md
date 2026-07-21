@@ -46,6 +46,10 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 - 코드 스타일: 한 줄에 한 문장(세미콜론으로 여러 문장 뭉치지 않는다). 3회 이상 반복되는 발행 패턴은 헬퍼로 추출. collect 계층 주석은 한국어(다이어그램 제외).
 - 2트리 대칭: 파일 레이아웃/네이밍/필드셋을 Linux(`src/`)와 Windows(`windows-agent/src/`) 동일하게 유지. 한쪽에 신호를 추가하면 다른 쪽도 실측 발행하거나 측정불가 null 로 필드셋을 맞춘다(예: memory.edac 는 Windows 도 null 2점 발행).
 
+### worker 소스 구성
+
+worker 도 collect 와 동일 원리로 파일시스템 plumbing 을 분리한다: `worker_state.c`(state-dir 원자적 쓰기/재귀 생성·삭제/task_id 검증)를 `worker.c`(AMQP 폴링 + 멱등 게이트 + 설치 오케스트레이션)에서 떼어내고, 파일간 공유 심볼은 non-static + `worker_internal.h` 선언한다(공개 API 는 worker.h). 양 트리 대칭, 빌드는 `wildcard src/*.c`라 파일 추가 시 Makefile 무수정.
+
 ## 불변식 (반드시 준수)
 
 ### wire 계약과 null 의미론
