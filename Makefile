@@ -5,6 +5,10 @@ LDFLAGS ?=
 # 로컬/dev 빌드는 이 fallback. 스키마 계약 버전이 아니라 "어느 에이전트 빌드가 발행했나"의 빌드 정체성.
 AGENT_VERSION ?= 0.0.0-dev
 
+# 기본 goal 고정 — embed staging 규칙이 파일 앞쪽에 있어도 bare `make`가 바이너리를 빌드한다
+# (make 는 커맨드라인 인자가 없으면 첫 규칙을 기본 goal 로 삼는다). windows-agent/Makefile 과 대칭.
+.DEFAULT_GOAL := all
+
 # USE_VENDORED=1 -> static link against vendor/ (release). default: pkg-config (dev).
 PKGS               := librabbitmq libcjson libcurl libarchive openssl
 
@@ -229,12 +233,39 @@ verify: $(BIN)
 # container by scripts/build-linux.sh.
 DIST_DIR := dist
 DIST_BIN := $(DIST_DIR)/assessment-agent-linux-x86_64
+# static 링크되는 벤더 라이브러리의 저작권 고지 — 바이너리 재배포 조건(BSD/OpenSSL/Apache-2.0).
+DIST_NOTICES := $(DIST_DIR)/THIRD-PARTY-NOTICES-linux-x86_64.txt
 
 release: $(BIN) verify
 	@mkdir -p $(DIST_DIR)
 	cp $(BIN) $(DIST_BIN)
+	@echo "[release] generating $(DIST_NOTICES)"
+	@{ \
+	  echo "assessment-agent-linux-x86_64 — Third-Party Notices"; \
+	  echo "This binary statically links the open-source libraries listed below."; \
+	  echo "Each is distributed under its own license, reproduced verbatim."; \
+	  echo; \
+	  for d in $(VENDOR_DIR)/*/; do \
+	    lic=""; \
+	    for c in LICENSE LICENSE.txt LICENSE-MIT COPYING LICENSE.md; do \
+	      [ -f "$$d$$c" ] && { lic="$$d$$c"; break; }; \
+	    done; \
+	    [ -n "$$lic" ] || continue; \
+	    nm=$$(basename "$$d"); \
+	    case "$$nm" in \
+	      cJSON) ver='$(CJSON_VERSION)';; curl) ver='$(CURL_VERSION)';; \
+	      openssl) ver='$(OPENSSL_VERSION)';; rabbitmq-c) ver='$(RABBITMQ_C_VERSION)';; \
+	      libarchive) ver='$(LIBARCHIVE_VERSION)';; zlib) ver='$(ZLIB_VERSION)';; \
+	      *) ver=unknown;; \
+	    esac; \
+	    echo "================================================================"; \
+	    echo "$$nm ($$ver)"; \
+	    echo "================================================================"; \
+	    echo; cat "$$lic"; echo; echo; \
+	  done; \
+	} > $(DIST_NOTICES)
 	cd $(DIST_DIR) && sha256sum assessment-agent-linux-x86_64 > SHA256SUMS
-	@echo "[release] packaged $(DIST_BIN)"
+	@echo "[release] packaged $(DIST_BIN) + $(notdir $(DIST_NOTICES))"
 	@cat $(DIST_DIR)/SHA256SUMS
 
 .PHONY: all clean \

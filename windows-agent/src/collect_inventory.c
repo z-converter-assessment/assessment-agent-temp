@@ -925,6 +925,74 @@ static cJSON *win_iface_routes(const MIB_IPFORWARDTABLE *ipf, DWORD ifindex)
 }
 
 /* net_interfaces: GAA per-adapter -> MAC id + kind + speed + addresses[] + gateway. */
+/* 어댑터 하나의 addresses[] 발행(unicast + prefix + PrefixOrigin). */
+static void ni_emit_addresses(cJSON *o, IP_ADAPTER_ADDRESSES *p)
+{
+	cJSON *addrs = cJSON_CreateArray();
+	for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress; u; u = u->Next) {
+		if (!u->Address.lpSockaddr) continue;
+		char ip[INET6_ADDRSTRLEN] = {0}; const char *family = NULL; int prefix = -1;
+		int fam = u->Address.lpSockaddr->sa_family;
+		if (fam == AF_INET)  { inet_ntop(AF_INET, &((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr, ip, sizeof ip); family = "ipv4"; }
+		else if (fam == AF_INET6) { inet_ntop(AF_INET6, &((struct sockaddr_in6 *)u->Address.lpSockaddr)->sin6_addr, ip, sizeof ip); family = "ipv6"; }
+		if (!ip[0]) continue;
+		if (agent_is_nt6()) prefix = (int)u->OnLinkPrefixLength;
+		else if (fam == AF_INET) { unsigned ab = ((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.S_un.S_addr; int pfx; if (legacy_ipv4_prefix(p->IfIndex, ab, &pfx)) prefix = pfx; }
+		cJSON *ad = cJSON_CreateObject();
+		cJSON_AddStringToObject(ad, "address", ip);
+		wire_num_or_null(ad, "prefix", prefix >= 0, (double)prefix);
+		cJSON_AddStringToObject(ad, "family", family);
+		/* origin: PrefixOrigin(Vista+). Manual=static, Dhcp=dhcp. NT5.2/기타=null */
+		if (agent_is_nt6()) {
+			if (u->PrefixOrigin == IpPrefixOriginManual)    cJSON_AddStringToObject(ad, "origin", "static");
+			else if (u->PrefixOrigin == IpPrefixOriginDhcp) cJSON_AddStringToObject(ad, "origin", "dhcp");
+			else                                            cJSON_AddNullToObject(ad, "origin");
+		} else cJSON_AddNullToObject(ad, "origin");
+		cJSON_AddItemToArray(addrs, ad);
+	}
+	cJSON_AddItemToObject(o, "addresses", addrs);
+}
+
+/* 어댑터 재현/연결 메타(gateway/mtu/dns/routes, bond·vlan null) 발행. */
+static void ni_emit_conn_meta(cJSON *o, IP_ADAPTER_ADDRESSES *p, const MIB_IPFORWARDTABLE *ipf)
+{
+	cJSON *gw = NULL;
+	if (agent_is_nt6()) {
+		for (IP_ADAPTER_GATEWAY_ADDRESS_LH *g = p->FirstGatewayAddress; g; g = g->Next) {
+			if (!g->Address.lpSockaddr) continue;
+			int gf = g->Address.lpSockaddr->sa_family; char gb[INET6_ADDRSTRLEN] = {0};
+			if (gf == AF_INET) inet_ntop(AF_INET, &((struct sockaddr_in *)g->Address.lpSockaddr)->sin_addr, gb, sizeof gb);
+			else if (gf == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)g->Address.lpSockaddr)->sin6_addr, gb, sizeof gb);
+			if (gb[0]) { gw = cJSON_CreateString(gb); break; }
+		}
+	} else {
+		char gb[INET_ADDRSTRLEN]; if (legacy_ipv4_gateway(p->IfIndex, gb, sizeof gb)) gw = cJSON_CreateString(gb);
+	}
+	cJSON_AddItemToObject(o, "gateway", wire_or_null(gw));
+	/* mtu */
+	wire_num_or_null(o, "mtu", p->Mtu && p->Mtu != 0xFFFFFFFFUL, (double)p->Mtu);
+	/* dns: per-adapter DNS 서버(FirstDnsServerAddress, XP+) */
+	cJSON *dnsarr = NULL;
+	for (IP_ADAPTER_DNS_SERVER_ADDRESS *ds = p->FirstDnsServerAddress; ds; ds = ds->Next) {
+		if (!ds->Address.lpSockaddr) continue;
+		int df = ds->Address.lpSockaddr->sa_family;
+		char db[INET6_ADDRSTRLEN] = {0};
+		if (df == AF_INET)       inet_ntop(AF_INET, &((struct sockaddr_in *)ds->Address.lpSockaddr)->sin_addr, db, sizeof db);
+		else if (df == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ds->Address.lpSockaddr)->sin6_addr, db, sizeof db);
+		else continue;
+		if (!db[0]) continue;
+		if (!dnsarr) dnsarr = cJSON_CreateArray();
+		cJSON_AddItemToArray(dnsarr, cJSON_CreateString(db));
+	}
+	cJSON_AddItemToObject(o, "dns", wire_or_null(dnsarr));
+	/* routes: 정적 비-default(IPv4) */
+	cJSON *rts = win_iface_routes(ipf, p->IfIndex ? p->IfIndex : p->Ipv6IfIndex);
+	cJSON_AddItemToObject(o, "routes", wire_or_null(rts));
+	/* bond_mode/vlan_id: Windows 팀ing/VLAN 은 별도 스택 -> null(위조 금지) */
+	cJSON_AddNullToObject(o, "bond_mode");
+	cJSON_AddNullToObject(o, "vlan_id");
+}
+
 static cJSON *inv_collect_net_interfaces(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -959,64 +1027,8 @@ static cJSON *inv_collect_net_interfaces(void)
 		wire_num_or_null(o, "speed_mbps",
 		    agent_is_nt6() && p->TransmitLinkSpeed && p->TransmitLinkSpeed != 0xFFFFFFFFFFFFFFFFULL,
 		    (double)(p->TransmitLinkSpeed / 1000000ULL));
-		cJSON *addrs = cJSON_CreateArray();
-		for (IP_ADAPTER_UNICAST_ADDRESS *u = p->FirstUnicastAddress; u; u = u->Next) {
-			if (!u->Address.lpSockaddr) continue;
-			char ip[INET6_ADDRSTRLEN] = {0}; const char *family = NULL; int prefix = -1;
-			int fam = u->Address.lpSockaddr->sa_family;
-			if (fam == AF_INET)  { inet_ntop(AF_INET, &((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr, ip, sizeof ip); family = "ipv4"; }
-			else if (fam == AF_INET6) { inet_ntop(AF_INET6, &((struct sockaddr_in6 *)u->Address.lpSockaddr)->sin6_addr, ip, sizeof ip); family = "ipv6"; }
-			if (!ip[0]) continue;
-			if (agent_is_nt6()) prefix = (int)u->OnLinkPrefixLength;
-			else if (fam == AF_INET) { unsigned ab = ((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.S_un.S_addr; int pfx; if (legacy_ipv4_prefix(p->IfIndex, ab, &pfx)) prefix = pfx; }
-			cJSON *ad = cJSON_CreateObject();
-			cJSON_AddStringToObject(ad, "address", ip);
-			wire_num_or_null(ad, "prefix", prefix >= 0, (double)prefix);
-			cJSON_AddStringToObject(ad, "family", family);
-			/* origin: PrefixOrigin(Vista+). Manual=static, Dhcp=dhcp. NT5.2/기타=null */
-			if (agent_is_nt6()) {
-				if (u->PrefixOrigin == IpPrefixOriginManual)    cJSON_AddStringToObject(ad, "origin", "static");
-				else if (u->PrefixOrigin == IpPrefixOriginDhcp) cJSON_AddStringToObject(ad, "origin", "dhcp");
-				else                                            cJSON_AddNullToObject(ad, "origin");
-			} else cJSON_AddNullToObject(ad, "origin");
-			cJSON_AddItemToArray(addrs, ad);
-		}
-		cJSON_AddItemToObject(o, "addresses", addrs);
-		cJSON *gw = NULL;
-		if (agent_is_nt6()) {
-			for (IP_ADAPTER_GATEWAY_ADDRESS_LH *g = p->FirstGatewayAddress; g; g = g->Next) {
-				if (!g->Address.lpSockaddr) continue;
-				int gf = g->Address.lpSockaddr->sa_family; char gb[INET6_ADDRSTRLEN] = {0};
-				if (gf == AF_INET) inet_ntop(AF_INET, &((struct sockaddr_in *)g->Address.lpSockaddr)->sin_addr, gb, sizeof gb);
-				else if (gf == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)g->Address.lpSockaddr)->sin6_addr, gb, sizeof gb);
-				if (gb[0]) { gw = cJSON_CreateString(gb); break; }
-			}
-		} else {
-			char gb[INET_ADDRSTRLEN]; if (legacy_ipv4_gateway(p->IfIndex, gb, sizeof gb)) gw = cJSON_CreateString(gb);
-		}
-		cJSON_AddItemToObject(o, "gateway", wire_or_null(gw));
-		/* mtu */
-		wire_num_or_null(o, "mtu", p->Mtu && p->Mtu != 0xFFFFFFFFUL, (double)p->Mtu);
-		/* dns: per-adapter DNS 서버(FirstDnsServerAddress, XP+) */
-		cJSON *dnsarr = NULL;
-		for (IP_ADAPTER_DNS_SERVER_ADDRESS *ds = p->FirstDnsServerAddress; ds; ds = ds->Next) {
-			if (!ds->Address.lpSockaddr) continue;
-			int df = ds->Address.lpSockaddr->sa_family;
-			char db[INET6_ADDRSTRLEN] = {0};
-			if (df == AF_INET)       inet_ntop(AF_INET, &((struct sockaddr_in *)ds->Address.lpSockaddr)->sin_addr, db, sizeof db);
-			else if (df == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ds->Address.lpSockaddr)->sin6_addr, db, sizeof db);
-			else continue;
-			if (!db[0]) continue;
-			if (!dnsarr) dnsarr = cJSON_CreateArray();
-			cJSON_AddItemToArray(dnsarr, cJSON_CreateString(db));
-		}
-		cJSON_AddItemToObject(o, "dns", wire_or_null(dnsarr));
-		/* routes: 정적 비-default(IPv4) */
-		cJSON *rts = win_iface_routes(ipf, p->IfIndex ? p->IfIndex : p->Ipv6IfIndex);
-		cJSON_AddItemToObject(o, "routes", wire_or_null(rts));
-		/* bond_mode/vlan_id: Windows 팀ing/VLAN 은 별도 스택 -> null(위조 금지) */
-		cJSON_AddNullToObject(o, "bond_mode");
-		cJSON_AddNullToObject(o, "vlan_id");
+		ni_emit_addresses(o, p);
+		ni_emit_conn_meta(o, p, ipf);
 		cJSON_AddItemToArray(arr, o);
 	}
 	free(aa);

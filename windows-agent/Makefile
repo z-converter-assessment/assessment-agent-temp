@@ -81,8 +81,6 @@ OPENSSL_SSL        := $(OPENSSL_DIR)/install/lib/libssl.a
 OPENSSL_CRYPTO     := $(OPENSSL_DIR)/install/lib/libcrypto.a
 ZLIB_LIB           := $(ZLIB_DIR)/libz.a
 
-OPENSSL_TARGET     ?= mingw64
-OPENSSL_CROSS      ?=
 # curl >= 7.77 exposes the static lib as `libcurl_static`; older curl only `libcurl`.
 CURL_STATIC_TARGET ?= libcurl_static
 
@@ -267,12 +265,39 @@ verify: $(BIN)
 	@echo "[verify] OK: no NT6+ hard imports; only Windows system DLLs referenced"
 
 DIST_DIR := dist
+# static 링크되는 벤더 라이브러리의 저작권 고지 — 바이너리 재배포 조건(OpenSSL 1.0.2u SSLeay/BSD 등).
+DIST_NOTICES := $(DIST_DIR)/THIRD-PARTY-NOTICES-windows-x86.txt
 
 release: $(BIN) verify
 	@mkdir -p $(DIST_DIR)
 	cp $(BIN) $(DIST_DIR)/
+	@echo "[release] generating $(DIST_NOTICES)"
+	@{ \
+	  echo "assessment-agent-windows-x86.exe — Third-Party Notices"; \
+	  echo "This binary statically links the open-source libraries listed below."; \
+	  echo "Each is distributed under its own license, reproduced verbatim."; \
+	  echo; \
+	  for d in $(VENDOR_DIR)/*/; do \
+	    lic=""; \
+	    for c in LICENSE LICENSE.txt LICENSE-MIT COPYING LICENSE.md; do \
+	      [ -f "$$d$$c" ] && { lic="$$d$$c"; break; }; \
+	    done; \
+	    [ -n "$$lic" ] || continue; \
+	    nm=$$(basename "$$d"); \
+	    case "$$nm" in \
+	      cJSON) ver='$(CJSON_VERSION)';; curl) ver='$(CURL_VERSION)';; \
+	      openssl) ver='$(OPENSSL_VERSION)';; rabbitmq-c) ver='$(RABBITMQ_C_VERSION)';; \
+	      zlib) ver='$(ZLIB_VERSION)';; \
+	      *) ver=unknown;; \
+	    esac; \
+	    echo "================================================================"; \
+	    echo "$$nm ($$ver)"; \
+	    echo "================================================================"; \
+	    echo; cat "$$lic"; echo; echo; \
+	  done; \
+	} > $(DIST_NOTICES)
 	cd $(DIST_DIR) && sha256sum $(BIN) > SHA256SUMS
-	@echo "[release] packaged $(DIST_DIR)/$(BIN)"
+	@echo "[release] packaged $(DIST_DIR)/$(BIN) + $(notdir $(DIST_NOTICES))"
 	@cat $(DIST_DIR)/SHA256SUMS
 
 .PHONY: all clean vendor-fetch vendor-build vendor-build-openssl vendor-build-zlib \

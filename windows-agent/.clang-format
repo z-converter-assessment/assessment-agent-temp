@@ -1,0 +1,21 @@
+# assessment-agent C 스타일 정본 — 양 트리(src/, windows-agent/src/) 공통.
+# 목적: 2트리 스타일 대칭을 기계로 강제한다. 기존 코드 대량 재포맷은 하지 않고,
+# 편집하는 줄에만 적용한다(포맷터 churn 회피). bracing/indent/pointer 정렬만 커버하며,
+# 네이밍과 "한 줄 한 문장" 규약의 정본은 산문(.claude/CLAUDE.md)이다.
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 8
+TabWidth: 8
+UseTab: Always
+ContinuationIndentWidth: 8
+BreakBeforeBraces: Linux
+PointerAlignment: Right
+ColumnLimit: 0
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+IndentCaseLabels: false
+SortIncludes: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+SpaceAfterCStyleCast: false

@@ -2,7 +2,7 @@
 
 Assessment 수집 에이전트(C)의 릴리즈 빌드 트리. 단일 소스에서 OS별 2종 바이너리(Linux 1종 + Windows 1종)를 산출한다. 자체 소유 fleet의 자산 인벤토리와 자원 지표를 수집해 용량 계획(right-sizing)에 쓴다.
 
-관련 문서: 아키텍처 개요는 [docs/architecture.md](../docs/architecture.md), 설치·운영은 [README.md](../README.md), 빌드·릴리즈·CI는 [docs/BUILD.md](../docs/BUILD.md)(빌드 이식성 개념 배경은 [docs/study/portability-concepts.md](../docs/study/portability-concepts.md)), wire 계약은 [schema/wire.schema.json](../schema/wire.schema.json)(정본)과 [docs/payload-contract.md](../docs/payload-contract.md)(산문), 스토리지 레이아웃 파싱은 [docs/storage-layout.md](../docs/storage-layout.md).
+관련 문서: 역할별 문서 지도는 [docs/README.md](../docs/README.md)(인덱스). 핵심만 — 아키텍처 개요 [docs/architecture.md](../docs/architecture.md), 설계 결정 기록 [docs/adr/](../docs/adr/), 설치·운영 [README.md](../README.md), 빌드·릴리즈·CI [docs/BUILD.md](../docs/BUILD.md)(이식성 개념 배경 [docs/study/portability-concepts.md](../docs/study/portability-concepts.md)), wire 계약 [schema/wire.schema.json](../schema/wire.schema.json)(정본)·[docs/payload-contract.md](../docs/payload-contract.md)(산문), 스토리지 레이아웃 파싱 [docs/storage-layout.md](../docs/storage-layout.md).
 
 ## 도구 호출 형식 (최우선)
 
@@ -45,6 +45,10 @@ C 소스는 2트리로 관리한다: Linux(`src/`, `include/`)와 Windows(`windo
 - 어휘 정본: 신규 `system.*` metric 이름이나 attr 키를 발행하면 `schema/metric-vocab.json` 도 같이 갱신한다(양 트리 합집합). CI `check-vocab.py` 가 emit 어휘를 이 정본의 부분집합으로 강제하므로, 정본 미갱신 시 릴리즈가 막힌다. 이름 변경(리네이밍)은 소비자 키와의 계약이라 엔진과 합의 후 정본·양 트리 동시 반영.
 - 코드 스타일: 한 줄에 한 문장(세미콜론으로 여러 문장 뭉치지 않는다). 3회 이상 반복되는 발행 패턴은 헬퍼로 추출. collect 계층 주석은 한국어(다이어그램 제외).
 - 2트리 대칭: 파일 레이아웃/네이밍/필드셋을 Linux(`src/`)와 Windows(`windows-agent/src/`) 동일하게 유지. 한쪽에 신호를 추가하면 다른 쪽도 실측 발행하거나 측정불가 null 로 필드셋을 맞춘다(예: memory.edac 는 Windows 도 null 2점 발행).
+
+### worker 소스 구성
+
+worker 도 collect 와 동일 원리로 파일시스템 plumbing 을 분리한다: `worker_state.c`(state-dir 원자적 쓰기/재귀 생성·삭제/task_id 검증)를 `worker.c`(AMQP 폴링 + 멱등 게이트 + 설치 오케스트레이션)에서 떼어내고, 파일간 공유 심볼은 non-static + `worker_internal.h` 선언한다(공개 API 는 worker.h). 양 트리 대칭, 빌드는 `wildcard src/*.c`라 파일 추가 시 Makefile 무수정.
 
 ## 불변식 (반드시 준수)
 

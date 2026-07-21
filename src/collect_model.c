@@ -31,7 +31,7 @@
 #define AGENT_VERSION_FALLBACK "0.0.0-dev"
 #include "collect_internal.h"
 
-const char *cached_boot_time_iso(void)
+static const char *cached_boot_time_iso(void)
 {
 	static char buf[32];
 	static int initialized = 0;
@@ -63,7 +63,7 @@ const char *cached_boot_time_iso(void)
 	return ok ? buf : NULL;
 }
 
-const char *cached_agent_started_at_iso(void)
+static const char *cached_agent_started_at_iso(void)
 {
 	static char buf[32];
 	static int initialized = 0;
@@ -213,7 +213,7 @@ void wire_bool_or_null(cJSON *o, const char *key, int have, int v)
 	else      cJSON_AddNullToObject(o, key);
 }
 
-int is_machine_id(const char *s)
+static int is_machine_id(const char *s)
 {
 	size_t n = 0;
 	for (const char *p = s; *p; p++) {
@@ -224,7 +224,7 @@ int is_machine_id(const char *s)
 	return n == 32;
 }
 
-char *try_machine_id_file(const char *path)
+static char *try_machine_id_file(const char *path)
 {
 	char *raw = read_file_all(path);
 	if (!raw)
@@ -237,7 +237,7 @@ char *try_machine_id_file(const char *path)
 	return raw;
 }
 
-char *try_dbus_uuidgen(void)
+static char *try_dbus_uuidgen(void)
 {
 	char *raw = run_cmd("dbus-uuidgen --get 2>/dev/null");
 	if (!raw)
@@ -250,7 +250,7 @@ char *try_dbus_uuidgen(void)
 	return raw;
 }
 
-const char *detect_cloud_vendor(void)
+static const char *detect_cloud_vendor(void)
 {
 	char *vendor = read_file_all("/sys/class/dmi/id/sys_vendor");
 	if (!vendor)
@@ -314,7 +314,7 @@ char *fetch_cloud_metadata(const char *aws_path, const char *azure_path,
 	return out;
 }
 
-char *try_cloud_instance_id(void)
+static char *try_cloud_instance_id(void)
 {
 	char *out = fetch_cloud_metadata("instance-id", "compute/vmId", "instance/id");
 	if (!out || !*out) {
@@ -338,12 +338,12 @@ char *resolve_machine_id(void)
 	return try_cloud_instance_id();
 }
 
-int mac_str_cmp(const void *a, const void *b)
+static int mac_str_cmp(const void *a, const void *b)
 {
 	return strcmp(*(const char * const *)a, *(const char * const *)b);
 }
 
-cJSON *collect_mac_addresses(void)
+static cJSON *collect_mac_addresses(void)
 {
 	cJSON *arr = cJSON_CreateArray();
 	DIR *d = opendir("/sys/class/net");
