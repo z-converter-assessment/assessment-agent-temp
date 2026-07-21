@@ -1993,6 +1993,79 @@ static size_t netlink_addr_origins(struct addr_origin *out, size_t cap)
 }
 
 /* net_interfaces: /sys/class/net 열거 -> MAC id + kind + speed + addresses[](getifaddrs) + origin(netlink) + gateway. */
+/* 인터페이스 하나의 addresses[] 발행(ipv4/ipv6 + netlink origin 매칭). */
+static void ni_emit_addresses(cJSON *o, const char *iff, struct ifaddrs *ifap,
+                              const struct addr_origin *origins, size_t n_origin)
+{
+	unsigned int ifidx = if_nametoindex(iff);
+	cJSON *addrs = cJSON_CreateArray();
+	for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr || !ifa->ifa_name || strcmp(ifa->ifa_name, iff) != 0) continue;
+		int fam = ifa->ifa_addr->sa_family;
+		char ip[INET6_ADDRSTRLEN]; int prefix = 0; const char *family;
+		if (fam == AF_INET) {
+			if (!inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, ip, sizeof ip)) continue;
+			if (ifa->ifa_netmask) prefix = ipv4_netmask_prefix(((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr);
+			family = "ipv4";
+		} else if (fam == AF_INET6) {
+			if (!inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr, ip, sizeof ip)) continue;
+			if (ifa->ifa_netmask) prefix = ipv6_netmask_prefix((struct sockaddr_in6 *)ifa->ifa_netmask);
+			family = "ipv6";
+		} else continue;
+		cJSON *a = cJSON_CreateObject();
+		cJSON_AddStringToObject(a, "address", ip);
+		cJSON_AddNumberToObject(a, "prefix", (double)prefix);
+		cJSON_AddStringToObject(a, "family", family);
+		/* origin: netlink IFA_F_PERMANENT 조회. permanent=static, 아니면 dhcp, 미매칭=null. */
+		const char *origin = NULL;
+		const unsigned char *ab = (fam == AF_INET)
+			? (const unsigned char *)&((struct sockaddr_in *)ifa->ifa_addr)->sin_addr
+			: (const unsigned char *)&((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+		int ablen = (fam == AF_INET) ? 4 : 16;
+		for (size_t k = 0; k < n_origin; k++) {
+			if (origins[k].ifindex == (int)ifidx && origins[k].family == fam &&
+			    memcmp(origins[k].addr, ab, ablen) == 0) {
+				origin = origins[k].permanent ? "static" : "dhcp";
+				break;
+			}
+		}
+		if (origin) cJSON_AddStringToObject(a, "origin", origin);
+		else        cJSON_AddNullToObject(a, "origin");
+		cJSON_AddItemToArray(addrs, a);
+	}
+	cJSON_AddItemToObject(o, "addresses", addrs);
+}
+
+/* 인터페이스 재현 메타(mtu/bond_mode/vlan_id) 발행. */
+static void ni_emit_link_meta(cJSON *o, const char *iff)
+{
+	char np[320], nv[64];
+	/* mtu */
+	snprintf(np, sizeof np, "/sys/class/net/%s/mtu", iff);
+	if (read_sysfs_str(np, nv, sizeof nv) && atoi(nv) > 0) cJSON_AddNumberToObject(o, "mtu", atoi(nv));
+	else                                                   cJSON_AddNullToObject(o, "mtu");
+	/* bond_mode: 본딩 iface 의 raw 토큰(엔진 정규화) */
+	snprintf(np, sizeof np, "/sys/class/net/%s/bonding/mode", iff);
+	if (read_sysfs_str(np, nv, sizeof nv)) {
+		char tok[64];
+		if (sscanf(nv, "%63s", tok) == 1) cJSON_AddStringToObject(o, "bond_mode", tok);
+		else                              cJSON_AddNullToObject(o, "bond_mode");
+	} else cJSON_AddNullToObject(o, "bond_mode");
+	/* vlan_id: /proc/net/vlan/<iff> VID */
+	int vid = -1;
+	snprintf(np, sizeof np, "/proc/net/vlan/%s", iff);
+	FILE *vf = fopen(np, "r");
+	if (vf) {
+		char l[256];
+		while (fgets(l, sizeof l, vf)) {
+			char *q = strstr(l, "VID:");
+			if (q) { vid = atoi(q + 4); break; }
+		}
+		fclose(vf);
+	}
+	wire_num_or_null(o, "vlan_id", vid >= 0, (double)vid);
+}
+
 static cJSON *inv_collect_net_interfaces(void)
 {
 	cJSON *arr = cJSON_CreateArray();
@@ -2022,72 +2095,11 @@ static cJSON *inv_collect_net_interfaces(void)
 			if (read_sysfs_str(sp, spv, sizeof spv) && strtol(spv, NULL, 10) > 0)
 				cJSON_AddNumberToObject(o, "speed_mbps", (double)strtol(spv, NULL, 10));
 			else cJSON_AddNullToObject(o, "speed_mbps");
-			/* addresses[] */
-			unsigned int ifidx = if_nametoindex(iff);
-			cJSON *addrs = cJSON_CreateArray();
-			for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
-				if (!ifa->ifa_addr || !ifa->ifa_name || strcmp(ifa->ifa_name, iff) != 0) continue;
-				int fam = ifa->ifa_addr->sa_family;
-				char ip[INET6_ADDRSTRLEN]; int prefix = 0; const char *family;
-				if (fam == AF_INET) {
-					if (!inet_ntop(AF_INET, &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr, ip, sizeof ip)) continue;
-					if (ifa->ifa_netmask) prefix = ipv4_netmask_prefix(((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr);
-					family = "ipv4";
-				} else if (fam == AF_INET6) {
-					if (!inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr, ip, sizeof ip)) continue;
-					if (ifa->ifa_netmask) prefix = ipv6_netmask_prefix((struct sockaddr_in6 *)ifa->ifa_netmask);
-					family = "ipv6";
-				} else continue;
-				cJSON *a = cJSON_CreateObject();
-				cJSON_AddStringToObject(a, "address", ip);
-				cJSON_AddNumberToObject(a, "prefix", (double)prefix);
-				cJSON_AddStringToObject(a, "family", family);
-				/* origin: netlink IFA_F_PERMANENT 조회. permanent=static, 아니면 dhcp, 미매칭=null. */
-				const char *origin = NULL;
-				const unsigned char *ab = (fam == AF_INET)
-					? (const unsigned char *)&((struct sockaddr_in *)ifa->ifa_addr)->sin_addr
-					: (const unsigned char *)&((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
-				int ablen = (fam == AF_INET) ? 4 : 16;
-				for (size_t k = 0; k < n_origin; k++) {
-					if (origins[k].ifindex == (int)ifidx && origins[k].family == fam &&
-					    memcmp(origins[k].addr, ab, ablen) == 0) {
-						origin = origins[k].permanent ? "static" : "dhcp";
-						break;
-					}
-				}
-				if (origin) cJSON_AddStringToObject(a, "origin", origin);
-				else        cJSON_AddNullToObject(a, "origin");
-				cJSON_AddItemToArray(addrs, a);
-			}
-			cJSON_AddItemToObject(o, "addresses", addrs);
+			ni_emit_addresses(o, iff, ifap, origins, n_origin);
 			cJSON *hit = cJSON_GetObjectItem(gw4, iff);
 			int has_gw = (hit && cJSON_IsString(hit));
 			cJSON_AddItemToObject(o, "gateway", has_gw ? cJSON_CreateString(hit->valuestring) : cJSON_CreateNull());
-			/* mtu */
-			char np[320], nv[64];
-			snprintf(np, sizeof np, "/sys/class/net/%s/mtu", iff);
-			if (read_sysfs_str(np, nv, sizeof nv) && atoi(nv) > 0) cJSON_AddNumberToObject(o, "mtu", atoi(nv));
-			else                                                   cJSON_AddNullToObject(o, "mtu");
-			/* bond_mode: 본딩 iface 의 raw 토큰(엔진 정규화) */
-			snprintf(np, sizeof np, "/sys/class/net/%s/bonding/mode", iff);
-			if (read_sysfs_str(np, nv, sizeof nv)) {
-				char tok[64];
-				if (sscanf(nv, "%63s", tok) == 1) cJSON_AddStringToObject(o, "bond_mode", tok);
-				else                              cJSON_AddNullToObject(o, "bond_mode");
-			} else cJSON_AddNullToObject(o, "bond_mode");
-			/* vlan_id: /proc/net/vlan/<iff> VID */
-			int vid = -1;
-			snprintf(np, sizeof np, "/proc/net/vlan/%s", iff);
-			FILE *vf = fopen(np, "r");
-			if (vf) {
-				char l[256];
-				while (fgets(l, sizeof l, vf)) {
-					char *q = strstr(l, "VID:");
-					if (q) { vid = atoi(q + 4); break; }
-				}
-				fclose(vf);
-			}
-			wire_num_or_null(o, "vlan_id", vid >= 0, (double)vid);
+			ni_emit_link_meta(o, iff);
 			/* routes: 정적 비-default */
 			cJSON *rts = iface_routes(iff);
 			cJSON_AddItemToObject(o, "routes", wire_or_null(rts));
