@@ -1,0 +1,11 @@
+# GitHub Actions 의존성 갱신 자동화. SHA 로 핀된 액션(release.yml)의 새 릴리즈를
+# 감지해 SHA bump PR 을 연다 — 핀의 불변성(공급망)과 최신성을 동시에 유지한다.
+# 벤더 C 라이브러리는 NT5.2/musl 호환을 위해 Makefile 에서 수동 핀하므로 대상 아님.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
