@@ -2,7 +2,7 @@
 
 Assessment 수집 에이전트(C)의 릴리즈 빌드 트리. 단일 소스에서 OS별 2종 바이너리(Linux 1종 + Windows 1종)를 산출한다. 자체 소유 fleet의 자산 인벤토리와 자원 지표를 수집해 용량 계획(right-sizing)에 쓴다.
 
-관련 문서: 아키텍처 개요는 [docs/architecture.md](../docs/architecture.md), 설치·운영은 [README.md](../README.md), 빌드·릴리즈·CI는 [docs/BUILD.md](../docs/BUILD.md)(빌드 이식성 개념 배경은 [docs/study/portability-concepts.md](../docs/study/portability-concepts.md)), wire 계약은 [schema/wire.schema.json](../schema/wire.schema.json)(정본)과 [docs/payload-contract.md](../docs/payload-contract.md)(산문), 스토리지 레이아웃 파싱은 [docs/storage-layout.md](../docs/storage-layout.md).
+관련 문서: 역할별 문서 지도는 [docs/README.md](../docs/README.md)(인덱스). 핵심만 — 아키텍처 개요 [docs/architecture.md](../docs/architecture.md), 설계 결정 기록 [docs/adr/](../docs/adr/), 설치·운영 [README.md](../README.md), 빌드·릴리즈·CI [docs/BUILD.md](../docs/BUILD.md)(이식성 개념 배경 [docs/study/portability-concepts.md](../docs/study/portability-concepts.md)), wire 계약 [schema/wire.schema.json](../schema/wire.schema.json)(정본)·[docs/payload-contract.md](../docs/payload-contract.md)(산문), 스토리지 레이아웃 파싱 [docs/storage-layout.md](../docs/storage-layout.md).
 
 ## 도구 호출 형식 (최우선)
 
